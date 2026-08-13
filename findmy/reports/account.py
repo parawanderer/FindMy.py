@@ -51,7 +51,7 @@ from .twofactor import (
 
 if TYPE_CHECKING:
     import io
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     from findmy.accessory import RollingKeyPairSource
@@ -178,6 +178,78 @@ class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapp
         Last name of the account holder as reported by Apple.
 
         May be None in some cases, such as when not logged in.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def dsid(self) -> str:
+        """
+        The numeric identifier of this account.
+
+        Used as the username half of the HTTP Basic credential that iCloud services
+        expect, paired with whichever service token is appropriate. Note this is a
+        different identifier from the `adsid` used during authentication.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def service_tokens(self) -> Mapping[str, str]:
+        """
+        The iCloud service tokens obtained while logging in, keyed by service name.
+
+        Look tokens up by name and fail with the name that was missing; the set returned
+        varies, and no position in it is meaningful.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def adsid(self) -> str | None:
+        """
+        The account identifier issued during authentication.
+
+        **A different value from :attr:`dsid`**, despite both being account identifiers
+        and both arriving in the same payload. Services want one or the other and they are
+        not interchangeable.
+
+        None for a session established before this was retained, in which case
+        :meth:`request_pet` obtains it.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def device_uuid(self) -> str:
+        """
+        The identifier this installation presents itself to Apple as.
+
+        Generated once and persisted with the rest of the account state. It must not be
+        regenerated: a session is bound to the machine identity that established it, and
+        an identity that changes per login makes every login look like a new machine --
+        which is the pattern two-factor authentication exists to detect.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def client_info(self) -> str:
+        """
+        The client identity string sent as `X-Mme-Client-Info`.
+
+        Names the model, OS release and bundle this client claims to be. Its parts must be
+        internally consistent and stable across logins.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def request_pet(self) -> MaybeCoro[str]:
+        """
+        Obtain a fresh password-equivalent token by authenticating again.
+
+        Logging in spends the PET it produces, so a logged-in account has none to give.
+        Some iCloud services want one anyway; this issues a new one without spending it.
         """
         raise NotImplementedError
 
@@ -435,6 +507,38 @@ class AsyncAppleAccount(BaseAppleAccount):
         """See :meth:`BaseAppleAccount.last_name`."""
         return self._account_info["last_name"] if self._account_info else None
 
+    @property
+    @_require_login_state(LoginState.LOGGED_IN)
+    @override
+    def dsid(self) -> str:
+        """See :meth:`BaseAppleAccount.dsid`."""
+        return self._login_state_data["dsid"]
+
+    @property
+    @_require_login_state(LoginState.LOGGED_IN)
+    @override
+    def service_tokens(self) -> Mapping[str, str]:
+        """See :meth:`BaseAppleAccount.service_tokens`."""
+        return self._login_state_data["mobileme_data"]["tokens"]
+
+    @property
+    @override
+    def adsid(self) -> str | None:
+        """See :meth:`BaseAppleAccount.adsid`."""
+        return self._login_state_data.get("adsid")
+
+    @property
+    @override
+    def device_uuid(self) -> str:
+        """See :meth:`BaseAppleAccount.device_uuid`."""
+        return self._devid
+
+    @property
+    @override
+    def client_info(self) -> str:
+        """See :meth:`BaseAppleAccount.client_info`."""
+        return self._anisette.client
+
     @override
     def to_json(self, path: str | Path | io.TextIOBase | None = None, /) -> AccountStateMapping:
         res: AccountStateMapping = {
@@ -613,6 +717,62 @@ class AsyncAppleAccount(BaseAppleAccount):
         return await self._login_mobileme()
 
     @_require_login_state(LoginState.LOGGED_IN)
+    async def request_pet(self) -> str:
+        """
+        Obtain a fresh password-equivalent token by authenticating again.
+
+        A PET is the short-lived credential that logging in produces, and a few iCloud
+        services want it rather than a service token. Logging in **spends** it -- it is
+        the credential the service tokens are exchanged for -- so by the time an account
+        is logged in there is none left to hand out. This authenticates again and returns
+        the new one without exchanging it, leaving the account's existing session intact.
+
+        Two things worth knowing before calling it:
+
+        - It makes a real authentication request, and the token it returns expires in
+          about five minutes. Ask for one when it is about to be used, not in advance.
+        - It requires the stored password, so it does not work for a session restored
+          without one.
+
+        :raises UnauthorizedError: If re-authentication does not complete, which most
+            likely means a second factor is being demanded.
+        """
+        logger.info("Re-authenticating to obtain a fresh PET")
+
+        # _gsa_authenticate replaces the login state, so the current one is put back
+        # afterwards: this is meant to hand out a token, not to change what the account is.
+        previous_state = self._login_state
+        previous_data = self._login_state_data
+        previous_info = self._account_info
+
+        try:
+            new_state = await self._gsa_authenticate()
+            if new_state != LoginState.AUTHENTICATED:
+                msg = (
+                    f"Re-authentication ended in state {new_state} rather than"
+                    " AUTHENTICATED, so no PET was issued."
+                )
+                raise UnauthorizedError(msg)
+
+            pet = self._login_state_data.get("idms_pet")
+            if not pet:
+                msg = "Re-authentication succeeded but returned no PET"
+                raise UnhandledProtocolError(msg)
+
+            # Take the chance to record the identifier too, for a session saved before it
+            # was carried forward.
+            fresh_adsid = self._login_state_data.get("adsid")
+        finally:
+            self._login_state = previous_state
+            self._login_state_data = previous_data
+            self._account_info = previous_info
+
+        if fresh_adsid and not self._login_state_data.get("adsid"):
+            self._login_state_data["adsid"] = fresh_adsid
+
+        return pet
+
+    @_require_login_state(LoginState.LOGGED_IN)
     async def fetch_raw_reports(  # noqa: C901
         self,
         devices: list[tuple[list[str], list[str]]],
@@ -624,10 +784,7 @@ class AsyncAppleAccount(BaseAppleAccount):
         start_ts = int((now - timedelta(days=7)).timestamp()) * 1000
         end_ts = int(now.timestamp()) * 1000
 
-        auth = (
-            self._login_state_data["dsid"],
-            self._login_state_data["mobileme_data"]["tokens"]["searchPartyToken"],
-        )
+        auth = (self.dsid, self.service_tokens["searchPartyToken"])
         data = {
             "clientContext": {
                 "clientBundleIdentifier": "com.apple.icloud.searchpartyuseragent",
@@ -891,6 +1048,7 @@ class AsyncAppleAccount(BaseAppleAccount):
     @_require_login_state(LoginState.AUTHENTICATED)
     async def _login_mobileme(self) -> LoginState:
         logger.info("Logging into com.apple.mobileme")
+        adsid = self._login_state_data.get("adsid")
         data = plistlib.dumps(
             {
                 "apple-id": self._username,
@@ -925,7 +1083,14 @@ class AsyncAppleAccount(BaseAppleAccount):
 
         return self._set_login_state(
             LoginState.LOGGED_IN,
-            {"dsid": data["dsid"], "mobileme_data": mobileme_data["service-data"]},
+            {
+                "dsid": data["dsid"],
+                "mobileme_data": mobileme_data["service-data"],
+                # Carried forward rather than discarded: it is a different identifier from
+                # `dsid`, some services want it, and re-authenticating to recover it is a
+                # round trip for a value already in hand.
+                "adsid": adsid,
+            },
         )
 
     async def _sms_2fa_request(
@@ -1055,6 +1220,36 @@ class AppleAccount(BaseAppleAccount):
         """See :meth:`AsyncAppleAccount.last_name`."""
         return self._asyncacc.last_name
 
+    @property
+    @override
+    def dsid(self) -> str:
+        """See :meth:`AsyncAppleAccount.dsid`."""
+        return self._asyncacc.dsid
+
+    @property
+    @override
+    def service_tokens(self) -> Mapping[str, str]:
+        """See :meth:`AsyncAppleAccount.service_tokens`."""
+        return self._asyncacc.service_tokens
+
+    @property
+    @override
+    def adsid(self) -> str | None:
+        """See :meth:`AsyncAppleAccount.adsid`."""
+        return self._asyncacc.adsid
+
+    @property
+    @override
+    def device_uuid(self) -> str:
+        """See :meth:`AsyncAppleAccount.device_uuid`."""
+        return self._asyncacc.device_uuid
+
+    @property
+    @override
+    def client_info(self) -> str:
+        """See :meth:`AsyncAppleAccount.client_info`."""
+        return self._asyncacc.client_info
+
     @override
     def to_json(self, dst: str | Path | None = None, /) -> AccountStateMapping:
         return self._asyncacc.to_json(dst)
@@ -1075,6 +1270,12 @@ class AppleAccount(BaseAppleAccount):
         except KeyError as e:
             msg = f"Failed to restore account data: {e}"
             raise ValueError(msg) from None
+
+    @override
+    def request_pet(self) -> str:
+        """See :meth:`AsyncAppleAccount.request_pet`."""
+        coro = self._asyncacc.request_pet()
+        return self._evt_loop.run_until_complete(coro)
 
     @override
     def login(self, username: str, password: str) -> LoginState:
