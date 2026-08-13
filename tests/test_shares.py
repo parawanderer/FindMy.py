@@ -577,8 +577,51 @@ def test_a_share_wrapped_to_another_key_says_so_rather_than_blaming_the_cipher()
     share = unwrap_share(a_share_addressed_to(theirs, theirs), ours)
 
     assert share.plaintext is None
-    assert "wrapped to a different key" in (share.error or "")
+    assert "none of ours" in (share.error or "")
     assert "recovery is what to look at" in (share.error or "")
+
+
+def test_a_failure_says_whether_the_key_or_the_construction_is_in_doubt() -> None:
+    # The two failures are indistinguishable by outcome, so the message must separate
+    # them. A share addressed to a key we hold means the key is settled.
+    ours = ec.generate_private_key(ec.SECP384R1())
+    entry = a_share_addressed_to(ours, ours)
+
+    # Replace the ciphertext with one this key cannot read, keeping the declared receiver.
+    from findmy.keychain.shares import ShareEntry, ShareRecord  # noqa: PLC0415
+
+    theirs = ec.generate_private_key(ec.SECP384R1())
+    record = a_record(
+        sender="PEER-SENDER",
+        receiver="PEER-US",
+        receiverPublicEncryptionKey=public_point_of(ours),
+        wrappedkey=archive(ecies_encrypt(theirs.public_key(), b"not for us")),
+        curve=1,
+        epoch=1,
+        version=1,
+    )
+    entry = ShareEntry(view="Manatee", share=ShareRecord.from_record(record), view_keys=[])
+
+    share = unwrap_share(entry, ours)
+
+    assert "addressed to our encryption key" in (share.error or "")
+    assert "the construction is what remains" in (share.error or "")
+
+
+def test_a_share_naming_no_key_says_that_it_establishes_nothing() -> None:
+    # Silence is not confirmation. Reporting "the key is fine" from an absent field would
+    # send the next hour after the cipher on no evidence at all.
+    ours = ec.generate_private_key(ec.SECP384R1())
+    theirs = ec.generate_private_key(ec.SECP384R1())
+
+    share = unwrap_share(a_share(theirs), ours)
+
+    assert "names no receiver key" in (share.error or "")
+    assert "nothing here confirms" in (share.error or "")
+
+
+def public_point_of(key) -> bytes:  # noqa: ANN001
+    return key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
 
 
 def test_a_share_addressed_to_our_key_is_not_reported_as_a_mismatch() -> None:
@@ -677,3 +720,124 @@ def test_a_share_that_cannot_be_checked_counts_as_unverified_rather_than_raising
 def a_public_key_bytes() -> bytes:
     key = ec.generate_private_key(ec.SECP384R1()).public_key()
     return key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+
+
+# --------------------------------------------------------------------------------------
+# The axes the search must actually cover
+# --------------------------------------------------------------------------------------
+
+
+def test_the_search_spans_both_key_derivation_functions() -> None:
+    # X9.63 was the only one tried for three rounds, and the axis was absent rather than
+    # explored -- which reads in a report as "HKDF was ruled out" when it was never run.
+    from findmy.keychain.shares import _ecies_variants  # noqa: PLC0415
+
+    assert {v.kdf for v in _ecies_variants()} == {"x963", "hkdf"}
+
+
+def test_the_iv_can_be_derived_from_either_end_of_the_material() -> None:
+    # Same derived bytes, split the other way, give a different key and a different IV.
+    # One ordering authenticates and the other is indistinguishable from a wrong key.
+    from findmy.keychain.shares import _ecies_variants  # noqa: PLC0415
+
+    assert {v.iv_source for v in _ecies_variants()} == {"zero", "key-then-iv", "iv-then-key"}
+
+
+def test_the_search_covers_a_truncated_hmac_as_well_as_a_gcm_tag() -> None:
+    # The archive calls those sixteen bytes an authentication code, not a tag.
+    from findmy.keychain.shares import _ecies_variants  # noqa: PLC0415
+
+    assert {v.cipher for v in _ecies_variants()} == {"gcm", "ctr-hmac"}
+
+
+def test_the_compact_x_only_point_is_among_the_shared_info_choices() -> None:
+    # Hashing the 48-byte x coordinate is a different derivation from hashing the 97-byte
+    # uncompressed point, and no boolean reaches it.
+    from findmy.keychain.shares import _ecies_variants  # noqa: PLC0415
+
+    assert "point-x" in {v.shared_info for v in _ecies_variants()}
+
+
+def test_the_x_only_part_is_the_coordinate_and_not_the_whole_point() -> None:
+    from findmy.keychain.shares import _part  # noqa: PLC0415
+
+    point = b"\x04" + bytes(range(48)) + bytes(range(48))
+
+    assert _part("point-x", point, b"ours") == bytes(range(48))
+    assert _part("point", point, b"ours") == point
+    assert _part("empty", point, b"ours") == b""
+
+
+def test_an_iv_taken_from_the_front_is_recognised() -> None:
+    from findmy.keychain.shares import ecies_decrypt  # noqa: PLC0415
+
+    key = ec.generate_private_key(ec.SECP384R1())
+    sealed = sealed_from_front(key.public_key(), b"the key")
+
+    assert ecies_decrypt(key, sealed) == b"the key"
+
+
+def sealed_from_front(public_key, plaintext: bytes) -> bytes:  # noqa: ANN001
+    """Seal with the IV taken from the front of the derived material, key after it."""
+    ephemeral = ec.generate_private_key(public_key.curve)
+    point = ephemeral.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    shared = ephemeral.exchange(ec.ECDH(), public_key)
+
+    out, counter = b"", 1
+    while len(out) < 12 + 16:
+        out += hashlib.sha256(shared + counter.to_bytes(4, "big") + point).digest()
+        counter += 1
+
+    iv, key = out[:12], out[12 : 12 + 16]
+    encryptor = Cipher(algorithms.AES(key), modes.GCM(iv)).encryptor()
+    encryptor.authenticate_additional_data(point)
+    body = encryptor.update(plaintext) + encryptor.finalize()
+    return point + body + encryptor.tag
+
+
+def test_a_ciphertext_authenticated_by_a_truncated_hmac_is_recognised() -> None:
+    from findmy.keychain.shares import ecies_decrypt  # noqa: PLC0415
+
+    key = ec.generate_private_key(ec.SECP384R1())
+    sealed = sealed_with_hmac(key.public_key(), b"the key")
+
+    assert ecies_decrypt(key, sealed) == b"the key"
+
+
+def sealed_with_hmac(public_key, plaintext: bytes) -> bytes:  # noqa: ANN001
+    """Seal with AES-CTR and a 16-byte truncated HMAC over point || ciphertext."""
+    import hmac as hmac_module  # noqa: PLC0415
+
+    ephemeral = ec.generate_private_key(public_key.curve)
+    point = ephemeral.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    shared = ephemeral.exchange(ec.ECDH(), public_key)
+
+    out, counter = b"", 1
+    while len(out) < 16 + 32:
+        out += hashlib.sha256(shared + counter.to_bytes(4, "big") + point).digest()
+        counter += 1
+
+    key, mac_key = out[:16], out[16:48]
+    body = Cipher(algorithms.AES(key), modes.CTR(bytes(16))).encryptor().update(plaintext)
+    code = hmac_module.new(mac_key, point + body, "sha256").digest()[:16]
+    return point + body + code
+
+
+def test_a_share_for_another_peer_is_named_as_such_not_as_a_cipher_failure() -> None:
+    # If the receiver is not the recovered peer, no cipher parameter was ever going to
+    # open it -- so reporting this as a decryption failure would send the search after a
+    # construction that is not the problem.
+    ours = ec.generate_private_key(ec.SECP384R1())
+
+    share = unwrap_share(a_share(ours), ours, expected_receiver="PEER-SOMEONE-ELSE")
+
+    assert share.plaintext is None
+    assert "not the recovered peer" in (share.error or "")
+
+
+def test_a_share_for_the_recovered_peer_passes_that_check() -> None:
+    ours = ec.generate_private_key(ec.SECP384R1())
+
+    share = unwrap_share(a_share(ours), ours, expected_receiver="PEER-US")
+
+    assert share.plaintext == b"the view key"

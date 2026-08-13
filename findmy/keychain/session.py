@@ -364,7 +364,22 @@ class AsyncKeychainSession(Closable):
         entries = await fetch_recoverable_shares(self._cuttlefish, peer.peer_id)
         encryption_key = peer.encryption_key()
 
-        shares = [unwrap_share(entry, encryption_key, directory) for entry in entries]
+        # The signing key is offered as an alternate purely so the failure can say which
+        # key a share is addressed to. A share should be wrapped to the encryption key;
+        # if one turns out not to be, that is worth learning from the data rather than
+        # from a wrong assumption that presents as a cipher that will not authenticate.
+        alternates = {"signing": peer.signing_key()}
+
+        shares = [
+            unwrap_share(
+                entry,
+                encryption_key,
+                directory,
+                alternates=alternates,
+                expected_receiver=peer.peer_id,
+            )
+            for entry in entries
+        ]
         logger.info("Shares for %s: %s", peer.peer_id, summarise(shares))
         return shares
 

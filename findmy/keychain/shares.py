@@ -20,6 +20,7 @@ import base64
 import binascii
 import contextlib
 import hashlib
+import hmac
 import logging
 import plistlib
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from google.protobuf.message import DecodeError
 
@@ -39,7 +41,7 @@ from findmy.cloudkit.records import named_fields
 from findmy.errors import UnhandledProtocolError
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from findmy.cloudkit.client import AsyncCloudKitClient
 
@@ -233,50 +235,122 @@ def _x963_kdf(shared: bytes, shared_info: bytes, length: int, digest: str = "sha
     return out[:length]
 
 
+def _hkdf(shared: bytes, shared_info: bytes, length: int, digest: str) -> bytes:
+    """HKDF with an empty salt, the other standard way to expand an ECDH secret."""
+    algorithm = hashes.SHA384() if digest == "sha384" else hashes.SHA256()
+    return HKDF(algorithm=algorithm, length=length, salt=None, info=shared_info).derive(shared)
+
+
+# Which bytes a variant feeds to the KDF as shared info, or to the cipher as associated
+# data. Named rather than boolean because there are more than two plausible answers and a
+# report saying `info=point-x` is worth more than one saying `info=True`. `point-x` is the
+# compact x-only representation of the ephemeral point, which is a distinct thing to hash
+# from the uncompressed form and cannot be reached by a boolean.
+_PARTS = ("point", "point-x", "empty", "point+ours", "ours")
+
+
+def _part(kind: str, point: bytes, ours: bytes) -> bytes:
+    """Assemble the bytes a named choice refers to."""
+    if kind == "point":
+        return point
+    if kind == "point-x":
+        return point[1 : 1 + (len(point) - 1) // 2]
+    if kind == "ours":
+        return ours
+    if kind == "point+ours":
+        return point + ours
+    return b""
+
+
+# Where the IV comes from. `zero` is an all-zero IV of the stated length; the other two
+# take it from the KDF, and **which end it comes from matters** -- the same derived bytes
+# split the other way give a different key and a different IV, and both authenticate as
+# nothing.
+_IV_SOURCES = ("zero", "key-then-iv", "iv-then-key")
+
+
 @dataclass(frozen=True)
 class EciesVariant:
     """
-    One way of turning a shared secret into an AES-GCM key, IV and AAD.
+    One way of turning a shared secret into a key, an IV and associated data.
 
-    The specification names the construction -- ephemeral point, X9.63 KDF, AES-GCM -- but
-    not the parameters that a reader cannot infer and a wrong choice does not announce.
-    Every combination below decrypts in microseconds and fails on the tag, so trying them
-    all costs nothing; guessing one and shipping it costs a round trip against a real
-    account for every guess. The name of whichever authenticates is reported, so the
-    specification can record the answer rather than the search.
+    The specification names the construction -- ephemeral point, a KDF, authenticated
+    encryption -- but not the parameters, and a wrong choice does not announce itself: it
+    fails as an authentication tag that does not check, exactly as a wrong *key* does.
+
+    So this enumerates rather than guesses. Each attempt is one AES pass over ~230 bytes
+    and cannot false-positive -- a 16-byte authenticator matching by chance is a 2^-128
+    event -- whereas verifying a single guess costs a passcode-authenticated round trip
+    against a real account. The name of whichever authenticates is logged, so the answer
+    can be written into the specification and the search deleted.
     """
 
+    kdf: str
     digest: str
     key_length: int
     iv_length: int
-    derived_iv: bool
-    shared_info_is_point: bool
-    aad_is_point: bool
+    iv_source: str
+    shared_info: str
+    aad: str
+    cipher: str = "gcm"
 
     @property
     def name(self) -> str:
         """A short label naming what this variant chose, for reporting a match."""
-        iv = f"{'derived' if self.derived_iv else 'zero'}-iv{self.iv_length}"
         return (
-            f"{self.digest}/aes{self.key_length * 8}-gcm/{iv}"
-            f"/info={'point' if self.shared_info_is_point else 'empty'}"
-            f"/aad={'point' if self.aad_is_point else 'empty'}"
+            f"{self.kdf}/{self.digest}/aes{self.key_length * 8}-{self.cipher}"
+            f"/{self.iv_source}{self.iv_length}"
+            f"/info={self.shared_info}/aad={self.aad}"
         )
+
+    def material(self, shared: bytes, shared_info: bytes) -> tuple[bytes, bytes]:
+        """Derive the key and IV this variant calls for."""
+        wants_iv = self.iv_source != "zero"
+        length = self.key_length + (self.iv_length if wants_iv else 0)
+
+        expand = _x963_kdf if self.kdf == "x963" else _hkdf
+        out = expand(shared, shared_info, length, self.digest)
+
+        if not wants_iv:
+            return out[: self.key_length], bytes(self.iv_length)
+        if self.iv_source == "key-then-iv":
+            return out[: self.key_length], out[self.key_length :]
+        return out[self.iv_length :], out[: self.iv_length]
 
 
 def _ecies_variants() -> list[EciesVariant]:
-    """Every parameter combination worth trying, cheapest-first is irrelevant here."""
-    return [
-        EciesVariant(digest, key_length, iv_length, derived_iv, info_point, aad_point)
+    """
+    Every parameter combination worth trying.
+
+    Two families. AES-GCM, where the 16-byte member is a GCM tag; and AES-CTR with a
+    truncated HMAC, where it is a MAC computed separately. The second is here because the
+    archive calls that member `SFIESAuthenticationCode` rather than a tag, and because the
+    ciphertexts are 227 to 245 bytes -- never a multiple of the block size, which rules
+    out CBC and every other padded mode but leaves both of these open.
+    """
+    gcm = [
+        EciesVariant(kdf, digest, key_length, iv_length, iv_source, info, aad)
+        for kdf in ("x963", "hkdf")
         for digest in ("sha256", "sha384")
         for key_length in (16, 32)
         # A GCM nonce is twelve bytes by specification, but Apple's ECIES has been seen
         # with a sixteen-byte all-zero one, and the two authenticate differently.
         for iv_length in (12, 16)
-        for derived_iv in (False, True)
-        for info_point in (True, False)
-        for aad_point in (True, False)
+        for iv_source in _IV_SOURCES
+        for info in _PARTS
+        for aad in _PARTS
     ]
+
+    ctr = [
+        EciesVariant(kdf, digest, key_length, 16, "zero", info, mac, cipher="ctr-hmac")
+        for kdf in ("x963", "hkdf")
+        for digest in ("sha256", "sha384")
+        for key_length in (16, 32)
+        for info in _PARTS
+        for mac in ("point+ct", "ct")
+    ]
+
+    return gcm + ctr
 
 
 def ecies_decrypt(private_key: ec.EllipticCurvePrivateKey, ciphertext: bytes) -> bytes:
@@ -366,28 +440,84 @@ def _decrypt_ecies_parts(
     except ValueError:
         return None
 
+    # P-384's cofactor is 1, so plain ECDH and cofactor ECDH are the same computation.
+    # There is nothing to search on that axis.
     shared = private_key.exchange(ec.ECDH(), ephemeral)
+    ours = public_point(private_key)
 
     for variant in _ecies_variants():
-        shared_info = point if variant.shared_info_is_point else b""
-        length = variant.key_length + (variant.iv_length if variant.derived_iv else 0)
-        material = _x963_kdf(shared, shared_info, length, variant.digest)
+        info = _part(variant.shared_info, point, ours)
 
-        key = material[: variant.key_length]
-        iv = material[variant.key_length :] if variant.derived_iv else bytes(variant.iv_length)
+        if variant.cipher == "ctr-hmac":
+            plaintext = _open_ctr_hmac(variant, shared, info, point, body, tag)
+        else:
+            key, iv = variant.material(shared, info)
+            plaintext = _open_gcm(variant, key, iv, point, body, tag, ours)
 
-        decryptor = Cipher(algorithms.AES(key), modes.GCM(iv, tag)).decryptor()
-        if variant.aad_is_point:
-            decryptor.authenticate_additional_data(point)
-        try:
-            plaintext = decryptor.update(body) + decryptor.finalize()
-        except InvalidTag:
+        if plaintext is None:
             continue
 
         logger.info("ECIES variant %s decrypted a share", variant.name)
         return plaintext
 
     return None
+
+
+def _open_gcm(  # noqa: PLR0913
+    variant: EciesVariant,
+    key: bytes,
+    iv: bytes,
+    point: bytes,
+    body: bytes,
+    tag: bytes,
+    ours: bytes,
+) -> bytes | None:
+    """Try one AES-GCM variant. The tag decides; a wrong choice cannot false-positive."""
+    decryptor = Cipher(algorithms.AES(key), modes.GCM(iv, tag)).decryptor()
+
+    aad = _part(variant.aad, point, ours)
+    if aad:
+        decryptor.authenticate_additional_data(aad)
+
+    try:
+        return decryptor.update(body) + decryptor.finalize()
+    except InvalidTag:
+        return None
+
+
+def _open_ctr_hmac(  # noqa: PLR0913
+    variant: EciesVariant,
+    shared: bytes,
+    info: bytes,
+    point: bytes,
+    body: bytes,
+    code: bytes,
+) -> bytes | None:
+    """
+    Try one AES-CTR-plus-HMAC variant.
+
+    Here the sixteen bytes are a **truncated HMAC** rather than a GCM tag -- which is what
+    the archive naming that member `SFIESAuthenticationCode` rather than a tag suggests,
+    and what the ciphertext lengths leave open now that every padded mode is ruled out.
+
+    This derives its own material rather than taking a key, because it needs a MAC key
+    past the cipher key and GCM does not. The MAC is checked before decrypting, so a
+    wrong variant costs one hash.
+    """
+    mac_length = 48 if variant.digest == "sha384" else 32
+
+    expand = _x963_kdf if variant.kdf == "x963" else _hkdf
+    material = expand(shared, info, variant.key_length + mac_length, variant.digest)
+
+    key, mac_key = material[: variant.key_length], material[variant.key_length :]
+    signed = point + body if variant.aad == "point+ct" else body
+
+    digest = hmac.new(mac_key, signed, variant.digest).digest()
+    if not hmac.compare_digest(digest[: len(code)], code):
+        return None
+
+    decryptor = Cipher(algorithms.AES(key), modes.CTR(bytes(16))).decryptor()
+    return decryptor.update(body) + decryptor.finalize()
 
 
 # --------------------------------------------------------------------------------------
@@ -739,6 +869,9 @@ def unwrap_share(
     entry: ShareEntry,
     encryption_key: ec.EllipticCurvePrivateKey,
     directory: PeerDirectory | None = None,
+    *,
+    alternates: Mapping[str, ec.EllipticCurvePrivateKey] | None = None,
+    expected_receiver: str | None = None,
 ) -> KeyShare:
     """
     Unwrap one share with the recovered peer's encryption key.
@@ -752,13 +885,22 @@ def unwrap_share(
         directory is treated as no directory at all rather than as "every sender is
         unknown" -- refusing every share because the circle could not be read reports a
         verification failure where the real problem is nothing to verify against.
+    :param alternates: Other keys recovery yielded, tried if the encryption key does not
+        work and named in the diagnostic. Which of a peer's two keys a share is wrapped to
+        is a question the share itself answers, and trying both costs nothing.
+    :param expected_receiver: The recovered peer's identifier. Comparing it against the
+        share's `receiver` is the same evidence as the declared key, for free and without
+        depending on that field being populated -- and it is worth having independently,
+        because if the receiver does not match then no cipher parameter was ever going to
+        help and the ECIES failure says nothing about the construction.
     """
     share = entry.share
+    candidates: dict[str, ec.EllipticCurvePrivateKey] = {"encryption": encryption_key}
+    candidates.update(alternates or {})
 
     sender = directory.get(share.sender) if directory is not None else None
     sender_known = sender is not None
     sender_verified = verify_share_signature(share, sender) if sender is not None else False
-
 
     def failed(reason: str, wrapped: bytes = b"") -> KeyShare:
         return KeyShare(
@@ -782,18 +924,44 @@ def unwrap_share(
         return failed("this share carries no wrapped key")
 
     # A share names the key it was wrapped to, so "wrong key" and "wrong construction"
-    # are distinguishable before decrypting rather than guessed at afterwards. They fail
-    # identically -- an authentication tag that does not check -- and the two lead in
-    # opposite directions: one back to how the encryption key was recovered, the other to
-    # the ECIES parameters. Saying which is why this check is worth its few lines.
-    mismatch = _receiver_key_mismatch(share, encryption_key)
-    if mismatch is not None:
-        return failed(mismatch, share.wrapped_key)
+    # are distinguishable from the data rather than guessed at afterwards. They fail
+    # identically -- an authentication tag that does not check -- and lead in opposite
+    # directions: one back to how the key was recovered, the other to the ECIES
+    # parameters. This verdict is reported whether or not anything decrypts, because a
+    # failure that cannot say which of the two it is sends the next hour the wrong way.
+    verdict = describe_receiver_key(share, candidates)
 
-    try:
-        plaintext = ecies_decrypt_archive(encryption_key, share.wrapped_key)
-    except ShareError as e:
-        return failed(str(e), share.wrapped_key)
+    if expected_receiver is not None and share.receiver != expected_receiver:
+        return failed(
+            f"this share is for peer {share.receiver!r}, not the recovered peer"
+            f" {expected_receiver!r}, so no key we hold was ever going to open it",
+            share.wrapped_key,
+        )
+
+    # If the share names one of our keys, that is the key -- otherwise every key we hold
+    # is worth trying, since a wrong one costs microseconds and only a tag check.
+    named = matching_candidate(share.receiver_public_encryption_key, candidates)
+    order = [named] if named is not None else list(candidates)
+
+    plaintext = None
+    for name in order:
+        with contextlib.suppress(ShareError):
+            plaintext = ecies_decrypt_archive(candidates[name], share.wrapped_key)
+        if plaintext is not None:
+            if name != "encryption":
+                logger.warning(
+                    "This share unwrapped under the %s key, not the encryption key",
+                    name,
+                )
+            break
+
+    if plaintext is None:
+        return failed(
+            f"nothing authenticated as an ECIES ciphertext under {' or '.join(order)}."
+            f" The share says {verdict}. The archive holds:"
+            f" {describe_archive(share.wrapped_key)}",
+            share.wrapped_key,
+        )
 
     wrapped = share.wrapped_key
 
@@ -810,34 +978,55 @@ def unwrap_share(
     )
 
 
-def _receiver_key_mismatch(
-    share: ShareRecord,
-    encryption_key: ec.EllipticCurvePrivateKey,
+def matching_candidate(
+    declared: bytes,
+    candidates: Mapping[str, ec.EllipticCurvePrivateKey],
 ) -> str | None:
     """
-    Check that this key is the one the share was wrapped to.
+    Find which of our keys a share names as its receiver, if any.
 
-    :returns: A description of the mismatch, or None if the keys agree -- or if the share
-        does not say, which is not a mismatch and must not be reported as one.
+    Compares by meaning rather than by bytes: a key named as a SubjectPublicKeyInfo and
+    the same key as a bare point are the same key.
+    """
+    wanted = _load_point(declared) or declared
+
+    for name, key in candidates.items():
+        if public_point(key) == wanted:
+            return name
+    return None
+
+
+def describe_receiver_key(
+    share: ShareRecord,
+    candidates: Mapping[str, ec.EllipticCurvePrivateKey],
+) -> str:
+    """
+    Say what the share's declared receiver key establishes about our keys.
+
+    This exists because a wrong key and a wrong cipher construction **fail identically**
+    -- an authentication tag that does not check -- and lead in opposite directions. The
+    share names the key it was wrapped to, so the question is already answered in the
+    data; not asking it is what turns a settled fact into a search.
+
+    Note that "the share names no key" and "the share names ours" are very different
+    findings and must not collapse into one silence: the first establishes nothing, the
+    second establishes that the key is right and the construction is what remains.
     """
     declared = share.receiver_public_encryption_key
     if not declared:
-        return None
+        return "it names no receiver key, so nothing here confirms the key is right"
 
-    ours = public_point(encryption_key)
-    if declared == ours:
-        return None
+    match = matching_candidate(declared, candidates)
+    if match is not None:
+        return (
+            f"it is addressed to our {match} key, so that key is right and the"
+            " construction is what remains"
+        )
 
-    # A key can be named as a bare point or wrapped in a SubjectPublicKeyInfo, so compare
-    # what they mean rather than how they are written.
-    loaded = _load_point(declared)
-    if loaded is not None and loaded == ours:
-        return None
-
+    ours = ", ".join(f"{name} {public_point(key)[:6].hex()}…" for name, key in candidates.items())
     return (
-        f"this share is wrapped to a different key than the one recovered: it names"
-        f" {declared[:8].hex()}… ({len(declared)} bytes) and the recovered encryption key"
-        f" is {ours[:8].hex()}…. The recovery is what to look at, not the cipher"
+        f"it is addressed to {declared[:6].hex()}… ({len(declared)} bytes), which is"
+        f" none of ours ({ours}) -- so the recovery is what to look at, not the cipher"
     )
 
 
