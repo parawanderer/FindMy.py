@@ -162,6 +162,8 @@ cython_debug/
 
 account.json
 airtag.plist
+ani_libs.bin
+.vscode/
 DO_NOT_COMMIT*
 .direnv/
 accessories/

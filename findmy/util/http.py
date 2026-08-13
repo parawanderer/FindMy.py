@@ -50,6 +50,11 @@ class HttpResponse:
         """Whether the status code is "OK" (2xx)."""
         return str(self._status_code).startswith("2")
 
+    @property
+    def content(self) -> bytes:
+        """Raw response body, for responses that are not text."""
+        return self._content
+
     def text(self) -> str:
         """Response content as a UTF-8 encoded string."""
         return self._content.decode("utf-8")
