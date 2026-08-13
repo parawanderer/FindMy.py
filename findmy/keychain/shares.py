@@ -20,7 +20,6 @@ import base64
 import binascii
 import contextlib
 import hashlib
-import hmac
 import logging
 import plistlib
 from dataclasses import dataclass, field
@@ -30,7 +29,7 @@ from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import AESSIV
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from google.protobuf.message import DecodeError
 
@@ -190,334 +189,158 @@ def describe_archive(data: bytes) -> str:
     return ", ".join(parts) or "<empty>"
 
 
-def ecies_parts(blobs: list[bytes], point_length: int) -> list[tuple[bytes, bytes, bytes]]:
+def archived_members(data: bytes) -> dict[str, bytes]:
     """
-    Assemble candidate (point, body, tag) triples from an archive's members.
+    Pull an archive's byte members out with the names the archive gives them.
 
-    The parts may arrive concatenated in one member or split across several, and which
-    member is which is not stated -- so both readings are offered and GCM's tag decides.
-    A point is recognised by its length and leading byte, a tag by being sixteen bytes.
+    Names matter here rather than shapes: the members of an `SFIESCiphertext` say what
+    they are, and reading them by name is what stops a reader pairing the wrong two.
     """
-    points = [b for b in blobs if len(b) == point_length and b[:1] == b"\x04"]
-    tags = [b for b in blobs if len(b) == _GCM_TAG_LENGTH]
-    bodies = [b for b in blobs if len(b) not in (point_length, _GCM_TAG_LENGTH)]
+    members: dict[str, bytes] = {}
 
-    triples = [(point, body, tag) for point in points for body in bodies for tag in tags]
+    def walk(value: Any, path: str, depth: int = 0) -> None:  # noqa: ANN401
+        if depth > 32:
+            return
+        if isinstance(value, bytes):
+            members[path] = value
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                walk(item, f"{path}.{key}" if path else str(key), depth + 1)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]", depth + 1)
 
-    # A member that already carries all three, concatenated.
-    triples.extend(
-        (blob[:point_length], blob[point_length:-_GCM_TAG_LENGTH], blob[-_GCM_TAG_LENGTH:])
-        for blob in blobs
-        if len(blob) > point_length + _GCM_TAG_LENGTH and blob[:1] == b"\x04"
-    )
+    walk(unarchive(data), "")
+    return members
 
-    return triples
+
+# The members of an SFIESCiphertext, matched on a distinctive fragment rather than the
+# whole name. Apple's own key for the ephemeral point reads
+# `SFEphemeralSenderPublicKeyExternaRepresentation` -- "Externa", missing its final `l` --
+# so matching the spelled-out name would find nothing on real data.
+_MEMBER_POINT = "EphemeralSenderPublicKey"
+_MEMBER_CIPHERTEXT = "SFCiphertext"
+_MEMBER_CODE = "AuthenticationCode"
+
+
+@dataclass(frozen=True)
+class SfiesParts:
+    """The three members of an `SFIESCiphertext`, with the ciphertext already trimmed."""
+
+    point: bytes
+    ciphertext: bytes
+    code: bytes
+
+
+def sfies_parts(archive: bytes) -> SfiesParts:
+    """
+    Read an `SFIESCiphertext` archive into the three pieces decryption needs.
+
+    **`SFCiphertext` is longer than the ciphertext.** It overruns by exactly the size of
+    the other two members -- the ephemeral point plus the authentication code -- and the
+    excess is uninitialised heap from Apple's own buffer. It is not padding, not a nonce
+    and not part of any construction, so it is trimmed here and never read, logged or
+    modelled.
+
+    That overrun is why a correct implementation still fails: the tag check rejects it
+    exactly as a wrong key or a wrong cipher parameter would, which sends the search after
+    the construction when the construction was right all along.
+
+    The trim is derived from the other two members rather than written as 113, because a
+    different curve makes it a different number.
+
+    :raises ShareError: If the archive is not an `SFIESCiphertext`.
+    """
+    members = archived_members(archive)
+
+    def find(fragment: str) -> bytes | None:
+        return next((v for k, v in members.items() if fragment in k), None)
+
+    point = find(_MEMBER_POINT)
+    ciphertext = find(_MEMBER_CIPHERTEXT)
+    code = find(_MEMBER_CODE)
+
+    if point is None or ciphertext is None or code is None:
+        msg = (
+            "This archive is not an SFIESCiphertext: it holds"
+            f" {describe_archive(archive)}"
+        )
+        raise ShareError(msg)
+
+    overrun = len(point) + len(code)
+    if len(ciphertext) <= overrun:
+        msg = (
+            f"The ciphertext member is {len(ciphertext)} bytes, which is not longer than"
+            f" the {overrun}-byte overrun it is expected to carry"
+        )
+        raise ShareError(msg)
+
+    return SfiesParts(point=point, ciphertext=ciphertext[:-overrun], code=code)
 
 
 # --------------------------------------------------------------------------------------
-# ECIES
+# SFIES
 # --------------------------------------------------------------------------------------
 
 
-def _x963_kdf(shared: bytes, shared_info: bytes, length: int, digest: str = "sha256") -> bytes:
-    """
-    ANSI X9.63 key derivation, as Apple's ECIES uses it.
-
-    :param digest: Which hash. Not fixed at SHA-256: a construction for a P-384 key may
-        pair the curve with SHA-384, and the two are indistinguishable without trying.
-    """
+def _x963_kdf(shared: bytes, shared_info: bytes, length: int) -> bytes:
+    """ANSI X9.63 key derivation with SHA-256, counter starting at one."""
     out = b""
     counter = 1
     while len(out) < length:
         block = shared + counter.to_bytes(4, "big") + shared_info
-        out += hashlib.new(digest, block).digest()
+        out += hashlib.sha256(block).digest()
         counter += 1
     return out[:length]
 
 
-def _hkdf(shared: bytes, shared_info: bytes, length: int, digest: str) -> bytes:
-    """HKDF with an empty salt, the other standard way to expand an ECDH secret."""
-    algorithm = hashes.SHA384() if digest == "sha384" else hashes.SHA256()
-    return HKDF(algorithm=algorithm, length=length, salt=None, info=shared_info).derive(shared)
+# 32 bytes of AES-256 key followed by a 16-byte GCM nonce. Sixteen, not the twelve a GCM
+# nonce is usually specified as -- and the two authenticate differently, so this is not a
+# detail a reader can normalise on the way past.
+_SFIES_KEY_LENGTH = 32
+_SFIES_NONCE_LENGTH = 16
 
 
-# Which bytes a variant feeds to the KDF as shared info, or to the cipher as associated
-# data. Named rather than boolean because there are more than two plausible answers and a
-# report saying `info=point-x` is worth more than one saying `info=True`. `point-x` is the
-# compact x-only representation of the ephemeral point, which is a distinct thing to hash
-# from the uncompressed form and cannot be reached by a boolean.
-_PARTS = ("point", "point-x", "empty", "point+ours", "ours")
-
-
-def _part(kind: str, point: bytes, ours: bytes) -> bytes:
-    """Assemble the bytes a named choice refers to."""
-    if kind == "point":
-        return point
-    if kind == "point-x":
-        return point[1 : 1 + (len(point) - 1) // 2]
-    if kind == "ours":
-        return ours
-    if kind == "point+ours":
-        return point + ours
-    return b""
-
-
-# Where the IV comes from. `zero` is an all-zero IV of the stated length; the other two
-# take it from the KDF, and **which end it comes from matters** -- the same derived bytes
-# split the other way give a different key and a different IV, and both authenticate as
-# nothing.
-_IV_SOURCES = ("zero", "key-then-iv", "iv-then-key")
-
-
-@dataclass(frozen=True)
-class EciesVariant:
-    """
-    One way of turning a shared secret into a key, an IV and associated data.
-
-    The specification names the construction -- ephemeral point, a KDF, authenticated
-    encryption -- but not the parameters, and a wrong choice does not announce itself: it
-    fails as an authentication tag that does not check, exactly as a wrong *key* does.
-
-    So this enumerates rather than guesses. Each attempt is one AES pass over ~230 bytes
-    and cannot false-positive -- a 16-byte authenticator matching by chance is a 2^-128
-    event -- whereas verifying a single guess costs a passcode-authenticated round trip
-    against a real account. The name of whichever authenticates is logged, so the answer
-    can be written into the specification and the search deleted.
-    """
-
-    kdf: str
-    digest: str
-    key_length: int
-    iv_length: int
-    iv_source: str
-    shared_info: str
-    aad: str
-    cipher: str = "gcm"
-
-    @property
-    def name(self) -> str:
-        """A short label naming what this variant chose, for reporting a match."""
-        return (
-            f"{self.kdf}/{self.digest}/aes{self.key_length * 8}-{self.cipher}"
-            f"/{self.iv_source}{self.iv_length}"
-            f"/info={self.shared_info}/aad={self.aad}"
-        )
-
-    def material(self, shared: bytes, shared_info: bytes) -> tuple[bytes, bytes]:
-        """Derive the key and IV this variant calls for."""
-        wants_iv = self.iv_source != "zero"
-        length = self.key_length + (self.iv_length if wants_iv else 0)
-
-        expand = _x963_kdf if self.kdf == "x963" else _hkdf
-        out = expand(shared, shared_info, length, self.digest)
-
-        if not wants_iv:
-            return out[: self.key_length], bytes(self.iv_length)
-        if self.iv_source == "key-then-iv":
-            return out[: self.key_length], out[self.key_length :]
-        return out[self.iv_length :], out[: self.iv_length]
-
-
-def _ecies_variants() -> list[EciesVariant]:
-    """
-    Every parameter combination worth trying.
-
-    Two families. AES-GCM, where the 16-byte member is a GCM tag; and AES-CTR with a
-    truncated HMAC, where it is a MAC computed separately. The second is here because the
-    archive calls that member `SFIESAuthenticationCode` rather than a tag, and because the
-    ciphertexts are 227 to 245 bytes -- never a multiple of the block size, which rules
-    out CBC and every other padded mode but leaves both of these open.
-    """
-    gcm = [
-        EciesVariant(kdf, digest, key_length, iv_length, iv_source, info, aad)
-        for kdf in ("x963", "hkdf")
-        for digest in ("sha256", "sha384")
-        for key_length in (16, 32)
-        # A GCM nonce is twelve bytes by specification, but Apple's ECIES has been seen
-        # with a sixteen-byte all-zero one, and the two authenticate differently.
-        for iv_length in (12, 16)
-        for iv_source in _IV_SOURCES
-        for info in _PARTS
-        for aad in _PARTS
-    ]
-
-    ctr = [
-        EciesVariant(kdf, digest, key_length, 16, "zero", info, mac, cipher="ctr-hmac")
-        for kdf in ("x963", "hkdf")
-        for digest in ("sha256", "sha384")
-        for key_length in (16, 32)
-        for info in _PARTS
-        for mac in ("point+ct", "ct")
-    ]
-
-    return gcm + ctr
-
-
-def ecies_decrypt(private_key: ec.EllipticCurvePrivateKey, ciphertext: bytes) -> bytes:
-    """
-    Decrypt an Apple ECIES ciphertext held in one blob.
-
-    Kept for a payload that arrives already concatenated; a share's arrives inside an
-    archive, for which :func:`ecies_decrypt_archive` is the entry point.
-    """
-    point_length = 1 + 2 * ((private_key.curve.key_size + 7) // 8)
-
-    starts = [i for i, byte in enumerate(ciphertext) if byte == 0x04]
-    starts = [i for i in starts if len(ciphertext) - i > point_length + _GCM_TAG_LENGTH][:8]
-
-    if not starts:
-        msg = (
-            f"No uncompressed point begins anywhere in these {len(ciphertext)} bytes, so"
-            f" this is not an ECIES ciphertext for a {private_key.curve.name} key."
-            f" It starts {ciphertext[:16].hex()}"
-        )
-        raise ShareError(msg)
-
-    for start in starts:
-        result = _try_ecies(private_key, ciphertext, start, point_length)
-        if result is not None:
-            return result
-
-    msg = (
-        "None of the ECIES variants authenticated at any plausible offset. Either this"
-        " key does not receive this share, or the construction differs from the ones"
-        " tried."
-    )
-    raise ShareError(msg)
-
-
-def ecies_decrypt_archive(private_key: ec.EllipticCurvePrivateKey, archive: bytes) -> bytes:
-    """
-    Decrypt an ECIES ciphertext that arrives as an archived structure.
-
-    The archive holds the ephemeral point, the ciphertext and the tag as **separate
-    members**, not as one blob -- which is what "expands to an ECIES ciphertext structure"
-    means and what a reader expecting a single payload gets wrong. Which member is which
-    is not stated, so they are recognised by shape and every combination is tried; the
-    authentication tag makes a wrong pairing free to reject.
-
-    :raises ShareError: If nothing in the archive authenticates.
-    """
-    blobs = archived_blobs(archive)
-    point_length = 1 + 2 * ((private_key.curve.key_size + 7) // 8)
-
-    for point, body, tag in ecies_parts(blobs, point_length):
-        result = _decrypt_ecies_parts(private_key, point, body, tag)
-        if result is not None:
-            return result
-
-    msg = (
-        "Nothing in this archive authenticated as an ECIES ciphertext for a"
-        f" {private_key.curve.name} key. It holds: {describe_archive(archive)}"
-    )
-    raise ShareError(msg)
-
-
-def _try_ecies(
+def sfies_decrypt(
     private_key: ec.EllipticCurvePrivateKey,
-    ciphertext: bytes,
-    start: int,
-    point_length: int,
-) -> bytes | None:
-    """Try one starting offset, across the key-derivation variants."""
-    return _decrypt_ecies_parts(
-        private_key,
-        ciphertext[start : start + point_length],
-        ciphertext[start + point_length : -_GCM_TAG_LENGTH],
-        ciphertext[-_GCM_TAG_LENGTH:],
-    )
+    parts: SfiesParts,
+) -> bytes:
+    """
+    Decrypt an `SFIESCiphertext`.
 
+    Plain ECDH -- P-384's cofactor is one, so there is no cofactor variant to consider --
+    then ANSI X9.63 with SHA-256, using the ephemeral point **exactly as archived** as the
+    shared info. That yields 48 bytes: an AES-256 key and a 16-byte GCM nonce. There is no
+    associated data, and the authentication code is the GCM tag.
 
-def _decrypt_ecies_parts(
-    private_key: ec.EllipticCurvePrivateKey,
-    point: bytes,
-    body: bytes,
-    tag: bytes,
-) -> bytes | None:
-    """Try one (point, body, tag) triple across the key-derivation variants."""
+    :raises ShareError: If it does not authenticate.
+    """
     try:
-        ephemeral = ec.EllipticCurvePublicKey.from_encoded_point(private_key.curve, point)
-    except ValueError:
-        return None
+        ephemeral = ec.EllipticCurvePublicKey.from_encoded_point(private_key.curve, parts.point)
+    except ValueError as e:
+        msg = f"The archived ephemeral key is not a point on {private_key.curve.name}: {e}"
+        raise ShareError(msg) from None
 
-    # P-384's cofactor is 1, so plain ECDH and cofactor ECDH are the same computation.
-    # There is nothing to search on that axis.
     shared = private_key.exchange(ec.ECDH(), ephemeral)
-    ours = public_point(private_key)
+    material = _x963_kdf(shared, parts.point, _SFIES_KEY_LENGTH + _SFIES_NONCE_LENGTH)
 
-    for variant in _ecies_variants():
-        info = _part(variant.shared_info, point, ours)
+    key = material[:_SFIES_KEY_LENGTH]
+    nonce = material[_SFIES_KEY_LENGTH:]
 
-        if variant.cipher == "ctr-hmac":
-            plaintext = _open_ctr_hmac(variant, shared, info, point, body, tag)
-        else:
-            key, iv = variant.material(shared, info)
-            plaintext = _open_gcm(variant, key, iv, point, body, tag, ours)
-
-        if plaintext is None:
-            continue
-
-        logger.info("ECIES variant %s decrypted a share", variant.name)
-        return plaintext
-
-    return None
-
-
-def _open_gcm(  # noqa: PLR0913
-    variant: EciesVariant,
-    key: bytes,
-    iv: bytes,
-    point: bytes,
-    body: bytes,
-    tag: bytes,
-    ours: bytes,
-) -> bytes | None:
-    """Try one AES-GCM variant. The tag decides; a wrong choice cannot false-positive."""
-    decryptor = Cipher(algorithms.AES(key), modes.GCM(iv, tag)).decryptor()
-
-    aad = _part(variant.aad, point, ours)
-    if aad:
-        decryptor.authenticate_additional_data(aad)
-
+    decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, parts.code)).decryptor()
     try:
-        return decryptor.update(body) + decryptor.finalize()
+        return decryptor.update(parts.ciphertext) + decryptor.finalize()
     except InvalidTag:
-        return None
+        msg = (
+            "The SFIES ciphertext did not authenticate under this key. The key, the"
+            " trimming of the ciphertext member, or the shared secret is wrong"
+        )
+        raise ShareError(msg) from None
 
 
-def _open_ctr_hmac(  # noqa: PLR0913
-    variant: EciesVariant,
-    shared: bytes,
-    info: bytes,
-    point: bytes,
-    body: bytes,
-    code: bytes,
-) -> bytes | None:
-    """
-    Try one AES-CTR-plus-HMAC variant.
-
-    Here the sixteen bytes are a **truncated HMAC** rather than a GCM tag -- which is what
-    the archive naming that member `SFIESAuthenticationCode` rather than a tag suggests,
-    and what the ciphertext lengths leave open now that every padded mode is ruled out.
-
-    This derives its own material rather than taking a key, because it needs a MAC key
-    past the cipher key and GCM does not. The MAC is checked before decrypting, so a
-    wrong variant costs one hash.
-    """
-    mac_length = 48 if variant.digest == "sha384" else 32
-
-    expand = _x963_kdf if variant.kdf == "x963" else _hkdf
-    material = expand(shared, info, variant.key_length + mac_length, variant.digest)
-
-    key, mac_key = material[: variant.key_length], material[variant.key_length :]
-    signed = point + body if variant.aad == "point+ct" else body
-
-    digest = hmac.new(mac_key, signed, variant.digest).digest()
-    if not hmac.compare_digest(digest[: len(code)], code):
-        return None
-
-    decryptor = Cipher(algorithms.AES(key), modes.CTR(bytes(16))).decryptor()
-    return decryptor.update(body) + decryptor.finalize()
+def sfies_decrypt_archive(private_key: ec.EllipticCurvePrivateKey, archive: bytes) -> bytes:
+    """Read an `SFIESCiphertext` archive and decrypt it."""
+    return sfies_decrypt(private_key, sfies_parts(archive))
 
 
 # --------------------------------------------------------------------------------------
@@ -545,7 +368,7 @@ class KeyShare:
     error: str | None = None
     """Why it could not be, if it could not."""
 
-    view_keys: list[bytes] = field(default_factory=list)
+    view_keys: dict[str, bytes] = field(default_factory=dict)
     """The view's keys, unwrapped under the key this share yielded."""
 
     sender_known: bool = False
@@ -643,8 +466,17 @@ class ViewKey:
     wrapped_key: bytes
     upload_version: int
 
+    slot: str = ""
+    """
+    Which member of the view key set this came from: `tlk`, `classA` or `classB`.
+
+    Kept because the slot decides how the key is obtained and the record's own `class`
+    field is not a reliable substitute -- the top-level key is **not wrapped at all**,
+    while the class keys are, and unwrapping is not something to get wrong by one field.
+    """
+
     @classmethod
-    def from_record(cls, record: ck.Record) -> ViewKey:
+    def from_record(cls, record: ck.Record, slot: str = "") -> ViewKey:
         """Read a `synckey` record."""
         fields = named_fields(record)
         key_class = fields.get("class")
@@ -654,6 +486,7 @@ class ViewKey:
             key_class=key_class if isinstance(key_class, str) else "",
             wrapped_key=_as_bytes(fields.get("wrappedkey")),
             upload_version=int(upload) if isinstance(upload, (int, float)) else 0,
+            slot=slot,
         )
 
 
@@ -797,16 +630,16 @@ def decode_share_entry(data: bytes) -> ShareEntry | None:
 
 def read_view_keys(keys: cf.ViewKeySet) -> list[ViewKey]:
     """
-    Read a view's keys out of their wrappers.
+    Read a view's keys out of their wrappers, remembering which slot each came from.
 
-    Their field numbers are assumed rather than stated, and a wrong one yields no key
-    rather than an error -- so the count is worth reporting instead of trusting.
+    The slot is not decoration: the top-level key and the class keys are obtained by
+    different means, and only the position distinguishes them reliably.
     """
     found: list[ViewKey] = []
-    for wrapper in (keys.tlk, keys.class_a, keys.class_b):
+    for slot, wrapper in (("tlk", keys.tlk), ("classA", keys.class_a), ("classB", keys.class_b)):
         record = _record_in(wrapper)
         if record is not None:
-            found.append(ViewKey.from_record(record))
+            found.append(ViewKey.from_record(record, slot))
     return found
 
 
@@ -946,7 +779,7 @@ def unwrap_share(
     plaintext = None
     for name in order:
         with contextlib.suppress(ShareError):
-            plaintext = ecies_decrypt_archive(candidates[name], share.wrapped_key)
+            plaintext = sfies_decrypt_archive(candidates[name], share.wrapped_key)
         if plaintext is not None:
             if name != "encryption":
                 logger.warning(
@@ -1040,73 +873,100 @@ def _load_point(data: bytes) -> bytes | None:
     return key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
 
 
-def unwrap_view_keys(keys: list[ViewKey], share_plaintext: bytes) -> list[bytes]:
+def parse_key_material(plaintext: bytes) -> cf.TlkKeyMaterial:
     """
-    Unwrap a view's keys with the key the share yielded.
+    Read what a decrypted share expands to.
 
-    **These are wrapped under the share's key, not under a peer key** -- a different key
-    from the one that opened the share, and the same ECIES construction. Keep all of them:
-    the top key alone is not what a record's protection structure is matched against, so
-    discarding the class keys leaves the interesting records undecryptable for a reason
-    nothing would explain.
+    Four members, and **field 4 is the view's top-level key itself** -- symmetric key
+    bytes, not a container holding a key and not an EC private key. Reading it as an EC
+    scalar fails on every share, because the bytes were never that.
 
-    Failures are logged rather than raised, since a view key this client cannot read is
-    not a reason to discard the share key it already has.
+    :raises ShareError: If the plaintext is not a key message.
     """
-    recovered: list[bytes] = []
+    material = cf.TlkKeyMaterial()
+    try:
+        material.ParseFromString(plaintext)
+    except DecodeError:
+        msg = (
+            "A share decrypted but its plaintext is not a key message. Its top-level"
+            f" fields are: {describe_wire(plaintext)}"
+        )
+        raise ShareError(msg) from None
 
-    private_key = _share_key_as_private(share_plaintext)
-    if private_key is None:
-        if keys:
-            logger.warning(
-                "A share yielded %d bytes that are not an EC private key, so its %d view"
-                " key(s) cannot be unwrapped",
-                len(share_plaintext),
-                len(keys),
-            )
-        return recovered
+    if not material.key:
+        msg = (
+            "A share decrypted to a key message carrying no key at field 4. Its"
+            f" top-level fields are: {describe_wire(plaintext)}"
+        )
+        raise ShareError(msg)
+
+    return material
+
+
+def unwrap_class_key(wrapped: bytes, top_level_key: bytes) -> bytes:
+    """
+    Unwrap a class key with the view's top-level key.
+
+    **This is not the ECIES that opened the share.** It is AES-SIV (RFC 5297) with CMAC,
+    keyed with the top-level key, and with **no associated data at all** -- an empty
+    *vector* of headers, which is not the same thing as a vector holding one empty header.
+    The two produce different results, and the wrong one fails as an authentication
+    failure with nothing to say it was the header count.
+
+    :raises ShareError: If it does not authenticate.
+    """
+    try:
+        # None is the empty vector. Passing [b""] would be one empty header instead.
+        return AESSIV(top_level_key).decrypt(wrapped, None)
+    except InvalidTag:
+        msg = "The class key did not authenticate under the view's top-level key"
+        raise ShareError(msg) from None
+    except ValueError as e:
+        msg = f"The top-level key is not a usable AES-SIV key ({len(top_level_key)} bytes): {e}"
+        raise ShareError(msg) from None
+
+
+def unwrap_view_keys(keys: list[ViewKey], share_plaintext: bytes) -> dict[str, bytes]:
+    """
+    Assemble a view's three keys.
+
+    **Three, not four.** The top-level key is not wrapped anywhere -- it *is* what the
+    share decrypted to, so looking for a fourth thing to unwrap finds a `tlk` record whose
+    contents were already in hand. Only `classA` and `classB` are wrapped, and under that
+    top-level key rather than under any peer key.
+
+    Keep all three: the top-level key alone is not what a record's protection structure is
+    matched against, so discarding the class keys leaves the interesting records
+    undecryptable for a reason nothing would explain.
+
+    Failures are logged rather than raised, since a class key this client cannot read is
+    not a reason to discard the top-level key it already has.
+
+    :returns: The keys by name -- `tlk`, `classA`, `classB`.
+    """
+    try:
+        material = parse_key_material(share_plaintext)
+    except ShareError as e:
+        logger.warning("%s", e)
+        return {}
+
+    recovered = {"tlk": material.key}
 
     for key in keys:
+        if key.slot == "tlk":
+            # Already held: this record carries the key the share itself decrypted to.
+            continue
         if not key.wrapped_key:
             continue
         try:
-            recovered.append(ecies_decrypt_archive(private_key, key.wrapped_key))
+            recovered[key.slot or key.key_class] = unwrap_class_key(
+                key.wrapped_key,
+                material.key,
+            )
         except ShareError as e:
-            logger.warning("View key %r did not unwrap: %s", key.key_class or "?", e)
+            logger.warning("View key %r did not unwrap: %s", key.slot or key.key_class, e)
 
     return recovered
-
-
-def _share_key_as_private(plaintext: bytes) -> ec.EllipticCurvePrivateKey | None:
-    """
-    Read a share's plaintext as an EC private key.
-
-    The plaintext is a key message -- a UUID, a zone name, a key class and the key bytes --
-    and it is the key bytes that unwrap the view keys. Both the whole plaintext and any
-    scalar-sized run inside it are tried, since which part is the key is not stated.
-    """
-    for candidate in _key_candidates(plaintext):
-        for curve in (ec.SECP384R1(), ec.SECP256R1()):
-            if len(candidate) != (curve.key_size + 7) // 8:
-                continue
-            try:
-                return ec.derive_private_key(int.from_bytes(candidate, "big"), curve)
-            except ValueError:
-                continue
-    return None
-
-
-def _key_candidates(plaintext: bytes) -> list[bytes]:
-    """List the byte runs of a share plaintext that might be the key itself."""
-    from findmy.cloudkit.records import iter_wire_fields  # noqa: PLC0415
-
-    candidates = [plaintext]
-    with contextlib.suppress(Exception):
-        # A plaintext that is not a message is still a candidate in its own right.
-        candidates.extend(
-            payload for _, wire, payload in iter_wire_fields(plaintext) if wire == 2 and payload
-        )
-    return candidates
 
 
 def summarise(shares: Sequence[KeyShare]) -> str:

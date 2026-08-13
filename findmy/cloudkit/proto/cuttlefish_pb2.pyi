@@ -93,6 +93,18 @@ class ViewKeySet(_message.Message):
     class_b: RecordWrapper
     def __init__(self, tlk: _Optional[_Union[RecordWrapper, _Mapping]] = ..., class_a: _Optional[_Union[RecordWrapper, _Mapping]] = ..., class_b: _Optional[_Union[RecordWrapper, _Mapping]] = ...) -> None: ...
 
+class TlkKeyMaterial(_message.Message):
+    __slots__ = ("uuid", "zone_name", "key_class", "key")
+    UUID_FIELD_NUMBER: _ClassVar[int]
+    ZONE_NAME_FIELD_NUMBER: _ClassVar[int]
+    KEY_CLASS_FIELD_NUMBER: _ClassVar[int]
+    KEY_FIELD_NUMBER: _ClassVar[int]
+    uuid: str
+    zone_name: str
+    key_class: str
+    key: bytes
+    def __init__(self, uuid: _Optional[str] = ..., zone_name: _Optional[str] = ..., key_class: _Optional[str] = ..., key: _Optional[bytes] = ...) -> None: ...
+
 class RecordWrapper(_message.Message):
     __slots__ = ("record",)
     RECORD_FIELD_NUMBER: _ClassVar[int]

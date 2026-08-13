@@ -73,8 +73,8 @@ def report_shares(shares: list) -> bool:
         state = f"{len(share.plaintext)} bytes" if share.plaintext else f"failed: {share.error}"
         sender = f" from {share.sender}" if share.sender else ""
         print(f"  {share.service or '<no view>'}{sender}: {state}")
-        if share.view_keys:
-            print(f"      plus {len(share.view_keys)} view key(s) unwrapped")
+        for name, key in sorted(share.view_keys.items()):
+            print(f"      {name}: {len(key)} bytes")
 
     return any(share.plaintext for share in shares)
 
@@ -130,14 +130,15 @@ async def main() -> int:
                 return 1
 
             if not report_shares(shares):
-                print("\nNothing unwrapped. Either the ECIES construction differs from the")
-                print("ones tried, or these shares are not for this peer after all.")
+                print("\nNothing unwrapped. The construction is specified, so this is not a")
+                print("parameter to search for -- the failure above says which part is at")
+                print("fault, and the key having been confirmed rules out the recovery.")
                 return 1
 
             print("\nThose are keychain view keys, obtained without joining the circle:")
             print("no peer created, no voucher signed, no escrow record enrolled, nothing")
-            print("written to the account. Whether they are the ones Stage 5 needs is the")
-            print("next thing to find out.")
+            print("written to the account. Each view yields three keys -- the top-level")
+            print("key and its two class keys -- and Manatee is the one Find My needs.")
     except UnhandledProtocolError as e:
         print(f"\nFailed: {e}")
         return 1

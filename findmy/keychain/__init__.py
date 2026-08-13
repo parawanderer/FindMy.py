@@ -45,8 +45,9 @@ from .session import (
 from .shares import (
     KeyShare,
     ShareError,
-    ecies_decrypt,
     fetch_recoverable_shares,
+    sfies_decrypt,
+    sfies_decrypt_archive,
     unarchive,
     unwrap_share,
 )
@@ -71,7 +72,6 @@ __all__ = (
     "SignedBlob",
     "ViableBottles",
     "derive_bottle_keys",
-    "ecies_decrypt",
     "escrow_host",
     "fetch_recoverable_shares",
     "fetch_viable_bottles",
@@ -84,6 +84,8 @@ __all__ = (
     "parse_keyvault_message",
     "recover_bottled_peer",
     "require_key_shares",
+    "sfies_decrypt",
+    "sfies_decrypt_archive",
     "unarchive",
     "unwrap_inner_blob",
     "unwrap_outer_blob",

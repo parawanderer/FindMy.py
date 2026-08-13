@@ -1,4 +1,11 @@
-"""Tests for key shares (Stage 3 §6.7.0)."""
+"""
+Tests for key shares (Stage 3 SS6.7.0).
+
+The cipher is specified exactly, so there is no search here -- one construction, and the
+things that made a correct implementation of it fail anyway: the ciphertext member
+overruns the ciphertext, the plaintext's key is symmetric rather than an EC key, and the
+class keys use a different algorithm from the share that carried them.
+"""
 
 from __future__ import annotations
 
@@ -8,21 +15,26 @@ import plistlib
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESSIV
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from findmy.cloudkit.proto import cuttlefish_pb2 as cf
 from findmy.keychain.shares import (
     ShareError,
     archived_bytes,
-    ecies_decrypt,
+    parse_key_material,
+    sfies_decrypt_archive,
+    sfies_parts,
     summarise,
     unarchive,
+    unwrap_class_key,
     unwrap_share,
+    unwrap_view_keys,
 )
 
 
 def archive(payload: bytes) -> bytes:
-    """Build an NSKeyedArchiver archive of the shape a wrapped key arrives in."""
+    """Build an NSKeyedArchiver archive holding one payload."""
     return plistlib.dumps(
         {
             "$version": 100000,
@@ -34,20 +46,65 @@ def archive(payload: bytes) -> bytes:
     )
 
 
-def ecies_encrypt(public_key, plaintext: bytes, *, key_length: int = 16) -> bytes:  # noqa: ANN001
+def sfies_archive(
+    public_key,  # noqa: ANN001
+    plaintext: bytes,
+    *,
+    overrun: bytes | None = None,
+    names: tuple[str, str, str] = (
+        "SFEphemeralSenderPublicKeyExternaRepresentation",
+        "SFCiphertext",
+        "SFIESAuthenticationCode",
+    ),
+) -> bytes:
+    """
+    Seal exactly as the specification describes, and archive it as Apple does.
+
+    `overrun` is the trailing rubbish the real `SFCiphertext` carries. It defaults to the
+    real behaviour -- as many bytes as the point and code together -- because a test that
+    omits it would pass against an implementation that never learned to trim.
+    """
     ephemeral = ec.generate_private_key(public_key.curve)
     point = ephemeral.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
     shared = ephemeral.exchange(ec.ECDH(), public_key)
 
     out, counter = b"", 1
-    while len(out) < key_length:
+    while len(out) < 48:
         out += hashlib.sha256(shared + counter.to_bytes(4, "big") + point).digest()
         counter += 1
 
-    encryptor = Cipher(algorithms.AES(out[:key_length]), modes.GCM(bytes(16))).encryptor()
-    encryptor.authenticate_additional_data(point)
+    encryptor = Cipher(algorithms.AES(out[:32]), modes.GCM(out[32:48])).encryptor()
     body = encryptor.update(plaintext) + encryptor.finalize()
-    return point + body + encryptor.tag
+
+    trailing = bytes(len(point) + len(encryptor.tag)) if overrun is None else overrun
+
+    point_name, ciphertext_name, code_name = names
+    return plistlib.dumps(
+        {
+            "$version": 100000,
+            "$archiver": "NSKeyedArchiver",
+            "$top": {"root": plistlib.UID(1)},
+            "$objects": [
+                "$null",
+                {code_name: plistlib.UID(2), ciphertext_name: plistlib.UID(3),
+                 point_name: plistlib.UID(4)},
+                encryptor.tag,
+                body + trailing,
+                point,
+            ],
+        },
+        fmt=plistlib.FMT_BINARY,
+    )
+
+
+def key_material(key: bytes, *, view: str = "Manatee") -> bytes:
+    """The message a share decrypts to."""
+    return cf.TlkKeyMaterial(
+        uuid="1234-5678",
+        zone_name=view,
+        key_class="tlk",
+        key=key,
+    ).SerializeToString()
 
 
 # --------------------------------------------------------------------------------------
@@ -56,11 +113,7 @@ def ecies_encrypt(public_key, plaintext: bytes, *, key_length: int = 16) -> byte
 
 
 def test_an_archive_resolves_its_uid_references() -> None:
-    # References are stored as UIDs into a flat table, so a naive plist read gives back
-    # indices rather than data.
-    resolved = unarchive(archive(b"the-payload"))
-
-    assert resolved == {"root": b"the-payload"}
+    assert unarchive(archive(b"the-payload")) == {"root": b"the-payload"}
 
 
 def test_the_payload_is_pulled_out_of_an_archive() -> None:
@@ -88,66 +141,204 @@ def test_an_archive_with_no_payload_is_reported() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# ECIES
+# SFIES -- one construction, and the overrun that hid it
 # --------------------------------------------------------------------------------------
 
 
-def test_an_ecies_ciphertext_roundtrips() -> None:
+def test_a_share_decrypts_under_the_specified_construction() -> None:
     key = ec.generate_private_key(ec.SECP384R1())
-    sealed = ecies_encrypt(key.public_key(), b"the view key")
 
-    assert ecies_decrypt(key, sealed) == b"the view key"
+    sealed = sfies_archive(key.public_key(), b"the view key")
+
+    assert sfies_decrypt_archive(key, sealed) == b"the view key"
 
 
-def test_the_ephemeral_key_is_the_authenticated_data() -> None:
-    # The detail most likely to be missed: it is both the KDF's shared info and the AAD.
+def test_the_ciphertext_member_is_trimmed_by_the_other_two_members() -> None:
+    # This is the whole reason a correct implementation still failed: SFCiphertext runs
+    # past the ciphertext by exactly the point and code sizes, and the tag rejects the
+    # excess exactly as it would reject a wrong key or a wrong cipher parameter.
     key = ec.generate_private_key(ec.SECP384R1())
-    sealed = bytearray(ecies_encrypt(key.public_key(), b"the view key"))
-    sealed[0:1] = b"\x04"  # leave it a valid prefix but corrupt the point below
 
-    with pytest.raises(ShareError):
-        ecies_decrypt(key, bytes(sealed[:1]) + bytes(96) + bytes(sealed[97:]))
+    parts = sfies_parts(sfies_archive(key.public_key(), b"the view key"))
+
+    assert len(parts.point) == 97
+    assert len(parts.code) == 16
+    assert len(parts.ciphertext) == len(b"the view key")
+
+
+def test_the_overrun_is_derived_and_not_the_number_113() -> None:
+    # 97 + 16 is a P-384 number. A different curve makes it a different number, so the
+    # trim has to come from the members rather than from a constant.
+    key = ec.generate_private_key(ec.SECP256R1())
+
+    parts = sfies_parts(sfies_archive(key.public_key(), b"a shorter curve"))
+
+    assert len(parts.point) == 65
+    assert len(parts.ciphertext) == len(b"a shorter curve")
+    assert sfies_decrypt_archive(key, sfies_archive(key.public_key(), b"x")) == b"x"
+
+
+def test_uninitialised_trailing_bytes_do_not_change_the_result() -> None:
+    # The overrun is heap, so it differs run to run and must not reach any computation.
+    key = ec.generate_private_key(ec.SECP384R1())
+
+    noisy = sfies_archive(key.public_key(), b"the view key", overrun=bytes(range(113)))
+
+    assert sfies_decrypt_archive(key, noisy) == b"the view key"
+
+
+def test_apples_misspelled_member_name_is_the_one_that_must_match() -> None:
+    # The archived key reads "ExternaRepresentation", missing its final l. Matching the
+    # correctly spelled name finds nothing on real data.
+    key = ec.generate_private_key(ec.SECP384R1())
+
+    misspelled = sfies_archive(key.public_key(), b"the view key")
+    correct = sfies_archive(
+        key.public_key(),
+        b"the view key",
+        names=(
+            "SFEphemeralSenderPublicKeyExternalRepresentation",
+            "SFCiphertext",
+            "SFIESAuthenticationCode",
+        ),
+    )
+
+    assert sfies_decrypt_archive(key, misspelled) == b"the view key"
+    assert sfies_decrypt_archive(key, correct) == b"the view key"
 
 
 def test_a_ciphertext_for_another_key_does_not_authenticate() -> None:
     theirs = ec.generate_private_key(ec.SECP384R1())
     ours = ec.generate_private_key(ec.SECP384R1())
 
-    with pytest.raises(ShareError, match="None of the ECIES variants"):
-        ecies_decrypt(ours, ecies_encrypt(theirs.public_key(), b"not for us"))
+    with pytest.raises(ShareError, match="did not authenticate"):
+        sfies_decrypt_archive(ours, sfies_archive(theirs.public_key(), b"not for us"))
 
 
-def test_a_ciphertext_too_short_to_hold_anything_is_refused() -> None:
+def test_an_archive_that_is_not_an_sfies_ciphertext_names_what_it_holds() -> None:
     key = ec.generate_private_key(ec.SECP384R1())
 
-    with pytest.raises(ShareError, match="No uncompressed point"):
-        ecies_decrypt(key, b"\x04" + bytes(100))
+    with pytest.raises(ShareError, match="not an SFIESCiphertext"):
+        sfies_decrypt_archive(key, archive(b"just one blob"))
 
 
-def test_a_ciphertext_behind_a_header_is_still_found() -> None:
-    # What an archive hands back does not always begin at the point, so every position
-    # where one could start is tried. GCM's tag makes a wrong offset free to reject.
-    key = ec.generate_private_key(ec.SECP384R1())
-    sealed = ecies_encrypt(key.public_key(), b"the view key")
-
-    assert ecies_decrypt(key, b"\x01\x02\x03" + sealed) == b"the view key"
-
-
-def test_bytes_with_no_point_anywhere_say_what_they_start_with() -> None:
+def test_a_ciphertext_member_shorter_than_its_overrun_is_refused() -> None:
     key = ec.generate_private_key(ec.SECP384R1())
 
-    with pytest.raises(ShareError, match="It starts"):
-        ecies_decrypt(key, b"\xaa" * 200)  # no 0x04 anywhere, so no point can start
+    with pytest.raises(ShareError, match="not longer than"):
+        sfies_parts(sfies_archive(key.public_key(), b"", overrun=b""))
 
 
-def test_both_key_lengths_are_found() -> None:
-    # The specification does not say whether the derived material is 16 or 32 bytes, and
-    # GCM's tag settles it without a round trip.
-    key = ec.generate_private_key(ec.SECP384R1())
+# --------------------------------------------------------------------------------------
+# What a share decrypts to
+# --------------------------------------------------------------------------------------
 
-    for length in (16, 32):
-        sealed = ecies_encrypt(key.public_key(), b"payload", key_length=length)
-        assert ecies_decrypt(key, sealed) == b"payload"
+
+def test_the_plaintext_carries_the_key_itself_at_field_four() -> None:
+    # Not a container holding a key, and not an EC private key: reading it as a scalar
+    # fails on every share because the bytes were never that.
+    material = parse_key_material(key_material(bytes(range(64))))
+
+    assert material.key == bytes(range(64))
+    assert material.zone_name == "Manatee"
+
+
+def test_a_plaintext_with_no_key_says_so_rather_than_yielding_nothing() -> None:
+    without = cf.TlkKeyMaterial(uuid="1234", zone_name="Manatee").SerializeToString()
+
+    with pytest.raises(ShareError, match="no key at field 4"):
+        parse_key_material(without)
+
+
+def test_a_plaintext_that_is_not_a_key_message_reports_its_fields() -> None:
+    with pytest.raises(ShareError, match="not a key message"):
+        parse_key_material(b"\xff\xff\xff\xff")
+
+
+# --------------------------------------------------------------------------------------
+# The class keys, which are not ECIES
+# --------------------------------------------------------------------------------------
+
+
+def test_a_class_key_is_unwrapped_with_aes_siv_and_no_headers() -> None:
+    top_level = AESSIV.generate_key(512)
+    wrapped = AESSIV(top_level).encrypt(b"the class A key", None)
+
+    assert unwrap_class_key(wrapped, top_level) == b"the class A key"
+
+
+def test_an_empty_header_vector_is_not_a_vector_holding_an_empty_header() -> None:
+    # The two are different associated data and give different results. Getting it wrong
+    # fails as an authentication failure with nothing to say the header count was why.
+    top_level = AESSIV.generate_key(512)
+
+    with_one_empty = AESSIV(top_level).encrypt(b"the class A key", [b""])
+
+    with pytest.raises(ShareError, match="did not authenticate"):
+        unwrap_class_key(with_one_empty, top_level)
+
+
+def test_a_class_key_under_the_wrong_top_level_key_does_not_authenticate() -> None:
+    wrapped = AESSIV(AESSIV.generate_key(512)).encrypt(b"the class A key", None)
+
+    with pytest.raises(ShareError, match="did not authenticate"):
+        unwrap_class_key(wrapped, AESSIV.generate_key(512))
+
+
+def test_a_top_level_key_of_the_wrong_size_says_that_rather_than_failing_the_tag() -> None:
+    wrapped = AESSIV(AESSIV.generate_key(512)).encrypt(b"the class A key", None)
+
+    with pytest.raises(ShareError, match="not a usable AES-SIV key"):
+        unwrap_class_key(wrapped, b"too short")
+
+
+# --------------------------------------------------------------------------------------
+# Three keys, not four
+# --------------------------------------------------------------------------------------
+
+
+def a_view_key(slot: str, wrapped: bytes = b""):  # noqa: ANN201
+    from findmy.keychain.shares import ViewKey  # noqa: PLC0415
+
+    return ViewKey(key_class=slot, wrapped_key=wrapped, upload_version=1, slot=slot)
+
+
+def test_the_top_level_key_is_the_plaintext_and_is_not_unwrapped_again() -> None:
+    # The tlk record carries what the share already decrypted to, so treating it as a
+    # fourth thing to unwrap looks for a wrapping that is not there.
+    top_level = AESSIV.generate_key(512)
+
+    keys = unwrap_view_keys([a_view_key("tlk", b"whatever")], key_material(top_level))
+
+    assert keys == {"tlk": top_level}
+
+
+def test_an_entry_yields_three_keys() -> None:
+    top_level = AESSIV.generate_key(512)
+    siv = AESSIV(top_level)
+
+    keys = unwrap_view_keys(
+        [
+            a_view_key("tlk", b"ignored"),
+            a_view_key("classA", siv.encrypt(b"class A key", None)),
+            a_view_key("classB", siv.encrypt(b"class B key", None)),
+        ],
+        key_material(top_level),
+    )
+
+    assert keys == {"tlk": top_level, "classA": b"class A key", "classB": b"class B key"}
+
+
+def test_a_class_key_that_will_not_unwrap_does_not_cost_the_top_level_one() -> None:
+    top_level = AESSIV.generate_key(512)
+
+    keys = unwrap_view_keys([a_view_key("classA", b"not a wrapping")], key_material(top_level))
+
+    assert keys == {"tlk": top_level}
+
+
+def test_a_plaintext_that_is_not_a_key_message_yields_no_keys_rather_than_raising() -> None:
+    assert unwrap_view_keys([a_view_key("classA", b"x")], b"\xff\xff\xff\xff") == {}
 
 
 # --------------------------------------------------------------------------------------
@@ -178,11 +369,10 @@ def a_share(key, payload: bytes = b"the view key"):  # noqa: ANN001, ANN201
     """An entry as `fetch_recoverable_shares` returns them."""
     from findmy.keychain.shares import ShareEntry, ShareRecord  # noqa: PLC0415
 
-    sealed = ecies_encrypt(key.public_key(), payload)
     record = a_record(
         sender="PEER-SENDER",
         receiver="PEER-US",
-        wrappedkey=archive(sealed),
+        wrappedkey=sfies_archive(key.public_key(), payload),
         curve=1,
         epoch=1,
         version=1,
@@ -390,155 +580,6 @@ def test_a_share_verifies_against_its_sending_peer() -> None:
 # An archive holding the ECIES parts separately
 # --------------------------------------------------------------------------------------
 
-
-def split_archive(public_key, plaintext: bytes) -> bytes:  # noqa: ANN001
-    """Archive an ECIES ciphertext as separate members, the way a share carries one."""
-    import plistlib as pl  # noqa: PLC0415
-
-    sealed = ecies_encrypt(public_key, plaintext)
-    point, body, tag = sealed[:97], sealed[97:-16], sealed[-16:]
-
-    return pl.dumps(
-        {
-            "$version": 100000,
-            "$archiver": "NSKeyedArchiver",
-            "$top": {"root": pl.UID(1)},
-            "$objects": [
-                "$null",
-                {"pub": pl.UID(2), "ct": pl.UID(3), "tag": pl.UID(4)},
-                point,
-                body,
-                tag,
-            ],
-        },
-        fmt=pl.FMT_BINARY,
-    )
-
-
-def test_an_archive_holding_the_parts_separately_still_decrypts() -> None:
-    # "Expands to an ECIES ciphertext structure" means members, not one blob. A reader
-    # expecting a single payload hands the wrong 16 bytes to the point parser.
-    from findmy.keychain.shares import ecies_decrypt_archive  # noqa: PLC0415
-
-    key = ec.generate_private_key(ec.SECP384R1())
-
-    assert ecies_decrypt_archive(key, split_archive(key.public_key(), b"the key")) == b"the key"
-
-
-def test_an_archive_holding_one_concatenated_member_also_decrypts() -> None:
-    from findmy.keychain.shares import ecies_decrypt_archive  # noqa: PLC0415
-
-    key = ec.generate_private_key(ec.SECP384R1())
-    sealed = ecies_encrypt(key.public_key(), b"the key")
-
-    assert ecies_decrypt_archive(key, archive(sealed)) == b"the key"
-
-
-def test_an_archive_that_does_not_authenticate_names_its_members() -> None:
-    # "It did not decrypt" is not actionable; the member names and sizes are.
-    from findmy.keychain.shares import ecies_decrypt_archive  # noqa: PLC0415
-
-    ours = ec.generate_private_key(ec.SECP384R1())
-    theirs = ec.generate_private_key(ec.SECP384R1())
-
-    with pytest.raises(ShareError, match="It holds:"):
-        ecies_decrypt_archive(ours, split_archive(theirs.public_key(), b"not for us"))
-
-
-# --------------------------------------------------------------------------------------
-# The parameters the specification does not pin down
-# --------------------------------------------------------------------------------------
-
-
-def sealed_with(  # noqa: PLR0913
-    public_key,  # noqa: ANN001
-    plaintext: bytes,
-    *,
-    digest: str = "sha256",
-    key_length: int = 16,
-    iv_length: int = 16,
-    derived_iv: bool = False,
-    info_point: bool = True,
-    aad_point: bool = True,
-) -> bytes:
-    """Seal under one specific parameter choice, to check that choice is recognised."""
-    ephemeral = ec.generate_private_key(public_key.curve)
-    point = ephemeral.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
-    shared = ephemeral.exchange(ec.ECDH(), public_key)
-
-    shared_info = point if info_point else b""
-    length = key_length + (iv_length if derived_iv else 0)
-
-    out, counter = b"", 1
-    while len(out) < length:
-        out += hashlib.new(digest, shared + counter.to_bytes(4, "big") + shared_info).digest()
-        counter += 1
-
-    key = out[:key_length]
-    iv = out[key_length:length] if derived_iv else bytes(iv_length)
-
-    encryptor = Cipher(algorithms.AES(key), modes.GCM(iv)).encryptor()
-    if aad_point:
-        encryptor.authenticate_additional_data(point)
-    body = encryptor.update(plaintext) + encryptor.finalize()
-    return point + body + encryptor.tag
-
-
-@pytest.mark.parametrize(
-    "choice",
-    [
-        {"digest": "sha384"},
-        {"key_length": 32},
-        {"iv_length": 12},
-        {"derived_iv": True, "iv_length": 12},
-        {"info_point": False},
-        {"aad_point": False},
-        {"digest": "sha384", "key_length": 32, "iv_length": 12, "aad_point": False},
-    ],
-)
-def test_every_plausible_ecies_parameter_choice_is_recognised(choice: dict) -> None:
-    # The specification names the construction but not these. Each combination costs
-    # microseconds and fails on the tag, so searching them is free -- whereas guessing one
-    # costs a round trip against a real account, with a passcode, per guess.
-    from findmy.keychain.shares import ecies_decrypt  # noqa: PLC0415
-
-    key = ec.generate_private_key(ec.SECP384R1())
-
-    assert ecies_decrypt(key, sealed_with(key.public_key(), b"the key", **choice)) == b"the key"
-
-
-def test_a_twelve_byte_nonce_and_a_sixteen_byte_one_are_not_the_same_thing() -> None:
-    # Both are all zeroes and both are "a zero IV", but AES-GCM derives a different
-    # counter block from each, so one authenticates and the other does not.
-    from findmy.keychain.shares import ecies_decrypt  # noqa: PLC0415
-
-    key = ec.generate_private_key(ec.SECP384R1())
-    twelve = sealed_with(key.public_key(), b"the key", iv_length=12)
-    sixteen = sealed_with(key.public_key(), b"the key", iv_length=16)
-
-    assert twelve != sixteen
-    assert ecies_decrypt(key, twelve) == b"the key"
-    assert ecies_decrypt(key, sixteen) == b"the key"
-
-
-def test_a_matching_variant_is_named_so_the_answer_can_be_recorded(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # The point of the search is to end it: whichever authenticates is the real
-    # construction, and saying which turns a sweep into something specifiable.
-    import logging  # noqa: PLC0415
-
-    from findmy.keychain.shares import ecies_decrypt  # noqa: PLC0415
-
-    key = ec.generate_private_key(ec.SECP384R1())
-    sealed = sealed_with(key.public_key(), b"the key", digest="sha384", key_length=32)
-
-    with caplog.at_level(logging.INFO, logger="findmy.keychain.shares"):
-        ecies_decrypt(key, sealed)
-
-    assert "sha384/aes256-gcm" in caplog.text
-
-
 # --------------------------------------------------------------------------------------
 # Which of the two identical-looking failures this is
 # --------------------------------------------------------------------------------------
@@ -559,7 +600,7 @@ def a_share_addressed_to(key, wrapped_to, *, as_der: bool = False):  # noqa: ANN
         sender="PEER-SENDER",
         receiver="PEER-US",
         receiverPublicEncryptionKey=declared,
-        wrappedkey=archive(ecies_encrypt(key.public_key(), b"the view key")),
+        wrappedkey=sfies_archive(key.public_key(), b"the view key"),
         curve=1,
         epoch=1,
         version=1,
@@ -595,7 +636,7 @@ def test_a_failure_says_whether_the_key_or_the_construction_is_in_doubt() -> Non
         sender="PEER-SENDER",
         receiver="PEER-US",
         receiverPublicEncryptionKey=public_point_of(ours),
-        wrappedkey=archive(ecies_encrypt(theirs.public_key(), b"not for us")),
+        wrappedkey=sfies_archive(theirs.public_key(), b"not for us"),
         curve=1,
         epoch=1,
         version=1,
@@ -722,105 +763,6 @@ def a_public_key_bytes() -> bytes:
     return key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
 
 
-# --------------------------------------------------------------------------------------
-# The axes the search must actually cover
-# --------------------------------------------------------------------------------------
-
-
-def test_the_search_spans_both_key_derivation_functions() -> None:
-    # X9.63 was the only one tried for three rounds, and the axis was absent rather than
-    # explored -- which reads in a report as "HKDF was ruled out" when it was never run.
-    from findmy.keychain.shares import _ecies_variants  # noqa: PLC0415
-
-    assert {v.kdf for v in _ecies_variants()} == {"x963", "hkdf"}
-
-
-def test_the_iv_can_be_derived_from_either_end_of_the_material() -> None:
-    # Same derived bytes, split the other way, give a different key and a different IV.
-    # One ordering authenticates and the other is indistinguishable from a wrong key.
-    from findmy.keychain.shares import _ecies_variants  # noqa: PLC0415
-
-    assert {v.iv_source for v in _ecies_variants()} == {"zero", "key-then-iv", "iv-then-key"}
-
-
-def test_the_search_covers_a_truncated_hmac_as_well_as_a_gcm_tag() -> None:
-    # The archive calls those sixteen bytes an authentication code, not a tag.
-    from findmy.keychain.shares import _ecies_variants  # noqa: PLC0415
-
-    assert {v.cipher for v in _ecies_variants()} == {"gcm", "ctr-hmac"}
-
-
-def test_the_compact_x_only_point_is_among_the_shared_info_choices() -> None:
-    # Hashing the 48-byte x coordinate is a different derivation from hashing the 97-byte
-    # uncompressed point, and no boolean reaches it.
-    from findmy.keychain.shares import _ecies_variants  # noqa: PLC0415
-
-    assert "point-x" in {v.shared_info for v in _ecies_variants()}
-
-
-def test_the_x_only_part_is_the_coordinate_and_not_the_whole_point() -> None:
-    from findmy.keychain.shares import _part  # noqa: PLC0415
-
-    point = b"\x04" + bytes(range(48)) + bytes(range(48))
-
-    assert _part("point-x", point, b"ours") == bytes(range(48))
-    assert _part("point", point, b"ours") == point
-    assert _part("empty", point, b"ours") == b""
-
-
-def test_an_iv_taken_from_the_front_is_recognised() -> None:
-    from findmy.keychain.shares import ecies_decrypt  # noqa: PLC0415
-
-    key = ec.generate_private_key(ec.SECP384R1())
-    sealed = sealed_from_front(key.public_key(), b"the key")
-
-    assert ecies_decrypt(key, sealed) == b"the key"
-
-
-def sealed_from_front(public_key, plaintext: bytes) -> bytes:  # noqa: ANN001
-    """Seal with the IV taken from the front of the derived material, key after it."""
-    ephemeral = ec.generate_private_key(public_key.curve)
-    point = ephemeral.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
-    shared = ephemeral.exchange(ec.ECDH(), public_key)
-
-    out, counter = b"", 1
-    while len(out) < 12 + 16:
-        out += hashlib.sha256(shared + counter.to_bytes(4, "big") + point).digest()
-        counter += 1
-
-    iv, key = out[:12], out[12 : 12 + 16]
-    encryptor = Cipher(algorithms.AES(key), modes.GCM(iv)).encryptor()
-    encryptor.authenticate_additional_data(point)
-    body = encryptor.update(plaintext) + encryptor.finalize()
-    return point + body + encryptor.tag
-
-
-def test_a_ciphertext_authenticated_by_a_truncated_hmac_is_recognised() -> None:
-    from findmy.keychain.shares import ecies_decrypt  # noqa: PLC0415
-
-    key = ec.generate_private_key(ec.SECP384R1())
-    sealed = sealed_with_hmac(key.public_key(), b"the key")
-
-    assert ecies_decrypt(key, sealed) == b"the key"
-
-
-def sealed_with_hmac(public_key, plaintext: bytes) -> bytes:  # noqa: ANN001
-    """Seal with AES-CTR and a 16-byte truncated HMAC over point || ciphertext."""
-    import hmac as hmac_module  # noqa: PLC0415
-
-    ephemeral = ec.generate_private_key(public_key.curve)
-    point = ephemeral.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
-    shared = ephemeral.exchange(ec.ECDH(), public_key)
-
-    out, counter = b"", 1
-    while len(out) < 16 + 32:
-        out += hashlib.sha256(shared + counter.to_bytes(4, "big") + point).digest()
-        counter += 1
-
-    key, mac_key = out[:16], out[16:48]
-    body = Cipher(algorithms.AES(key), modes.CTR(bytes(16))).encryptor().update(plaintext)
-    code = hmac_module.new(mac_key, point + body, "sha256").digest()[:16]
-    return point + body + code
 
 
 def test_a_share_for_another_peer_is_named_as_such_not_as_a_cipher_failure() -> None:

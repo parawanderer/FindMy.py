@@ -142,6 +142,15 @@ message ViewKeySet {
   optional RecordWrapper class_b = 3;
 }
 
+// What a decrypted key share expands to. Field 4 is the view's top-level key itself --
+// symmetric material, not a container holding a key and not an EC private key.
+message TlkKeyMaterial {
+  optional string uuid = 1;
+  optional string zone_name = 2;
+  optional string key_class = 3;
+  optional bytes key = 4;
+}
+
 // What both a share and a view key arrive in.
 //
 // The payload is a **CloudKit Record** -- the same message Stage 4 fetches accessory
