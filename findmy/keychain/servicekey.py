@@ -147,6 +147,7 @@ def scalar_in(blob: bytes) -> ScalarCandidate | None:
     """
     for length, curve in _CURVES_BY_SCALAR_LENGTH.items():
         if len(blob) == length:
+            logger.debug("A %d-byte key blob is a scalar with no public half", len(blob))
             return ScalarCandidate(scalar=blob, verified=False)
 
         if len(blob) != 2 * length:
@@ -169,6 +170,11 @@ def scalar_in(blob: bytes) -> ScalarCandidate | None:
             )
             raise KeyBlobError(msg)
 
+        logger.debug(
+            "A %d-byte key blob's halves agree; its public x is %s",
+            len(blob),
+            public_x[:8].hex(),
+        )
         return ScalarCandidate(scalar=scalar, verified=True)
 
     return None
