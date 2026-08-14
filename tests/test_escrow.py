@@ -464,7 +464,9 @@ def test_devices_are_counted_by_serial_not_by_record() -> None:
 def test_the_peer_id_is_read_out_of_the_label() -> None:
     # The same value a peer carries as its hash, so a listing already names the peer a
     # voucher would have to name as its sponsor.
-    digest = "SHA256:OSUs+amZS4S6iLyzPPjrHGQJrB12JugpVSFAQ4Qe5lU="
+    # Synthetic: sha256(b"a peer that does not exist"). A real peer id would name
+    # a device on somebody's account, and this repository is public.
+    digest = "SHA256:JOt/vBrUq5R7gnD4zu3eCV3N2gZ3lZtJDdxV3G9IMnA="
     record = make_record(f"com.apple.icdp.record.{digest}", BOTTLE_UUID)
 
     assert record.peer_id == digest
