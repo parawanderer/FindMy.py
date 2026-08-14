@@ -134,6 +134,38 @@ def plain_value(value: ck.Record.Value) -> object:
     return None
 
 
+def describe_wire(data: bytes, depth: int = 2) -> str:
+    """
+    Describe a protobuf payload's fields without knowing its schema.
+
+    Used when a message does not decode as expected, or decodes to nothing useful. Naming
+    the field numbers, wire types and sizes that actually arrived turns "it did not parse"
+    into something someone can act on, which is worth more than any guess about why.
+
+    :param depth: How many levels to descend. A length-delimited field that itself parses
+        as a message is described inline, because the shape that matters is usually one
+        level below the one that failed.
+    """
+    kinds = {0: "varint", 1: "fixed64", 2: "bytes", 5: "fixed32"}
+    parts: list[str] = []
+
+    try:
+        for number, wire, payload in iter_wire_fields(data):
+            if wire != 2:
+                parts.append(f"{number}:{kinds.get(wire, wire)}")
+                continue
+
+            inner = describe_wire(payload, depth - 1) if depth > 0 and payload else ""
+            if inner and inner != "<empty>" and "<unparseable>" not in inner:
+                parts.append(f"{number}:bytes {len(payload)}B{{{inner}}}")
+            else:
+                parts.append(f"{number}:bytes {len(payload)}B")
+    except Exception:  # noqa: BLE001 -- a malformed payload is exactly what this describes
+        parts.append("<unparseable>")
+
+    return ", ".join(parts) or "<empty>"
+
+
 def reference_name(value: ck.Record.Value) -> str:
     """
     Read the record name a reference points at.

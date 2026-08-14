@@ -16,11 +16,12 @@ import logging
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from google.protobuf.message import DecodeError
 
 from findmy.cloudkit import der
 from findmy.cloudkit.proto import cuttlefish_pb2 as cf
-from findmy.cloudkit.records import iter_wire_fields
+from findmy.cloudkit.records import describe_wire, iter_wire_fields
 from findmy.errors import UnhandledProtocolError
 
 logger = logging.getLogger(__name__)
@@ -95,14 +96,59 @@ def private_key_from_scalar(scalar: bytes) -> ec.EllipticCurvePrivateKey:
         raise ServiceKeyError(msg) from None
 
 
+def scalar_in(blob: bytes) -> bytes | None:
+    """
+    Read a private scalar out of a key blob, whatever it is carried alongside.
+
+    A "compressed private key" is not always a bare scalar. §6.7.0's peer keys are a
+    public point followed by their scalar, and the same layout appears here -- so a blob
+    is taken as a scalar if its length says so, and otherwise its **trailing** scalar-sized
+    run is tried against whatever precedes it.
+
+    That check is self-verifying and free: deriving the public key from the candidate
+    scalar must reproduce the leading bytes exactly, in one of the two point encodings. So
+    a wrong reading is not merely unlikely, it is impossible rather than plausible -- which
+    is what makes trying this better than guessing at a layout.
+
+    :returns: The scalar, or None if the blob holds none.
+    """
+    if len(blob) in _CURVES_BY_SCALAR_LENGTH:
+        return blob
+
+    for length, curve in _CURVES_BY_SCALAR_LENGTH.items():
+        if len(blob) <= length:
+            continue
+
+        scalar, prefix = blob[-length:], blob[:-length]
+        try:
+            key = ec.derive_private_key(int.from_bytes(scalar, "big"), curve())
+        except ValueError:
+            continue
+
+        public = key.public_key()
+        encodings = (
+            public.public_bytes(Encoding.X962, PublicFormat.CompressedPoint),
+            public.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint),
+        )
+        if prefix in encodings:
+            logger.debug(
+                "A %d-byte key blob is a point followed by its %d-byte scalar",
+                len(blob),
+                length,
+            )
+            return scalar
+
+    return None
+
+
 def _scalars_in(payload: bytes) -> list[bytes]:
     """
     Pull the private scalars out of the v2 payload, in the order they appear.
 
     The payload is a protobuf carrying an encryption key and a signing key, each with its
-    scalar and an optional public structure -- but **the field numbers are not specified**.
-    So rather than trusting a guess, this walks the wire in order and takes the first
-    length-delimited member of each submessage, keeping whichever are scalar-shaped.
+    key bytes and an optional DER public structure -- but **the field numbers are not
+    specified**. So rather than trusting a guess, this walks the wire in order and takes
+    the first length-delimited member of each submessage that yields a scalar.
 
     Order is the discriminator, as the specification gives it: encryption key first.
     """
@@ -111,10 +157,19 @@ def _scalars_in(payload: bytes) -> list[bytes]:
     for _, wire, member in iter_wire_fields(payload):
         if wire != 2 or not member:
             continue
-        # Each member is a key message; its first length-delimited field is the scalar.
+
+        # A member may be the key blob itself, or a message wrapping one.
+        found = scalar_in(member)
+        if found is not None:
+            scalars.append(found)
+            continue
+
         for _, inner_wire, inner in iter_wire_fields(member):
-            if inner_wire == 2 and len(inner) in _CURVES_BY_SCALAR_LENGTH:
-                scalars.append(inner)
+            if inner_wire != 2 or not inner:
+                continue
+            found = scalar_in(inner)
+            if found is not None:
+                scalars.append(found)
                 break
 
     return scalars
@@ -199,8 +254,8 @@ def _from_v2(element: der.DerElement) -> ServiceKeys:
     except DecodeError:
         keys = cf.PcsServiceKeys()
 
-    declared = [keys.encryption_key.key, keys.signing_key.key]
-    scalars = [s for s in declared if len(s) in _CURVES_BY_SCALAR_LENGTH]
+    declared = [scalar_in(blob) for blob in (keys.encryption_key.key, keys.signing_key.key)]
+    scalars = [s for s in declared if s is not None]
 
     if not scalars:
         scalars = _scalars_in(payload)
@@ -213,8 +268,10 @@ def _from_v2(element: der.DerElement) -> ServiceKeys:
 
     if not scalars:
         msg = (
-            f"A v2 private key structure's {len(payload)}-byte payload carries no key of a"
-            " recognised length"
+            f"A v2 private key structure's {len(payload)}-byte payload carries no usable"
+            " private key. A key blob is taken as a scalar by its length, or as a point"
+            " followed by its scalar when the two check each other, and neither was found."
+            f" Its wire structure is: {describe_wire(payload)}"
         )
         raise ServiceKeyError(msg)
 

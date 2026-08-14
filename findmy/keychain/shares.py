@@ -36,7 +36,7 @@ from google.protobuf.message import DecodeError
 from findmy.cloudkit.constants import CUTTLEFISH_SERVICE
 from findmy.cloudkit.proto import cloudkit_pb2 as ck
 from findmy.cloudkit.proto import cuttlefish_pb2 as cf
-from findmy.cloudkit.records import named_fields
+from findmy.cloudkit.records import describe_wire, named_fields
 from findmy.errors import UnhandledProtocolError
 
 if TYPE_CHECKING:
@@ -388,28 +388,6 @@ class KeyShare:
     means nothing identifies who produced the key, while a known sender whose signature
     fails means something claims to be them and is not.
     """
-
-
-def describe_wire(data: bytes) -> str:
-    """
-    Describe a protobuf payload's top-level fields without knowing its schema.
-
-    Used when a message does not decode as expected. Naming the field numbers, wire types
-    and sizes that actually arrived turns "it did not parse" into something someone can
-    act on, which is worth more than any guess about why.
-    """
-    from findmy.cloudkit.records import iter_wire_fields  # noqa: PLC0415
-
-    kinds = {0: "varint", 1: "fixed64", 2: "bytes", 5: "fixed32"}
-    parts = []
-    try:
-        for number, wire, payload in iter_wire_fields(data):
-            size = f" {len(payload)}B" if wire == 2 else ""
-            parts.append(f"{number}:{kinds.get(wire, wire)}{size}")
-    except Exception:  # noqa: BLE001 -- a malformed payload is exactly what this describes
-        parts.append("<unparseable>")
-
-    return ", ".join(parts) or "<empty>"
 
 
 @dataclass(frozen=True)

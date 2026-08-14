@@ -15,6 +15,7 @@ import plistlib
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESSIV
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from findmy.cloudkit.proto import cloudkit_pb2 as ck
 from findmy.cloudkit.records import CloudKitRecord, reference_name
@@ -601,10 +602,10 @@ def test_a_v1_payload_is_read_too_since_the_structure_is_a_choice() -> None:
     assert keys.encryption_key.private_numbers().private_value == scalar
 
 
-def test_a_payload_whose_keys_are_all_the_wrong_length_reports_its_size() -> None:
-    # It does not reach the curve lookup: nothing scalar-shaped is found at all, and
-    # saying how big the payload was is what distinguishes this from a parse failure.
-    with pytest.raises(ServiceKeyError, match="carries no key of a recognised length"):
+def test_a_payload_holding_no_key_reports_its_wire_structure() -> None:
+    # Nothing scalar-shaped is found at all. What the payload actually contains is the
+    # only thing that moves this forward, so the failure carries it rather than a size.
+    with pytest.raises(ServiceKeyError, match="wire structure is:"):
         service_keys_from_der(a_v2_payload(b"\x01" * 17))
 
 
@@ -672,3 +673,58 @@ def test_a_v2_structure_holding_no_octet_string_says_what_it_holds() -> None:
 
     with pytest.raises(ServiceKeyError, match="holds no octet string"):
         service_keys_from_der(empty_sequence)
+
+
+def a_compound_key_payload(scalar: bytes, *, compressed: bool = True) -> bytes:
+    """A key blob written as its public point followed by its scalar."""
+    key = ec.derive_private_key(int.from_bytes(scalar, "big"), ec.SECP256R1())
+    form = PublicFormat.CompressedPoint if compressed else PublicFormat.UncompressedPoint
+    point = key.public_key().public_bytes(Encoding.X962, form)
+
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    keys = cf.PcsServiceKeys(encryption_key=cf.PcsPrivateKey(key=point + scalar))
+    return der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
+
+
+def test_a_key_written_as_a_point_then_a_scalar_is_read() -> None:
+    # §6.7.0's peer keys are a point followed by their scalar, so a key blob longer than a
+    # scalar is not malformed -- it is that layout, and the halves check each other.
+    scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+    raw = scalar.to_bytes(32, "big")
+
+    for compressed in (True, False):
+        keys = service_keys_from_der(a_compound_key_payload(raw, compressed=compressed))
+        assert keys.encryption_key.private_numbers().private_value == scalar
+
+
+def test_the_halves_must_check_each_other_before_a_compound_key_is_accepted() -> None:
+    # The point is what makes this safe to try rather than a guess: a mismatched prefix is
+    # rejected, so a wrong reading is impossible rather than merely unlikely.
+    from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
+
+    scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+    raw = scalar.to_bytes(32, "big")
+    other = ec.generate_private_key(ec.SECP256R1()).public_key()
+    wrong = other.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+
+    assert scalar_in(wrong + raw) is None
+
+
+def test_a_bare_scalar_is_still_taken_as_one() -> None:
+    from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
+
+    raw = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+    assert scalar_in(raw.to_bytes(32, "big")) == raw.to_bytes(32, "big")
+
+
+def test_a_failure_describes_the_payload_nested_not_only_at_the_top() -> None:
+    # The shape that matters is usually one level below the one that failed.
+    from findmy.cloudkit.records import describe_wire  # noqa: PLC0415
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    keys = cf.PcsServiceKeys(encryption_key=cf.PcsPrivateKey(key=b"\x01" * 17))
+    described = describe_wire(keys.SerializeToString())
+
+    assert "1:bytes" in described
+    assert "{" in described  # the nested member is described inline
