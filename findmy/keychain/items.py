@@ -262,9 +262,15 @@ def strip_padding(plaintext: bytes) -> bytes:
 
 
 def _decode_base64(value: str) -> bytes:
-    """Take a field from base64 text to bytes, or its own bytes if it is not base64."""
+    """
+    Take a field from base64 text to bytes, or its own bytes if it is not base64.
+
+    **Validated on purpose.** `b64decode` defaults to discarding characters outside the
+    alphabet, so a string that is not base64 at all decodes to garbage rather than
+    failing -- and the fallback that exists for exactly that case never runs.
+    """
     try:
-        return base64.b64decode(value)
+        return base64.b64decode(value, validate=True)
     except (ValueError, binascii.Error):
         return value.encode()
 
@@ -425,7 +431,42 @@ def split_view_records(records: Iterable[CloudKitRecord]) -> ViewContents:
     return ViewContents(items=items, pointers=pointers)
 
 
-def find_by_account(contents: ViewContents, keyring: ViewKeyring, account: bytes) -> dict[str, Any]:
+def readable_items(
+    contents: ViewContents,
+    keyring: ViewKeyring,
+) -> dict[bytes, dict[str, Any]]:
+    """
+    Decrypt every item in the view this keyring opens, by `acct`.
+
+    Keyed by account because that is how a protection structure names a key: §6.8 resolves
+    a key reference against the keychain by matching on `acct`, so this is the index that
+    answers the question records actually ask.
+
+    Items that do not decrypt are skipped rather than raised on -- a view holds items for
+    several classes, and this keyring opens the ones it opens.
+    """
+    found: dict[bytes, dict[str, Any]] = {}
+
+    for name, record in contents.items.items():
+        try:
+            item = decrypt_item(record, keyring)
+        except ItemError as e:
+            logger.debug("Item %s did not decrypt: %s", name, e)
+            continue
+
+        account = _account_bytes(item.get("acct"))
+        if account:
+            found[account] = item
+
+    logger.info("Read %d of %d item(s) in this view", len(found), len(contents.items))
+    return found
+
+
+def find_by_account(
+    contents: ViewContents,
+    keyring: ViewKeyring,
+    account: bytes,
+) -> dict[str, Any]:
     """
     Find an item by its `acct` attribute, decrypting as it searches.
 
@@ -434,31 +475,34 @@ def find_by_account(contents: ViewContents, keyring: ViewKeyring, account: bytes
     is why the pointer lookup is preferred where a tag is known -- but the two fail
     differently and both are worth having.
 
-    :param account: Base64 of a compressed public key, as `acct` holds it.
+    :param account: The public key as `acct` holds it -- **[observed]** a bare 32-byte x
+        coordinate, not an X9.62 compressed point.
     :raises ItemError: If no item carries that account.
     """
-    for name, record in contents.items.items():
-        try:
-            item = decrypt_item(record, keyring)
-        except ItemError as e:
-            logger.debug("Item %s did not decrypt while searching: %s", name, e)
-            continue
-        if _account_bytes(item.get("acct")) == account:
-            return item
+    item = readable_items(contents, keyring).get(account)
+    if item is not None:
+        return item
 
     msg = (
-        f"No item in this view carries acct {account[:12]!r}. Searched"
+        f"No item in this view carries acct {account[:12].hex()}. Searched"
         f" {len(contents.items)} item(s)"
     )
     raise ItemError(msg)
 
 
 def _account_bytes(value: object) -> bytes:
-    """Read an `acct` attribute as bytes, however the plist stored it."""
+    """
+    Read an `acct` attribute as the key bytes it names.
+
+    **It is base64 in the plist.** Stage 5 §2 says so, and the observed value is a 44-
+    character string decoding to 32 bytes -- so taking its ASCII instead yields 44 bytes
+    that match nothing, and match nothing *quietly*, since a key reference that finds no
+    item is indistinguishable from a key this client does not hold.
+    """
     if isinstance(value, bytes):
         return value
     if isinstance(value, str):
-        return value.encode()
+        return _decode_base64(value)
     return b""
 
 

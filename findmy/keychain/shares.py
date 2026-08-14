@@ -62,13 +62,14 @@ class ShareError(UnhandledProtocolError):
 
 def _decode_base64(value: str) -> bytes:
     """
-    Take a share field from base64 text to bytes.
+    Take a field from base64 text to bytes, or its own bytes if it is not base64.
 
-    `TlkShare` declares its binary members as strings, so everything binary arrives this
-    way. A value that is not base64 is returned as its own bytes rather than lost.
+    **Validated on purpose.** `b64decode` defaults to discarding characters outside the
+    alphabet, so a string that is not base64 at all decodes to garbage rather than
+    failing -- and the fallback that exists for exactly that case never runs.
     """
     try:
-        return base64.b64decode(value)
+        return base64.b64decode(value, validate=True)
     except (ValueError, binascii.Error):
         return value.encode()
 

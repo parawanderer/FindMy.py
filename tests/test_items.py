@@ -505,20 +505,27 @@ def test_other_record_types_are_ignored_rather_than_failing() -> None:
 
 def test_an_item_is_found_by_its_account_as_the_other_way_in() -> None:
     top_level = AESSIV.generate_key(512)
-    record, keyring = an_item(top_level, {"acct": "the-compressed-key", "v_Data": b"k"})
+    import base64  # noqa: PLC0415
+
+    key_bytes = bytes(range(32))
+    account = base64.b64encode(key_bytes).decode()
+    record, keyring = an_item(top_level, {"acct": account, "v_Data": b"k"})
 
     contents = split_view_records([record])
 
-    found = find_by_account(contents, keyring, b"the-compressed-key")
+    found = find_by_account(contents, keyring, key_bytes)
     assert found["v_Data"] == b"k"
 
 
 def test_no_item_with_that_account_says_how_many_were_searched() -> None:
     top_level = AESSIV.generate_key(512)
-    record, keyring = an_item(top_level, {"acct": "one-key"})
+    import base64  # noqa: PLC0415
+
+    account = base64.b64encode(bytes(range(32))).decode()
+    record, keyring = an_item(top_level, {"acct": account})
 
     with pytest.raises(ItemError, match="1 item"):
-        find_by_account(split_view_records([record]), keyring, b"another-key")
+        find_by_account(split_view_records([record]), keyring, bytes(32))
 
 
 def test_an_item_with_no_payload_says_it_holds_no_key() -> None:
@@ -872,3 +879,38 @@ def test_opaque_bytes_are_not_described_as_a_message() -> None:
     described = describe_wire(keys.SerializeToString())
 
     assert "0:" not in described
+
+
+def test_an_account_attribute_is_base64_decoded() -> None:
+    # Stage 5 §2 says acct holds base64 of a public key. Taking its ASCII yields 44 bytes
+    # that match nothing, and match nothing quietly -- a key reference finding no item is
+    # indistinguishable from a key this client does not hold.
+    import base64  # noqa: PLC0415
+
+    from findmy.keychain.items import _account_bytes  # noqa: PLC0415
+
+    key_bytes = bytes(range(32))
+    assert _account_bytes(base64.b64encode(key_bytes).decode()) == key_bytes
+
+
+def test_a_value_that_is_not_base64_falls_back_to_its_own_bytes() -> None:
+    # b64decode discards characters outside the alphabet unless told not to, so a string
+    # that is not base64 decodes to garbage rather than failing, and the fallback that
+    # exists for exactly that case never runs.
+    from findmy.keychain.items import _account_bytes  # noqa: PLC0415
+
+    assert _account_bytes("not-base64-at-all!") == b"not-base64-at-all!"
+
+
+def test_items_are_indexed_by_the_key_their_account_names() -> None:
+    import base64  # noqa: PLC0415
+
+    from findmy.keychain.items import readable_items  # noqa: PLC0415
+
+    top_level = AESSIV.generate_key(512)
+    key_bytes = bytes(range(32))
+    record, keyring = an_item(top_level, {"acct": base64.b64encode(key_bytes).decode()})
+
+    found = readable_items(split_view_records([record]), keyring)
+
+    assert list(found) == [key_bytes]

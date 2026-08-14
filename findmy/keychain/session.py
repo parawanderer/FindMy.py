@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 from typing_extensions import Self, override
 
 from findmy.cloudkit.client import AsyncCloudKitClient
+from findmy.cloudkit.pcs import public_key_forms
 from findmy.cloudkit.proto import cuttlefish_pb2 as cf
 from findmy.errors import UnhandledProtocolError
 from findmy.util.abc import Closable
@@ -52,15 +53,23 @@ from .escrow import (
 )
 from .items import (
     VIEW_MANATEE,
+    ItemError,
     fetch_view,
     make_securityd_client,
     payload_of,
+    readable_items,
     service_key_item,
 )
 from .peers import PeerDirectory, fetch_peer_directory
 from .recovery import recover_bottled_peer
-from .servicekey import ServiceKeys, service_keys_from_der
-from .shares import KeyShare, fetch_recoverable_shares, summarise, unwrap_share
+from .servicekey import ServiceKeyError, ServiceKeys, service_keys_from_der
+from .shares import (
+    KeyShare,
+    ViewKeyring,
+    fetch_recoverable_shares,
+    summarise,
+    unwrap_share,
+)
 
 if TYPE_CHECKING:
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -429,6 +438,20 @@ class AsyncKeychainSession(Closable):
         :raises ItemError: If the item cannot be found or decrypted.
         :raises ServiceKeyError: If its payload is not a key structure.
         """
+        keyring = await self._view_keyring(peer, view, shares)
+
+        contents = await fetch_view(self._securityd, view)
+        item = service_key_item(contents, keyring)
+
+        return service_keys_from_der(payload_of(item))
+
+    async def _view_keyring(
+        self,
+        peer: RecoveredPeer,
+        view: str,
+        shares: list[KeyShare] | None,
+    ) -> ViewKeyring:
+        """Find the symmetric keys that open a view's items, fetching shares if needed."""
         if shares is None:
             shares = await self.key_shares(peer)
 
@@ -445,11 +468,56 @@ class AsyncKeychainSession(Closable):
             raise KeychainSessionError(msg)
 
         logger.info("Reading the %s view with %s", view, keyring.describe())
+        return keyring
 
+    async def pcs_keys(
+        self,
+        peer: RecoveredPeer,
+        *,
+        view: str = VIEW_MANATEE,
+        shares: list[KeyShare] | None = None,
+    ) -> list[ec.EllipticCurvePrivateKey]:
+        """
+        Every elliptic-curve key a keychain view holds, for Stage 5 to try.
+
+        **Not the same as :meth:`service_keys`, and this is the one a record needs.** That
+        method follows the `currentitem` pointer to the view's *current* key for this
+        service. A record's protection structure names whichever key protected it, which
+        may be an older one or another service's -- §6.8 resolves such a reference by
+        matching on an item's `acct`, so the answer is a view-wide lookup rather than one
+        pointer.
+
+        Reading them all costs a decryption per item and needs no further round trip: the
+        zone was fetched once already.
+
+        :param peer: A peer from :meth:`recover`.
+        :param view: The keychain view to read.
+        :param shares: Shares already fetched, to avoid asking twice.
+        """
+        keyring = await self._view_keyring(peer, view, shares)
         contents = await fetch_view(self._securityd, view)
-        item = service_key_item(contents, keyring)
 
-        return service_keys_from_der(payload_of(item))
+        keys: list[ec.EllipticCurvePrivateKey] = []
+        for account, item in readable_items(contents, keyring).items():
+            try:
+                found = service_keys_from_der(payload_of(item))
+            except (ItemError, ServiceKeyError) as e:
+                logger.debug("Item for acct %s holds no key: %s", account[:8].hex(), e)
+                continue
+
+            # An item names the key it holds, so a mismatch here is this client having
+            # mis-read the payload rather than the item being for someone else -- worth
+            # saying, because it is the difference between a bad reader and a bad key.
+            if account not in public_key_forms(found.encryption_key.public_key()):
+                logger.warning(
+                    "The item for acct %s holds a key whose public half does not match it",
+                    account[:8].hex(),
+                )
+
+            keys.extend(found.for_pcs())
+
+        logger.info("The %s view holds %d elliptic-curve key(s)", view, len(keys))
+        return keys
 
     async def recover_service_keys(
         self,

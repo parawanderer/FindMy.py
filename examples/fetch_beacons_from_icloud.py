@@ -105,11 +105,15 @@ async def recover_keys(session: AsyncKeychainSession) -> list[ec.EllipticCurvePr
 
     passcode = getpass.getpass("passcode (not echoed)> ")
     try:
-        keys = await session.recover_service_keys(chosen, passcode)
+        peer = await session.recover(chosen, passcode)
     finally:
         del passcode  # used inside the call above and wanted no longer
 
-    return keys.for_pcs()
+    # Every key the view holds, not just the one the pointer names. A record's protection
+    # structure names whichever key protected it, which may be an older one -- and §6.8
+    # resolves such a reference by matching an item's `acct`, so the whole view is the
+    # lookup rather than one pointer.
+    return await session.pcs_keys(peer)
 
 
 async def report_recovery_options(session: AsyncKeychainSession) -> None:
