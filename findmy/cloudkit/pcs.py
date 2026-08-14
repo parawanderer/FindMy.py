@@ -523,6 +523,17 @@ def compress_public_key(public_key: ec.EllipticCurvePublicKey) -> bytes:
     return public_key.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
 
 
+def bare_x(public_key: ec.EllipticCurvePublicKey) -> bytes:
+    """
+    Render the x coordinate alone, which is how this protocol writes a public key.
+
+    Not the X9.62 compressed form: no sign byte, no `0x04` marker. See §2's note.
+    """
+    uncompressed = public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    coordinate = (public_key.curve.key_size + 7) // 8
+    return uncompressed[1 : 1 + coordinate]
+
+
 def public_key_forms(public_key: ec.EllipticCurvePublicKey) -> set[bytes]:
     """
     Every way this protocol writes a public key, for matching one against another.
@@ -980,7 +991,15 @@ def unwrap_zone(
         )
         raise PCSError(msg)
 
-    logger.info("The zone yields %d key(s) for its records", len(unwrapped.private_keys))
+    # Name them the way a record names a key -- as a bare x coordinate -- because the next
+    # failure is a record asking for one, and the only useful question then is whether it
+    # is among these. Public keys, so naming them discloses nothing.
+    named = ", ".join(bare_x(key.public_key())[:8].hex() for key in unwrapped.private_keys[:4])
+    logger.info(
+        "The zone yields %d key(s) for its records: %s",
+        len(unwrapped.private_keys),
+        named,
+    )
     return unwrapped.private_keys
 
 
