@@ -1125,3 +1125,43 @@ def test_the_der_describer_names_nested_tags() -> None:
 
     assert "[0]" in described
     assert "16" in described  # the SEQUENCE's own universal tag
+
+
+def test_an_identity_is_walked_rather_than_indexed_into() -> None:
+    # The members around the keyset are unnamed, so their positions are not something to
+    # rely on. Searching is safe here because a candidate must parse as the private-key
+    # CHOICE and yield a scalar of a known length -- a wrong element yields no key.
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import _identity_keys  # noqa: PLC0415
+
+    def length(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(body)]) + body
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + length(len(body)) + body
+
+    scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+    v_data = tlv(0x65, tlv(0x04, _pcs_key_message(scalar.to_bytes(32, "big"))))
+
+    # Deliberately buried at a different depth and position from the documented one.
+    buried = tlv(0x30, tlv(0x02, b"\x09") + tlv(0xA3, tlv(0x31, v_data)))
+    identity = tlv(0x30, tlv(0x0C, b"x") + tlv(0x04, buried))
+
+    element, _ = der.parse_one(identity)
+    keys = _identity_keys(element)
+
+    assert len(keys) == 1
+    assert keys[0].private_numbers().private_value == scalar
+
+
+def test_an_identity_holding_no_key_yields_none_rather_than_a_wrong_one() -> None:
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import _identity_keys  # noqa: PLC0415
+
+    # A structure of the right shape carrying bytes that are not a key.
+    element, _ = der.parse_one(bytes([0x30, 0x06, 0x04, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]))
+
+    assert _identity_keys(element) == []

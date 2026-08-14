@@ -1064,7 +1064,16 @@ def parse_meta(plaintext: bytes) -> MetaContents:
             symmetric.extend(entry.as_bytes() for entry in child.unwrap().children())
         elif child.is_context(_META_IDENTITIES):
             for identity in child.unwrap().children():
-                private.extend(_identity_keys(identity))
+                found = _identity_keys(identity)
+                if not found:
+                    # The member is present and the reader got nothing out of it, so what
+                    # is unknown is the shape below it -- and one level deeper each round
+                    # is how this has taken three. Describe it far enough to end.
+                    logger.warning(
+                        "An identity yielded no keys. Its shape is: %s",
+                        der.describe(identity, depth=6),
+                    )
+                private.extend(found)
 
     if not symmetric and not private:
         # It decoded and held neither member, which means the reader is looking in the
@@ -1072,7 +1081,7 @@ def parse_meta(plaintext: bytes) -> MetaContents:
         # diagnose from a message, and the one where naming the tags settles it.
         logger.warning(
             "A decrypted meta carries neither symmKeys nor identities. Its shape is: %s",
-            der.describe(element),
+            der.describe(element, depth=4),
         )
 
     logger.debug(
@@ -1083,51 +1092,56 @@ def parse_meta(plaintext: bytes) -> MetaContents:
     return MetaContents(symmetric_keys=symmetric, private_keys=private)
 
 
-def _identity_keys(identity: der.DerElement) -> list[ec.EllipticCurvePrivateKey]:
-    """Read the EC private keys out of one identity's nested keyset."""
+def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.EllipticCurvePrivateKey]:
+    """
+    Read the EC private keys out of one identity, wherever in it they sit.
+
+    The keys are inside a `keyset` **OCTET STRING that is itself DER**, one level down --
+    and the members around it are unnamed, so their positions are not something to rely
+    on. This therefore walks the identity rather than indexing into it.
+
+    **That is safe to do here for the reason a length-match search was not.** A candidate
+    is accepted only if it parses as the private-key CHOICE *and* yields a scalar of a
+    known length, so a wrong element does not produce a wrong key -- it produces no key.
+    """
     from findmy.keychain.servicekey import (  # noqa: PLC0415 -- avoids an import cycle
         ServiceKeyError,
         service_keys_from_der,
     )
 
+    if depth <= 0:
+        return []
+
     keys: list[ec.EllipticCurvePrivateKey] = []
 
-    for member in identity.children():
-        # The keyset is an OCTET STRING holding DER rather than an inline structure, so
-        # this descends into any member that parses as one rather than assuming a position.
-        if member.constructed:
-            continue
+    for member in _members_of(identity):
+        # A member may be a key structure itself...
         try:
+            keys.extend(service_keys_from_der(member.raw).for_pcs())
+            continue
+        except (ServiceKeyError, der.DerError):
+            pass
+
+        # ...or hold one deeper, either inline or inside an octet string of DER.
+        if member.constructed:
+            keys.extend(_identity_keys(member, depth - 1))
+            continue
+
+        with contextlib.suppress(der.DerError):
             nested, _ = der.parse_one(member.as_bytes())
-        except der.DerError:
-            continue
-        keys.extend(_keys_in_keyset(nested, service_keys_from_der, ServiceKeyError))
+            keys.extend(_identity_keys(nested, depth - 1))
 
     return keys
 
 
-def _keys_in_keyset(
-    keyset: der.DerElement,
-    read_key: object,
-    key_error: type[Exception],
-) -> list[ec.EllipticCurvePrivateKey]:
-    """Read every private key out of a nested keyset structure."""
-    keys: list[ec.EllipticCurvePrivateKey] = []
-
-    if not keyset.constructed:
-        return keys
-
-    for member in keyset.children():
-        if not member.constructed:
-            continue
-        for candidate in member.children():
-            try:
-                found = read_key(candidate.raw)  # type: ignore[operator]
-            except (key_error, der.DerError):
-                continue
-            keys.extend(found.for_pcs())
-
-    return keys
+def _members_of(element: der.DerElement) -> list[der.DerElement]:
+    """List a constructed element's children, or nothing for a primitive one."""
+    if not element.constructed:
+        return []
+    try:
+        return element.children()
+    except der.DerError:
+        return []
 
 
 def _find_our_key(
