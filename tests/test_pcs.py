@@ -1412,3 +1412,104 @@ def test_rebuilding_reuses_the_members_that_arrived() -> None:
     rebuilt = der.rebuild_without(element, 1)
 
     assert rebuilt == bytes([0x30, 0x03, 0x02, 0x01, 0x09])
+
+
+# --------------------------------------------------------------------------------------
+# Which framing a keyset's checksum covers
+# --------------------------------------------------------------------------------------
+
+
+def a_keyset_body() -> bytes:
+    """The three members before `hash`, in the shape a real keyset has."""
+    from findmy.cloudkit import der  # noqa: PLC0415
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + der.encode_length(len(body)) + body
+
+    # 12(0B), 17{16{4(64B)}}, 17{} -- note two of the three are EMPTY, which is what an
+    # encoder that omits falsy values would silently drop.
+    return (
+        tlv(0x0C, b"")
+        + tlv(0x31, tlv(0x30, tlv(0x04, bytes(64))))
+        + tlv(0x31, b"")
+    )
+
+
+def a_framed_keyset(*, framing: str) -> object:
+    """Build a keyset whose checksum covers one framing or the other."""
+    import hashlib  # noqa: PLC0415
+
+    from findmy.cloudkit import der  # noqa: PLC0415
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + der.encode_length(len(body)) + body
+
+    body = a_keyset_body()
+    sequence_without_hash = tlv(0x30, body)
+    covered = (
+        sequence_without_hash
+        if framing == "sequence"
+        else tlv(0x62, sequence_without_hash)  # APPLICATION 2, constructed
+    )
+
+    keyset = tlv(0x30, body + tlv(0x04, hashlib.sha256(covered).digest()))
+    element, _ = der.parse_one(tlv(0x62, keyset) if framing == "wrapper" else keyset)
+    return element
+
+
+def test_a_checksum_over_the_sequence_is_identified_as_such() -> None:
+    from findmy.cloudkit.pcs import keyset_hash_framing  # noqa: PLC0415
+
+    assert keyset_hash_framing(a_framed_keyset(framing="sequence")) == "sequence"
+
+
+def test_a_checksum_over_the_application_wrapper_is_identified_as_such() -> None:
+    # The two differ only by the application tag and its length, which is exactly the
+    # kind of level confusion this protocol has produced repeatedly.
+    from findmy.cloudkit.pcs import keyset_hash_framing  # noqa: PLC0415
+
+    assert keyset_hash_framing(a_framed_keyset(framing="wrapper")) == "wrapper"
+
+
+def test_the_two_framings_are_not_confused_for_one_another() -> None:
+    # If a wrapper-framed digest also passed the sequence check, a match would say
+    # nothing and the whole approach would be worthless.
+    import hashlib  # noqa: PLC0415
+
+    from findmy.cloudkit import der  # noqa: PLC0415
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + der.encode_length(len(body)) + body
+
+    body = a_keyset_body()
+    wrapper_digest = hashlib.sha256(tlv(0x62, tlv(0x30, body))).digest()
+    sequence_only, _ = der.parse_one(tlv(0x30, body + tlv(0x04, wrapper_digest)))
+
+    from findmy.cloudkit.pcs import keyset_hash_framing  # noqa: PLC0415
+
+    assert keyset_hash_framing(sequence_only) == ""
+
+
+def test_empty_members_survive_the_rebuild() -> None:
+    # The failure the spec named as most likely: an encoder that omits falsy values drops
+    # the empty name and the empty set, and the result still parses back identically, so
+    # nothing downstream complains. Two of a real keyset's four members are empty.
+    from findmy.cloudkit import der  # noqa: PLC0415
+
+    element = a_framed_keyset(framing="sequence")
+    rebuilt, _ = der.parse_one(der.rebuild_without(element, 3))
+
+    members = rebuilt.children()
+    assert [m.tag_number for m in members] == [12, 17, 17]
+    assert members[0].as_bytes() == b""   # the empty name survived
+    assert members[2].content == b""      # so did the empty set
+
+
+def test_a_structure_with_no_checksum_is_not_reported_as_failing() -> None:
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import keyset_hash_framing, verify_keyset_hash  # noqa: PLC0415
+
+    element, _ = der.parse_one(bytes([0x30, 0x03, 0x02, 0x01, 0x01]))  # SEQUENCE{INTEGER}
+
+    assert keyset_hash_framing(element) is None
+    assert verify_keyset_hash(element) is None

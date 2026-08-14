@@ -1312,14 +1312,113 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
 
         with contextlib.suppress(der.DerError):
             nested, _ = der.parse_one(member.as_bytes())
+
+            # The keyset arrives here: an OCTET STRING whose contents are `APP 2` wrapping
+            # the SEQUENCE. Checked at *this* level as well as at the SEQUENCE below,
+            # because "the structure with hash omitted" reads either way and the two
+            # differ by the application tag and its length. A digest match settles which.
+            _report_keyset_framing(nested)
+
             keys.extend(_identity_keys(nested, depth - 1))
 
     return keys
 
 
+def _report_keyset_framing(element: der.DerElement) -> None:
+    """Log which framing of a keyset's checksum matched, if a keyset is what this is."""
+    framing = keyset_hash_framing(element)
+    if framing is None:
+        return
+
+    if framing:
+        # The first real keyset to match. It settles the construction outright -- a wrong
+        # framing cannot produce a 32-byte digest match -- so it is worth saying loudly
+        # once rather than hiding at DEBUG with the failures.
+        logger.info(
+            "A keyset's checksum verifies, over the %s framing. This was open; it is not"
+            " any more, and the framing named here is the answer.",
+            framing,
+        )
+    else:
+        logger.debug(
+            "A keyset's checksum matched neither framing at %s. Its shape is: %s",
+            der.describe(element, depth=1),
+            der.describe(element, depth=4),
+        )
+
+
 # A keyset's checksum is a SHA-256 digest, and so is exactly the length of a P-256 scalar.
 # That coincidence is why a reader can return the checksum where the key was meant.
 _KEYSET_HASH_LENGTH = 32
+
+
+def keyset_hash_framing(keyset: der.DerElement) -> str | None:  # noqa: PLR0911
+    """
+    Say which framing of a keyset's DER its checksum covers, if either does.
+
+    `ShareProtectionKeySet` arrives **explicitly** application-tagged -- `APP 2` wrapping a
+    `SEQUENCE` -- so "the structure with `hash` omitted" has two readings, and they differ
+    by four bytes of tag and length:
+
+    | Framing | What is hashed |
+    | --- | --- |
+    | `sequence` | the inner `SEQUENCE`, rebuilt without `hash` |
+    | `wrapper` | that, re-wrapped in its `APP` tag |
+
+    **Trying both is sound here, where trying key layouts was not.** The oracle is an exact
+    32-byte digest match: a wrong framing cannot produce one without a preimage collision,
+    so a match identifies the framing outright. A search is only untrustworthy when its
+    oracle is "something plausible came out", which is what made the key-blob search
+    worthless.
+
+    :param keyset: Either the `SEQUENCE` or the application-tagged element wrapping it.
+    :returns: The framing's name, `""` if neither matched, or None if there is no
+        checksum here to check.
+    """
+    members = _members_of(keyset)
+    if not members:
+        return None
+
+    # Handed the wrapper: the checksum lives in the SEQUENCE inside it, and the bytes
+    # covered are the whole wrapper.
+    if (
+        keyset.tag_class == der.CLASS_APPLICATION
+        and len(members) == 1
+        and members[0].constructed
+    ):
+        inner = members[0]
+        digest = _trailing_digest(inner)
+        if digest is None:
+            return None
+        try:
+            body = der.rebuild_without(inner, len(_members_of(inner)) - 1)
+        except der.DerError:
+            return None
+        rewrapped = keyset.raw[:1] + der.encode_length(len(body)) + body
+        return "wrapper" if hashlib.sha256(rewrapped).digest() == digest else ""
+
+    digest = _trailing_digest(keyset)
+    if digest is None:
+        return None
+    try:
+        rebuilt = der.rebuild_without(keyset, len(members) - 1)
+    except der.DerError:
+        return None
+
+    return "sequence" if hashlib.sha256(rebuilt).digest() == digest else ""
+
+
+def _trailing_digest(element: der.DerElement) -> bytes | None:
+    """Read the structure's `hash` member, which is its last. None if it carries none."""
+    members = _members_of(element)
+    if not members:
+        return None
+
+    last = members[-1]
+    if not last.is_universal(der.TAG_OCTET_STRING) or len(last.as_bytes()) != _KEYSET_HASH_LENGTH:
+        return None
+
+    return last.as_bytes()
 
 
 def verify_keyset_hash(keyset: der.DerElement) -> bool | None:
@@ -1335,11 +1434,11 @@ def verify_keyset_hash(keyset: der.DerElement) -> bool | None:
     that matches nothing, five levels away.
 
     .. warning::
-        **[observed] This returns False on every real keyset, and the keys are fine.** The
-        zone unwraps, records decrypt, and a field written under these keys reached an
+        **[observed] This returned False on every real keyset, and the keys were fine.**
+        The zone unwraps, records decrypt, and a field written under these keys reached an
         Apple device -- so what is unestablished is this digest's construction, not the
-        data. Most likely the re-encoding is not byte-identical to what Apple hashed, or
-        the digest covers something other than the structure with `hash` removed.
+        data. Which framing it covers is now checked both ways; see
+        :func:`keyset_hash_framing`.
 
         So **nothing acts on the result**, and a False is logged at DEBUG rather than
         warned about. Do not turn this into a check that rejects anything until a real
@@ -1347,20 +1446,11 @@ def verify_keyset_hash(keyset: der.DerElement) -> bool | None:
 
     :returns: Whether it matched, or None if the structure carries no checksum to check.
     """
-    members = _members_of(keyset)
-    if not members:
+    framing = keyset_hash_framing(keyset)
+    if framing is None:
         return None
 
-    last = members[-1]
-    if not last.is_universal(der.TAG_OCTET_STRING) or len(last.as_bytes()) != _KEYSET_HASH_LENGTH:
-        return None
-
-    try:
-        rebuilt = der.rebuild_without(keyset, len(members) - 1)
-    except der.DerError:
-        return None
-
-    return hashlib.sha256(rebuilt).digest() == last.as_bytes()
+    return bool(framing)
 
 
 def _members_of(element: der.DerElement) -> list[der.DerElement]:
