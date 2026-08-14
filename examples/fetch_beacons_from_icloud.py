@@ -215,7 +215,11 @@ def report_key_sources(records, *, keychain_keys, zone_keys) -> None:  # noqa: A
 async def main() -> int:  # noqa: C901, PLR0912, PLR0915 -- a probe; linear reads better
     """Fetch, and decrypt if keys were supplied."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(name)s: %(message)s")
+    # Both halves, not just the CloudKit one. The keychain layer is where key material is
+    # read, and its debug lines say which shape each blob turned out to be -- which is the
+    # kind of thing that is missing from a paste without anyone noticing it is missing.
     logging.getLogger("findmy.cloudkit").setLevel(logging.DEBUG)
+    logging.getLogger("findmy.keychain").setLevel(logging.DEBUG)
 
     account = await get_account_async(ACCOUNT_STORE, ANISETTE_SERVER, ANISETTE_LIBS_PATH)
 
