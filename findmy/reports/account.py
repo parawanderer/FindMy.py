@@ -823,9 +823,16 @@ class AsyncAppleAccount(BaseAppleAccount):
         the terms and agreed to them, which is the worst moment to demand a re-login. So
         each terms request authenticates again immediately beforehand.
 
-        Falls back to the token already held rather than raising, for a session restored
-        without a password or one that is asked for a second factor. That leaves the
-        request to fail on its own terms, which says more than a failure here would.
+        **That is always possible during a blocked login, and not by luck.** Renewing a
+        PET repeats the SRP exchange, which needs the password -- and terms can only
+        block a login that is *in progress*, so the password is necessarily in hand. A
+        session restored from storage is past this stage entirely.
+
+        The exception is §5.1's weekly token refresh, which repeats this stage unattended.
+        If Apple has published new terms by then and no password is retained, there is
+        nothing to renew with and a fresh sign-in is the only answer. So this falls back
+        to the token already held rather than failing at the renewal, which leaves the
+        request to fail on its own terms -- more informative than a pre-emptive error.
         """
         held = self._login_state_data.get("idms_pet", "")
         if not self._password:
