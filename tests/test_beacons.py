@@ -422,6 +422,50 @@ def test_an_alignment_record_missing_its_index_is_still_written() -> None:
     }
 
 
+def test_the_writers_produce_the_keys_a_mac_actually_writes() -> None:
+    # A real oracle, which most fixtures here are not. These key sets are read off
+    # OpenTagViewer's committed macOS export (app/src/test/resources/19032025/), written
+    # by Apple's own framework -- so they are what the format contains rather than what
+    # this implementation believes it contains.
+    beacon = to_owned_beacon_plist(beacon_record())
+    naming = to_beacon_naming_plist(
+        DecryptedRecord(
+            name="NAMING-1",
+            record_type=RecordType.BEACON_NAMING,
+            values={
+                "name": "cat",
+                "associatedBeacon": "BEACON-1",
+                "roleId": 999,
+                "emoji": "\U0001f408",
+            },
+        ),
+    )
+
+    assert set(beacon) == {
+        "batteryLevel", "cloudKitMetadata", "identifier", "isZeus", "model", "pairingDate",
+        "privateKey", "productId", "publicKey", "secondarySharedSecret", "sharedSecret",
+        "stableIdentifier", "systemVersion", "vendorId",
+    }  # fmt: skip
+    assert set(naming) == {
+        "associatedBeacon", "cloudKitMetadata", "emoji", "identifier", "name", "roleId",
+    }  # fmt: skip
+
+
+def test_an_accessorys_model_is_empty_and_its_identity_is_the_product_ids() -> None:
+    # [observed] The committed macOS export's AirTag carries model='' and identifies
+    # itself through productId and vendorId. Devices do not: an unnamed master beacon in
+    # a real zone carried model='iPad13,18', the <family><major>,<minor> form Apple
+    # devices use. So the model alone nearly answers what an unnamed record is, and the
+    # secondary-secret check of _describe_unnamed confirms rather than discovers.
+    record = beacon_record(extra={"model": ""})
+
+    plist = to_owned_beacon_plist(record)
+
+    assert plist["model"] == ""
+    assert plist["productId"] == 1
+    assert plist["vendorId"] == 76
+
+
 def test_both_new_writers_carry_the_metadata_placeholder() -> None:
     assert to_beacon_naming_plist(naming_record())["cloudKitMetadata"] == b""
     assert to_key_alignment_plist(alignment_record())["cloudKitMetadata"] == b""

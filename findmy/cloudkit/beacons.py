@@ -401,11 +401,17 @@ def _describe_unnamed(beacon: DecryptedRecord) -> str:
     """
     Describe a master beacon that resolved to no naming record, with the evidence why.
 
-    **Which secondary secret it carries is the discriminator**: an accessory carries
-    `sharedSecret2`, while an iPhone, iPad or Mac carries `secureLocationsSharedSecret`
-    instead. If every unnamed record turns out to hold the latter, then these are the
-    owner's own findable devices -- which have no naming record because their name comes
-    from the device -- and discarding them is right rather than merely convenient.
+    **The model very nearly answers it on its own.** An accessory's `model` is empty --
+    the committed macOS export's AirTag carries `''` and identifies itself through
+    `productId` and `vendorId` -- while a real zone's unnamed record carried `iPad13,18`,
+    the `<family><major>,<minor>` form Apple devices use for themselves. So an unnamed
+    record is most likely one of the owner's own findable devices, which has no naming
+    record because its name comes from the device.
+
+    **The secondary secret confirms it**: an accessory carries `sharedSecret2`, an iPhone,
+    iPad or Mac carries `secureLocationsSharedSecret` instead. Both are reported, because
+    the discard happens before anything else reads either, so this is the only place they
+    are recorded together.
 
     Logged rather than acted on. Nothing branches on it until it is established.
     """
