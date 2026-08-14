@@ -39,6 +39,8 @@ from findmy.cloudkit.proto import cuttlefish_pb2 as cf
 from findmy.cloudkit.records import describe_wire, named_fields
 from findmy.errors import UnhandledProtocolError
 
+from .items import VIEW_MANATEE, VIEW_PROTECTED_CLOUD_STORAGE
+
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
@@ -47,6 +49,9 @@ if TYPE_CHECKING:
     from .peers import Peer, PeerDirectory
 
 logger = logging.getLogger(__name__)
+
+NEEDED_VIEWS = (VIEW_MANATEE, VIEW_PROTECTED_CLOUD_STORAGE)
+"""The keychain views this project reads. A share for any other is not its concern."""
 
 METHOD_FETCH_RECOVERABLE_TLK_SHARES = "fetchRecoverableTLKShares"
 
@@ -607,7 +612,21 @@ def decode_share_entry(data: bytes) -> ShareEntry | None:
 
     record = _record_in(entry.share)
     if record is None:
-        logger.warning("Entry for %s carries no readable share record", entry.service)
+        # Whether this matters depends entirely on which view it is. An account's trust
+        # circle lists shares for every keychain view it syncs -- around twenty -- and
+        # this project reads exactly two of them. A share it cannot open for a view it
+        # never looks at costs nothing, and warning about it buries the case that does.
+        needed = entry.service in NEEDED_VIEWS
+        logger.log(
+            logging.WARNING if needed else logging.INFO,
+            "Entry for %s carries no readable share record%s",
+            entry.service,
+            (
+                ", and that view is one this needs, so key recovery will come up short"
+                if needed
+                else ". Nothing here reads that view, so this affects nothing."
+            ),
+        )
         return None
 
     return ShareEntry(

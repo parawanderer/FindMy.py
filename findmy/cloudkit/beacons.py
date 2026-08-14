@@ -878,6 +878,75 @@ class AsyncBeaconStore:
             ),
         )
 
+    async def find_naming_record(
+        self,
+        identifier: str,
+        zone_keys: Sequence[ec.EllipticCurvePrivateKey],
+    ) -> CloudKitRecord:
+        """
+        Find an accessory's naming record, by the accessory's own identifier.
+
+        **What lets a caller rename without ever holding a record.** The record a save
+        needs is raw, while the thing that identifies an accessory --
+        `associatedBeacon` -- is an encrypted field, so finding one means fetching,
+        decrypting, and mapping the answer back to the record it came from. Doing that
+        once here is the point: it is the step that otherwise leaves every caller holding
+        two representations of the same zone and joining them by name.
+
+        **Fetched fresh every time, deliberately.** A save checks the record's protection
+        tag and replaces it, so a record held across one write is stale and its next write
+        is a lost update. Looking it up per rename means the caller never owns that
+        lifecycle -- and renames are far too rare for the extra fetch to be worth avoiding.
+
+        :param identifier: The accessory's identifier -- what
+            :attr:`~findmy.accessory.FindMyAccessory.identifier` carries.
+        :param zone_keys: What :meth:`zone_keys` returned.
+        :raises BeaconExportError: If no naming record names that accessory, or if more
+            than one does.
+        """
+        records = await self.fetch_records()
+        decrypted = decrypt_records(
+            records,
+            zone_keys,
+            default_master_keys=await self.zone_record_defaults(zone_keys),
+        )
+
+        matches = [
+            record.name
+            for record in decrypted
+            if record.record_type == RecordType.BEACON_NAMING
+            and record.values.get("associatedBeacon") == identifier
+        ]
+
+        if not matches:
+            # Distinguish the two reasons, because they lead in opposite directions: a
+            # beacon that is gone from the account, versus one still present and unnamed.
+            beacons = {
+                record.name
+                for record in decrypted
+                if record.record_type == RecordType.MASTER_BEACON
+            }
+            why = (
+                "it carries no naming record, so there is no name to change"
+                if identifier in beacons
+                else "no accessory with that identifier is in this account"
+            )
+            msg = f"Cannot rename {identifier}: {why}."
+            raise BeaconExportError(msg)
+
+        if len(matches) > 1:
+            # Never seen, and not something to pick between: writing the wrong one of two
+            # would change a name that appears nowhere and leave the visible one alone.
+            msg = (
+                f"Accessory {identifier} is named by {len(matches)} records"
+                f" ({', '.join(sorted(matches))}), and choosing between them is not"
+                " something this can do safely."
+            )
+            raise BeaconExportError(msg)
+
+        by_name = {record.name: record for record in records}
+        return by_name[matches[0]]
+
     async def zone_record_defaults(
         self,
         zone_keys: Sequence[ec.EllipticCurvePrivateKey],

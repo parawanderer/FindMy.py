@@ -250,7 +250,7 @@ class AsyncFindMyClient(Closable):
 
     async def rename(
         self,
-        naming: CloudKitRecord,
+        accessory: str | CloudKitRecord,
         *,
         name: str | None = None,
         emoji: str | None = None,
@@ -262,9 +262,15 @@ class AsyncFindMyClient(Closable):
         this changes exactly the fields it is given -- the rest of the record is sent back
         unchanged and merged, so nothing else about the accessory moves.
 
-        Find the record among :meth:`records`: it is the `BeaconNamingRecord` whose
-        `associatedBeacon` is the accessory's identifier.
-        :func:`~findmy.cloudkit.beacons.group_records` does that join.
+        **Pass an identifier.** `reader.rename(accessory.identifier, name="Keys")` closes
+        the loop from :meth:`accessories` to here without the caller ever meeting a
+        `CloudKitRecord`, and it costs one fetch, which a rename can afford.
+
+        The naming record itself is also accepted, for a caller that already holds one --
+        but **holding one across a write is a trap**. A save checks the record's
+        protection tag and replaces it, so a record kept from before a write is stale and
+        the *second* rename fails after the first succeeded, which is the worst way round
+        to find out. The identifier form has no such lifecycle to manage.
 
         .. note::
             **[observed] Confirmed against Apple's own Find My**, on a Mac, which showed a
@@ -274,11 +280,12 @@ class AsyncFindMyClient(Closable):
             echoing what it was sent, and reading the value back only proves this library
             agrees with itself. Nothing on this side could have caught a wrong layout.
 
-        :param naming: The naming record as fetched, from :meth:`records`.
+        :param accessory: The accessory's identifier, or its naming record as fetched.
         :param name: The new name, if it is changing.
         :param emoji: The new emoji, if it is changing.
-        :raises BeaconExportError: If the record is not a naming record, or neither a name
-            nor an emoji was given.
+        :raises BeaconExportError: If neither a name nor an emoji was given, if the
+            identifier names no accessory in this account, or if the record given is not a
+            naming record.
         :raises KeychainSessionError: If no keys are held.
         """
         changes: dict[str, object] = {}
@@ -291,11 +298,14 @@ class AsyncFindMyClient(Closable):
             msg = "Nothing to change: pass a name, an emoji, or both."
             raise BeaconExportError(msg)
 
-        return await self._store.save_naming_record(
-            naming,
-            await self.zone_keys(),
-            **changes,
+        zone_keys = await self.zone_keys()
+        naming = (
+            await self._store.find_naming_record(accessory, zone_keys)
+            if isinstance(accessory, str)
+            else accessory
         )
+
+        return await self._store.save_naming_record(naming, zone_keys, **changes)
 
     def _require_keys(self) -> None:
         """Insist on keys, naming the two ways to get them."""

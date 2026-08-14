@@ -1102,3 +1102,92 @@ def test_the_fallback_warns_that_it_has_never_run_for_real(
         decrypt_record(stripped, [], default_master_keys=[master_key])
 
     assert "never run against a real account" in caplog.text
+
+
+# --------------------------------------------------------------------------------------
+# Finding a naming record by the accessory's own identifier
+# --------------------------------------------------------------------------------------
+
+
+class FetchingClient(FakeClient):
+    """A client that also answers a fetch, so the identifier lookup has something to find."""
+
+    def __init__(self, changes: list) -> None:
+        super().__init__()
+        self.changes = changes
+
+    async def iter_records(self, zone_name, *, continuation_token=None):  # noqa: ANN001, ANN202, ARG002
+        for change in self.changes:
+            yield change
+
+
+def a_store_with(records: list[CloudKitRecord]) -> beacons.AsyncBeaconStore:
+    """A store whose fetch returns these records."""
+    changes = [
+        ck.RecordChange(record=record.source)
+        for record in records
+        if record.source is not None
+    ]
+    return a_store(FetchingClient(changes))
+
+
+@pytest.mark.asyncio
+async def test_a_naming_record_is_found_by_its_accessorys_identifier() -> None:
+    # The lookup that lets a caller rename holding only what accessories() gave it.
+    # associatedBeacon is encrypted, so finding one means fetching and decrypting.
+    master_key = bytes(range(16))
+    record, private_key = a_naming_record(master_key)
+    store = a_store_with([record])
+
+    found = await store.find_naming_record("BEACON-1", [private_key])
+
+    assert found.name == record.name
+
+
+@pytest.mark.asyncio
+async def test_an_identifier_that_names_no_accessory_says_so() -> None:
+    record, private_key = a_naming_record()
+    store = a_store_with([record])
+
+    with pytest.raises(BeaconExportError, match="no accessory with that identifier"):
+        await store.find_naming_record("NOT-HERE", [private_key])
+
+
+@pytest.mark.asyncio
+async def test_an_accessory_present_but_unnamed_is_distinguished_from_an_absent_one() -> None:
+    # The two lead in opposite directions: one is gone from the account, the other is
+    # there and has no name to change.
+    master_key = bytes(range(16))
+    naming, private_key = a_naming_record(master_key)
+    beacon, _ = make_encrypted_record(private_key, master_key, {}, name="LONELY")
+
+    store = a_store_with([naming, beacon])
+
+    with pytest.raises(BeaconExportError, match="carries no naming record"):
+        await store.find_naming_record("LONELY", [private_key])
+
+
+@pytest.mark.asyncio
+async def test_two_naming_records_for_one_accessory_are_refused() -> None:
+    # Never seen, and not something to pick between: writing the wrong one would change a
+    # name that appears nowhere and leave the visible one alone.
+    master_key = bytes(range(16))
+    first, private_key = a_naming_record(master_key)
+    second, _ = make_encrypted_record(
+        private_key,
+        master_key,
+        {
+            "name": (ValueType.STRING_TYPE, build_plaintext(ValueType.STRING_TYPE, "Other")),
+            "associatedBeacon": (
+                ValueType.STRING_TYPE,
+                build_plaintext(ValueType.STRING_TYPE, "BEACON-1"),
+            ),
+        },
+        record_type=RecordType.BEACON_NAMING,
+        name="NAMING-2",
+    )
+
+    store = a_store_with([first, second])
+
+    with pytest.raises(BeaconExportError, match="named by 2 records"):
+        await store.find_naming_record("BEACON-1", [private_key])

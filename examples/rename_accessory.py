@@ -34,13 +34,11 @@ from typing import TYPE_CHECKING
 
 from _login import get_account_async  # pyright: ignore [reportMissingImports]
 
-from findmy.cloudkit.beacons import decrypt_records
-from findmy.cloudkit.constants import RecordType
 from findmy.errors import UnhandledProtocolError
 from findmy.icloud import AsyncFindMyClient
 
 if TYPE_CHECKING:
-    from findmy.cloudkit.records import CloudKitRecord
+    from findmy.accessory import FindMyAccessory
 
 ANISETTE_SERVER = None
 ANISETTE_LIBS_PATH = "ani_libs.bin"
@@ -76,22 +74,30 @@ async def unlock(client: AsyncFindMyClient) -> bool:
     return True
 
 
-def choose(named: list[tuple[CloudKitRecord, str]]) -> int:
+def choose(accessories: list[FindMyAccessory]) -> FindMyAccessory | None:
     """
-    Show what can be renamed and ask which. Returns an index, or -1 to stop.
+    Show what can be renamed and ask which. Returns None to stop.
 
     Anything that is not one of the numbers stops, rather than being taken as a default.
     The one destructive step should need a deliberate answer, not a plausible typo.
     """
-    print(f"\n{len(named)} accessor{'y' if len(named) == 1 else 'ies'} can be renamed:\n")
-    for number, (_, name) in enumerate(named, start=1):
-        print(f"  {number}. {name or '<unnamed>'}")
+    # An accessory with no identifier cannot be looked up, so there is nothing to rename
+    # and offering it would fail at the one step that writes.
+    renameable = [a for a in accessories if a.identifier]
+
+    count = len(renameable)
+    print(f"\n{count} accessor{'y' if count == 1 else 'ies'} can be renamed:\n")
+    for number, accessory in enumerate(renameable, start=1):
+        print(f"  {number}. {accessory.name or '<unnamed>'} ({accessory.model})")
+
+    if len(renameable) != len(accessories):
+        print(f"\n  ({len(accessories) - count} more carry no identifier to look up.)")
 
     typed = input("\nWhich one? Number, or anything else to cancel> ").strip()
-    if not typed.isdigit() or not 1 <= int(typed) <= len(named):
-        return -1
+    if not typed.isdigit() or not 1 <= int(typed) <= count:
+        return None
 
-    return int(typed) - 1
+    return renameable[int(typed) - 1]
 
 
 def confirm(old: str, new: str) -> bool:
@@ -114,26 +120,27 @@ async def main() -> int:  # noqa: PLR0911
             if not await unlock(client):
                 return 1
 
-            records = await client.records()
-            decrypted = {d.name: d for d in decrypt_records(records, await client.zone_keys())}
-
-            # The naming records, paired with the name each currently holds. Renaming
-            # saves one of these -- the master beacon beside it is never written.
-            named = [
-                (record, str(decrypted[record.name].values.get("name", "")))
-                for record in records
-                if record.record_type == RecordType.BEACON_NAMING and record.name in decrypted
-            ]
-            if not named:
-                print("\nNo naming records came back, so there is nothing to rename.")
+            # Ordinary accessories, exactly as any other example gets them. Nothing here
+            # meets a CloudKit record: renaming takes the identifier this already carries.
+            accessories = await client.accessories()
+            if not accessories:
+                print("\nNo accessories came back, so there is nothing to rename.")
                 return 1
 
-            index = choose(named)
-            if index < 0:
+            chosen = choose(accessories)
+            if chosen is None:
                 print("\nCancelled. Nothing was sent.")
                 return 0
 
-            record, old = named[index]
+            # Where the accessory stops being an object and becomes the one thing rename
+            # needs. choose() already skips accessories without one; this is the boundary
+            # that makes that guarantee visible rather than assumed.
+            identifier = chosen.identifier
+            if not identifier:
+                print("\nThat accessory carries no identifier, so it cannot be looked up.")
+                return 1
+
+            old = chosen.name or ""
             new = input("\nNew name> ").strip()
             if not new:
                 print("\nAn empty name would leave the accessory unlabelled. Cancelled.")
@@ -143,26 +150,20 @@ async def main() -> int:  # noqa: PLR0911
                 print("\nCancelled. Nothing was sent, and your account is unchanged.")
                 return 0
 
-            await client.rename(record, name=new)
+            await client.rename(identifier, name=new)
 
             # Reading it back proves the two halves of THIS library agree, and nothing
             # more. It is worth doing because a failure here is decisive, but a success
             # is not -- which is what the closing message is for.
-            fresh = await client.records()
-            again = {d.name: d for d in decrypt_records(fresh, await client.zone_keys())}
-            readback = str(again.get(record.name, decrypted[record.name]).values.get("name", ""))
+            after = {a.identifier: a for a in await client.accessories()}
+            readback = (after[identifier].name or "") if identifier in after else ""
 
             print(f"\nSaved. Reading it back gives: {readback!r}")
             if readback != new:
                 print("Which is not what was written, so the write did not take effect.")
                 return 1
 
-            print("\nThat only proves this library can read what this library wrote, so")
-            print("it is worth looking at the accessory on an iPhone, iPad or Mac too.")
-            print("This path has been confirmed that way once -- a name written here")
-            print("showed up correctly in Find My on a Mac -- but nothing on this side")
-            print("can detect a layout Apple would reject, so a blank or garbled name")
-            print("there is still the more valuable result and worth reporting.")
+            print("Done.")
     except UnhandledProtocolError as e:
         print(f"\nFailed: {e}")
         return 1
