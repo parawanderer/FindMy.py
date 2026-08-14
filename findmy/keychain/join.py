@@ -20,7 +20,7 @@ sends lives. What is here can be exercised offline in full.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -548,3 +548,154 @@ def generate_identity(*, machine_id: str, model_id: str, creation_time: int) -> 
         permanent=permanent,
         peer_id=peer_identifier(permanent.info, permanent.signature),
     )
+
+
+@dataclass(frozen=True)
+class SignatureCheck:
+    """What verifying the circle's own signed blobs found."""
+
+    verified: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+
+    unverifiable: list[str] = field(default_factory=list)
+    """Peers carrying no signature, or a key this cannot read. Neither confirms nor denies."""
+
+    vouchers_verified: list[str] = field(default_factory=list)
+    vouchers_failed: list[str] = field(default_factory=list)
+
+    der_spki_keys: int = 0
+    """
+    How many signing keys parsed as DER SubjectPublicKeyInfo.
+
+    Separate evidence, and for a separate claim: §6.9.1 says a peer's keys travel as DER
+    SPKI rather than as raw points, and this client's writer encodes them that way. Real
+    peers are what settles that.
+    """
+
+    @property
+    def confirmed(self) -> bool:
+        """Whether every blob that could be checked verified."""
+        return bool(self.verified) and not self.failed and not self.vouchers_failed
+
+    def describe(self) -> str:
+        """One line, for a caller deciding whether the signing construction is right."""
+        checkable = len(self.verified) + len(self.failed)
+        parts = [f"{len(self.verified)}/{checkable} permanent info"]
+        if self.vouchers_verified or self.vouchers_failed:
+            vouchers = len(self.vouchers_verified) + len(self.vouchers_failed)
+            parts.append(f"{len(self.vouchers_verified)}/{vouchers} vouchers")
+        if self.unverifiable:
+            parts.append(f"{len(self.unverifiable)} could not be checked")
+        return ", ".join(parts)
+
+
+def check_peer_signatures(directory: PeerDirectory) -> SignatureCheck:
+    """
+    Verify the signatures on blobs **Apple's own devices** produced.
+
+    This is the second oracle a join has, and it is the only one that reaches the *signing*
+    construction. Everything else about :class:`SignedBlob` is checked against itself: the
+    tests sign and then verify with the same code, so a wrong type prefix, a wrong digest
+    or a wrong key encoding would agree with itself perfectly. A real peer's signature
+    cannot -- it was made by a device that knows the rule, and verifying it exercises the
+    ASCII prefix with no separator, ECDSA over SHA-384, and reading the key as DER SPKI.
+
+    Getting that rule wrong does not merely fail a join. It can produce blobs that are
+    *admitted and wrong*, which surfaces long after the one call that cannot be taken back.
+
+    Two things are checked and reported separately, because they mean different things:
+
+    * every peer's **permanent info**, signed by that peer's own key -- so a failure is
+      about this client's reading rather than about the circle;
+    * every **voucher**, signed by the sponsor it names -- which additionally exercises
+      looking a peer up and verifying across two parties.
+
+    :param directory: The circle, from
+        :func:`~findmy.keychain.peers.fetch_peer_directory`. Read-only; this sends nothing.
+    """
+    verified: list[str] = []
+    failed: list[str] = []
+    unverifiable: list[str] = []
+    vouchers_verified: list[str] = []
+    vouchers_failed: list[str] = []
+    der_spki = 0
+
+    for peer in directory.peers.values():
+        key = peer.signing_public_key()
+        if not peer.permanent_info or not peer.permanent_signature or key is None:
+            unverifiable.append(peer.hash)
+            continue
+
+        der_spki += int(_is_der_spki(peer.signing_key))
+
+        blob = SignedBlob(info=peer.permanent_info, signature=peer.permanent_signature)
+        (verified if blob.verify(key, TYPE_PERMANENT_INFO) else failed).append(peer.hash)
+
+        _check_voucher(peer, directory, vouchers_verified, vouchers_failed, unverifiable)
+
+    check = SignatureCheck(
+        verified=verified,
+        failed=failed,
+        unverifiable=unverifiable,
+        vouchers_verified=vouchers_verified,
+        vouchers_failed=vouchers_failed,
+        der_spki_keys=der_spki,
+    )
+
+    if check.failed:
+        logger.warning(
+            "%d peer(s) carry a permanent info this cannot verify. That is this client's"
+            " reading of the signing rule being wrong, not the circle being wrong -- and"
+            " a join built on it would send blobs Apple's side rejects, or admits and"
+            " misreads.",
+            len(check.failed),
+        )
+    elif check.verified:
+        logger.info(
+            "The signing construction verifies %d peer(s) signed by Apple's own devices",
+            len(check.verified),
+        )
+
+    return check
+
+
+def _is_der_spki(key: bytes) -> bool:
+    """Whether a peer's key is DER SubjectPublicKeyInfo rather than a raw point."""
+    from cryptography.hazmat.primitives.serialization import (  # noqa: PLC0415
+        load_der_public_key,
+    )
+
+    try:
+        load_der_public_key(key)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def _check_voucher(
+    peer: Peer,
+    directory: PeerDirectory,
+    verified: list[str],
+    failed: list[str],
+    unverifiable: list[str],
+) -> None:
+    """Verify one peer's voucher against the sponsor it names, if it carries one."""
+    if not peer.voucher_info or not peer.voucher_signature:
+        return
+
+    try:
+        voucher = cf.Voucher.FromString(peer.voucher_info)
+    except DecodeError:
+        failed.append(peer.hash)
+        return
+
+    sponsor = directory.get(voucher.sponsor)
+    sponsor_key = sponsor.signing_public_key() if sponsor else None
+    if sponsor_key is None:
+        # The sponsor is not in the circle, so there is nothing to verify against. Not a
+        # failure of the construction, and not evidence for it either.
+        unverifiable.append(peer.hash)
+        return
+
+    blob = SignedBlob(info=peer.voucher_info, signature=peer.voucher_signature)
+    (verified if blob.verify(sponsor_key, TYPE_VOUCHER) else failed).append(peer.hash)

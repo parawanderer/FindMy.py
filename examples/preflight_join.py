@@ -36,6 +36,7 @@ from _login import get_account_async  # pyright: ignore [reportMissingImports]
 from findmy.errors import UnhandledProtocolError
 from findmy.keychain import AsyncKeychainSession
 from findmy.keychain.escrow import ESCROW_LABEL_ICDP
+from findmy.keychain.join import check_peer_signatures
 from findmy.keychain.peers import check_peer_identifiers
 
 ANISETTE_SERVER = None
@@ -74,6 +75,14 @@ async def main() -> int:  # noqa: PLR0915 -- a report, and it reads as one
                 print(f"    reported {peer_hash}")
                 print(f"    derived  {directory.peers[peer_hash].derived_hash}")
 
+            # The second oracle, and the only one that reaches the signing rule. Every
+            # other test of it signs and verifies with the same code, so a wrong type
+            # prefix or digest would agree with itself; a blob Apple's own device signed
+            # cannot.
+            signatures = check_peer_signatures(directory)
+            print(f"  Signatures verified:   {signatures.describe()}")
+            print(f"  Signing keys as DER SPKI: {signatures.der_spki_keys}")
+
             # ------------------------------------------------------------------
             print("\n--- What the account already holds ---")
             options = await session.recovery_options()
@@ -111,21 +120,35 @@ async def main() -> int:  # noqa: PLR0915 -- a report, and it reads as one
 
     # ----------------------------------------------------------------------
     print("\n--- Verdict ---")
-    if check.confirmed:
-        print("  The identifier derivation reproduces every peer it could be checked")
-        print("  against, so a voucher built on it will name a beneficiary that exists.")
-        print("  A join is an ordinary call rather than an irreversible guess.")
-        return 0
-
     if check.mismatched:
-        print("  The derivation does NOT reproduce this circle's peers. Do not join:")
-        print("  the voucher would name a beneficiary that does not exist, and that")
-        print("  failure only surfaces after the join has been sent.")
+        print("  The identifier derivation does NOT reproduce this circle's peers. Do")
+        print("  not join: the voucher would name a beneficiary that does not exist,")
+        print("  and that failure only surfaces after the join has been sent.")
         return 1
 
-    print("  No peer carried anything to check the derivation against, so this run")
-    print("  neither confirms nor denies it. Joining would be a guess.")
-    return 1
+    if signatures.failed or signatures.vouchers_failed:
+        print("  Blobs that Apple's own devices signed do not verify under this")
+        print("  client's reading of the signing rule. Do not join: the blobs it")
+        print("  sends would be rejected, or admitted and wrong.")
+        return 1
+
+    if not check.confirmed:
+        print("  No peer carried anything to check the derivation against, so this run")
+        print("  neither confirms nor denies it. Joining would be a guess.")
+        return 1
+
+    print("  Two things are ruled out, and they are the two that could not be checked")
+    print("  any other way:")
+    print("    the identifier derivation, against identifiers Apple produced;")
+    print("    the signing construction, against signatures Apple's devices made.")
+    print()
+    print("  **That is not the same as a join being safe.** Everything this client")
+    print("  will put in its own blobs is checked only against itself: the permanent")
+    print("  info's epoch and key encoding, its machine id and millisecond timestamp,")
+    print("  the stable info's policy constants, the trust merge, the shares and the")
+    print("  bottle. A join remains an irreversible call with parts nothing local can")
+    print("  validate -- two fewer than before, and the two nothing else could reach.")
+    return 0
 
 
 if __name__ == "__main__":

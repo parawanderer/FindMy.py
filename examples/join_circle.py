@@ -44,7 +44,7 @@ import sys
 from _login import get_account_async  # pyright: ignore [reportMissingImports]
 
 from findmy.errors import UnhandledProtocolError
-from findmy.keychain import AsyncKeychainSession, DeviceDescription
+from findmy.keychain import AsyncKeychainSession, DeviceDescription, RecoveryOptions
 from findmy.keychain.peers import check_peer_identifiers
 
 ANISETTE_SERVER = None
@@ -53,13 +53,25 @@ ACCOUNT_STORE = "account.json"
 
 # How this client describes itself. These reach two places a person reads: the escrow
 # record's metadata, which is the only way to recognise it in a listing later, and the
-# peer's own name in the account's device list. Worth setting to something you will
-# recognise in a year.
+# peer's name in the account's device list.
+#
+# The name and the serial are honest -- deliberately synthetic, so that a listing a year
+# from now says what made the record. **The model and OS string are not.** They claim to be
+# a Mac, and this client is not one; they are here because nobody has tested whether
+# Cuttlefish accepts a `modelId` outside the set it knows, and a join is not the run to
+# find that out on. If that turns out to be permitted, these should become truthful.
+#
+# Note what a constant serial means: §5.2's rule is that records count runs and serials
+# count devices, so two joins on one account read as **one device that enrolled twice**.
+# That is accurate for one installation and wrong for two people running this, and the
+# listing will not tell those apart.
 DEVICE = DeviceDescription(
     name="FindMy.py",
     model="MacBookPro18,3",
     serial="FINDMYPY0001",
-    build="22F8",
+    # The build that goes with the OS version below. They were inconsistent here at first,
+    # which nothing checks today and which would be wrong the moment something does.
+    build="22F82",
     model_class="Mac",
     platform="macOS",
 )
@@ -70,6 +82,34 @@ def confirm(prompt: str, expected: str) -> bool:
     """Ask for a word to be typed back in full. Not a y/n."""
     print(f"\n{prompt}")
     return input(f"Type {expected} to continue> ").strip() == expected
+
+
+def choose_sponsor(options: RecoveryOptions):  # noqa: ANN201
+    """Offer the records that could sponsor a join, and take one by serial."""
+    print(f"\n{len(options.recoverable)} record(s) can sponsor this join:\n")
+    for record in options.recoverable:
+        print(f"  {record.describe()}")
+
+    print("\nEnter the SERIAL of the one to recover from. You will need that")
+    print("device's screen-lock passcode -- its PIN or login password.\n")
+
+    typed = input("serial> ").strip()
+    return next((r for r in options.recoverable if r.serial == typed), None)
+
+
+def ask_new_passcode() -> str:
+    """Ask for the passcode the new record will be recoverable with, twice."""
+    print("\nNow choose the passcode for the NEW escrow record this creates.")
+    print("It is what would recover this client later, and it is the only way")
+    print("back. It does not have to match the one you just typed.")
+
+    passcode = getpass.getpass("new passcode (not echoed)> ")
+    if passcode != getpass.getpass("again> "):
+        print("Those do not match.")
+        return ""
+    if not passcode:
+        print("An empty passcode would leave the record recoverable by anyone.")
+    return passcode
 
 
 async def main() -> int:  # noqa: PLR0911, PLR0915 -- refusals, each with its own reason
@@ -100,15 +140,7 @@ async def main() -> int:  # noqa: PLR0911, PLR0915 -- refusals, each with its ow
                 print("peer available to vouch for a new one.")
                 return 1
 
-            print(f"\n{len(options.recoverable)} record(s) can sponsor this join:\n")
-            for record in options.recoverable:
-                print(f"  {record.describe()}")
-
-            print("\nEnter the SERIAL of the one to recover from. You will need that")
-            print("device's screen-lock passcode -- its PIN or login password.\n")
-
-            typed = input("serial> ").strip()
-            chosen = next((r for r in options.recoverable if r.serial == typed), None)
+            chosen = choose_sponsor(options)
             if chosen is None:
                 print("No recoverable record has that serial.")
                 return 1
@@ -118,20 +150,15 @@ async def main() -> int:  # noqa: PLR0911, PLR0915 -- refusals, each with its ow
             try:
                 peer = await session.recover(chosen, passcode)
             finally:
+                # A gesture, and worth knowing as one: this drops the name so the string
+                # can be collected. It scrubs nothing, and the value has already been
+                # copied through the SRP exchange.
                 del passcode
 
             print(f"Recovered {peer.peer_id}, which will sponsor the new identity.")
 
-            print("\nNow choose the passcode for the NEW escrow record this creates.")
-            print("It is what would recover this client later, and it is the only way")
-            print("back. It does not have to match the one you just typed.")
-
-            new_passcode = getpass.getpass("new passcode (not echoed)> ")
-            if new_passcode != getpass.getpass("again> "):
-                print("Those do not match.")
-                return 1
+            new_passcode = ask_new_passcode()
             if not new_passcode:
-                print("An empty passcode would leave the record recoverable by anyone.")
                 return 1
 
             print("\nThis creates THREE permanent things on the account:")
@@ -144,6 +171,11 @@ async def main() -> int:  # noqa: PLR0911, PLR0915 -- refusals, each with its ow
                 print("Nothing was done.")
                 return 1
 
+            # BaseException, not Exception: a Ctrl-C or a cancellation during the join is
+            # exactly the case that invites running it again, and it is the case where
+            # nothing else would print this. A timeout does not establish that no request
+            # was sent -- so anything at all coming out of this call has to carry the
+            # warning, not just the failures the library models.
             try:
                 outcome = await session.join(
                     peer,
@@ -151,7 +183,19 @@ async def main() -> int:  # noqa: PLR0911, PLR0915 -- refusals, each with its ow
                     device=DEVICE,
                     os_version=OS_VERSION,
                 )
+            except BaseException:
+                print("\n*** The join may already have happened. ***")
+                print("The peer and the escrow record may exist even though this failed,")
+                print("and a timeout or an interrupt does not establish otherwise.")
+                print("Do NOT run this script again to find out: that would create a")
+                print("second peer, a second bottle and a second record, all permanent.")
+                print("Run preflight_join.py, which reads the circle and shows what is")
+                print("there.")
+                raise
             finally:
+                # Drops the name so the string becomes collectable. It does not scrub
+                # anything, and the passcode has already been copied through the SRP
+                # computation -- this is the most Python offers, not a guarantee.
                 del new_passcode
 
             print("\n--- Joined ---")
@@ -167,10 +211,11 @@ async def main() -> int:  # noqa: PLR0911, PLR0915 -- refusals, each with its ow
             print("needs to remove this record if you decide you did not want it, and no")
             print("Apple interface will show it to you.")
     except UnhandledProtocolError as e:
+        # Failures before the join reach here and are safe to retry. One that happened
+        # *during* the join has already printed its own warning above and re-raised, so
+        # this deliberately does not repeat it -- two messages about the same failure,
+        # one hedged and one definite, is worse than either alone.
         print(f"\nFailed: {e}")
-        print("\nIf that failure happened after the join was sent, the peer and the")
-        print("record exist regardless. Do NOT run this again to find out -- run")
-        print("preflight_join.py, which reads the circle and shows what is there.")
         return 1
     finally:
         await account.close()

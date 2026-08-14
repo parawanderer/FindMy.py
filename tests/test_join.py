@@ -618,3 +618,107 @@ def test_view_keys_type_is_transcribed_but_has_never_been_written() -> None:
         "class_c": 4,
         "old_top_level_key": 5,
     }
+
+
+# --------------------------------------------------------------------------------------
+# Verifying the circle's own signatures, which is the only external check of the rule
+# --------------------------------------------------------------------------------------
+
+
+def _signed_peer(name: str, key: ec.EllipticCurvePrivateKey, *, type_name: bytes = b""):
+    """A peer whose permanent info is signed the way §6.9.1 says, or not."""
+    from findmy.keychain.join import TYPE_PERMANENT_INFO, public_spki  # noqa: PLC0415
+    from findmy.keychain.peers import Peer  # noqa: PLC0415
+
+    info = cf.PeerPermanentInfo(
+        epoch=1,
+        signing_key=public_spki(key.public_key()),
+        machine_id="m",
+        model_id="Mac",
+        creation_time=1,
+    ).SerializeToString()
+    blob = SignedBlob.sign(info, key, type_name or TYPE_PERMANENT_INFO)
+
+    return Peer(
+        hash=name,
+        signing_key=public_spki(key.public_key()),
+        encryption_key=b"",
+        machine_id="m",
+        model_id="Mac",
+        permanent_info=blob.info,
+        permanent_signature=blob.signature,
+    )
+
+
+def test_a_correctly_signed_peer_verifies() -> None:
+    from findmy.keychain.join import check_peer_signatures  # noqa: PLC0415
+
+    check = check_peer_signatures(a_circle(_signed_peer("A", a_key())))
+
+    assert check.confirmed
+    assert check.verified == ["A"]
+    # §6.9.1 says a peer's keys travel as DER SPKI rather than as raw points.
+    assert check.der_spki_keys == 1
+
+
+def test_a_blob_signed_without_the_type_prefix_does_not_verify() -> None:
+    # The prefix is the protection, and this is the check that would catch its absence
+    # against real data -- everything else signs and verifies with the same code, so a
+    # missing prefix would agree with itself.
+    from findmy.keychain.join import check_peer_signatures  # noqa: PLC0415
+
+    check = check_peer_signatures(a_circle(_signed_peer("A", a_key(), type_name=b"")))
+    assert check.confirmed
+
+    wrong = a_circle(_signed_peer("A", a_key(), type_name=b"TPPB.PeerStableInfo"))
+    check = check_peer_signatures(wrong)
+
+    assert not check.confirmed
+    assert check.failed == ["A"]
+
+
+def test_a_peer_carrying_nothing_to_check_is_neither_pass_nor_fail() -> None:
+    from findmy.keychain.join import check_peer_signatures  # noqa: PLC0415
+
+    check = check_peer_signatures(a_circle(_trusting("A", 1)))
+
+    assert check.unverifiable == ["A"]
+    assert not check.confirmed  # nothing verified, so nothing is established
+
+
+def test_a_voucher_verifies_against_the_sponsor_it_names() -> None:
+    import dataclasses  # noqa: PLC0415
+
+    from findmy.keychain.join import check_peer_signatures, make_voucher  # noqa: PLC0415
+
+    sponsor_key, joiner_key = a_key(), a_key()
+    voucher = make_voucher("B", "A", sponsor_key)
+    joiner = dataclasses.replace(
+        _signed_peer("B", joiner_key),
+        voucher_info=voucher.info,
+        voucher_signature=voucher.signature,
+    )
+
+    check = check_peer_signatures(a_circle(_signed_peer("A", sponsor_key), joiner))
+
+    assert check.vouchers_verified == ["B"]
+    assert check.confirmed
+
+
+def test_a_voucher_signed_by_somebody_else_fails() -> None:
+    import dataclasses  # noqa: PLC0415
+
+    from findmy.keychain.join import check_peer_signatures, make_voucher  # noqa: PLC0415
+
+    sponsor_key = a_key()
+    voucher = make_voucher("B", "A", a_key())  # not the sponsor's key
+    joiner = dataclasses.replace(
+        _signed_peer("B", a_key()),
+        voucher_info=voucher.info,
+        voucher_signature=voucher.signature,
+    )
+
+    check = check_peer_signatures(a_circle(_signed_peer("A", sponsor_key), joiner))
+
+    assert check.vouchers_failed == ["B"]
+    assert not check.confirmed
