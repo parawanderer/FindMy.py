@@ -603,14 +603,21 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
             ", ".join(sorted(nameless)),
         )
 
-    # An accessory that gets no alignment record searches its whole history when located
-    # -- tens of thousands of keys against a service answering a few hundred at a time --
-    # and until now that happened with nothing said. A record that is *present but
-    # unreadable* warns; one that simply did not join was silent, which is the worse of
-    # the two because it looks like an accessory that never had one.
+    # An accessory with no alignment record searches its whole key history when located --
+    # tens of thousands of keys against a service answering a few hundred at a time.
+    #
+    # INFO rather than WARNING, because the cost is paid at *locate* time and this runs at
+    # *fetch* time. Renaming an accessory, or listing them, never pays it, so warning here
+    # cries wolf on every run that does neither. Where it does matter, the caller is about
+    # to choose: `scan_span` in fetch_beacons_from_icloud.py prices each accessory before
+    # asking, which is a better signal than a log line because it appears at the decision.
+    #
+    # Still said, and still naming them: an accessory that simply did not join looks
+    # exactly like one that never had a record, and only the fetched count tells them
+    # apart -- which is why that count is here.
     unaligned = [group.beacon.name for group in locatable if group.alignment is None]
     if unaligned:
-        logger.warning(
+        logger.info(
             "%d of %d accessor(ies) have no key-alignment record and will search their"
             " whole history when located: %s. %d alignment record(s) were fetched, so if"
             " that number is not zero these did not join.",

@@ -801,9 +801,12 @@ def test_an_accessory_with_no_alignment_record_is_named_not_merely_absent(
     # against a service answering a few hundred at a time. An unreadable record warns; one
     # that simply did not join was silent, which looks like an accessory that never had
     # one rather than a join that failed.
+    #
+    # At INFO: the cost lands at locate time and this runs at fetch time, so a run that
+    # only lists or renames never pays it.
     import logging  # noqa: PLC0415
 
-    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.beacons"):
+    with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
         accessories_from_records([beacon_record("TAG-1"), naming_record("TAG-1")])
 
     assert "TAG-1" in caplog.text
@@ -817,14 +820,14 @@ def test_an_accessory_that_joined_its_alignment_record_is_not_warned_about(
 
     records = [beacon_record("TAG-1"), naming_record("TAG-1"), alignment_record("TAG-1")]
 
-    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.beacons"):
+    with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
         accessories = accessories_from_records(records)
 
     assert len(accessories) == 1
     assert "whole history" not in caplog.text
 
 
-def test_the_warning_says_how_many_alignment_records_were_fetched(
+def test_the_report_says_how_many_alignment_records_were_fetched(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # The difference between "this account has none" and "they did not join" is the whole
@@ -837,7 +840,7 @@ def test_the_warning_says_how_many_alignment_records_were_fetched(
         alignment_record("SOMETHING-ELSE"),
     ]
 
-    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.beacons"):
+    with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
         accessories_from_records(records)
 
     assert "1 alignment record(s) were fetched" in caplog.text
