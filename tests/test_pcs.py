@@ -18,6 +18,7 @@ import struct
 import pytest
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.keywrap import aes_key_wrap
@@ -1264,3 +1265,78 @@ def test_the_hmac_covers_the_object_signature_not_its_wrapper() -> None:
 
     # The wrapper's DER is strictly longer, so signing it cannot coincide.
     assert len(protection.signature_data_der) > len(protection.signature_data.data)
+
+
+def test_a_keyset_yields_its_key_and_not_its_checksum() -> None:
+    # [observed] The nested keyset is [APPLICATION 2] { name, keys SET, set, hash }, and
+    # its hash is 32 bytes -- exactly a P-256 scalar's length. Reading the keyset *as* a
+    # key therefore succeeds, returning the digest, and a walk that stops at the first
+    # member to yield something never looks inside `keys` where the real blob is.
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import _identity_keys  # noqa: PLC0415
+
+    def length(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(body)]) + body
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + length(len(body)) + body
+
+    real = ec.generate_private_key(ec.SECP256R1())
+    uncompressed = real.public_key().public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    blob = uncompressed[1:33] + real.private_numbers().private_value.to_bytes(32, "big")
+
+    keyset = tlv(
+        0x62,  # [APPLICATION 2], constructed
+        tlv(
+            0x30,
+            tlv(0x0C, b"")
+            + tlv(0x31, tlv(0x30, tlv(0x04, blob)))
+            + tlv(0x31, b"")
+            + tlv(0x04, bytes(range(32))),  # the hash: a scalar's length, and not a key
+        ),
+    )
+    identity = tlv(0x30, tlv(0x02, b"\x01") + tlv(0x04, keyset))
+
+    element, _ = der.parse_one(identity)
+    found = [k.private_numbers().private_value for k in _identity_keys(element)]
+
+    assert real.private_numbers().private_value in found
+
+
+def test_a_keyset_without_its_application_wrapper_is_read_too() -> None:
+    # The same members, reached by iterating rather than through [APPLICATION 2]. Worth
+    # having separately: in this shape the 32-byte digest is not picked up at all, so the
+    # key being found does not depend on which of the two paths reached it.
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import _identity_keys  # noqa: PLC0415
+
+    def length(n: int) -> bytes:
+        return bytes([n]) if n < 0x80 else bytes([0x81, n])
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + length(len(body)) + body
+
+    real = ec.generate_private_key(ec.SECP256R1())
+    uncompressed = real.public_key().public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    blob = uncompressed[1:33] + real.private_numbers().private_value.to_bytes(32, "big")
+    digest = bytes(range(32))
+
+    keyset = tlv(
+        0x30,
+        tlv(0x31, tlv(0x30, tlv(0x04, blob))) + tlv(0x04, digest),
+    )
+
+    element, _ = der.parse_one(keyset)
+    found = [k.private_numbers().private_value for k in _identity_keys(element)]
+
+    assert real.private_numbers().private_value in found
+    assert int.from_bytes(digest, "big") not in found

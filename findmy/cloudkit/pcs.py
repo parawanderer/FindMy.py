@@ -1192,7 +1192,6 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
         if not member.is_universal(der.TAG_SET):
             try:
                 keys.extend(service_keys_from_der(member.raw).for_pcs())
-                continue
             except KeyBlobError:
                 # Distinct from "this is not a key": the halves of something shaped exactly
                 # like a key disagree. A search that swallows this is how a valid-but-wrong
@@ -1201,7 +1200,14 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
             except (ServiceKeyError, der.DerError):
                 pass
 
-        # ...or hold one deeper, either inline or inside an octet string of DER.
+        # **Descend even when the member already yielded a key.** A `ShareProtectionKeySet`
+        # is `{ name, keys, set, hash }`, and reading it *as* a key succeeds -- its 32-byte
+        # `hash` is exactly a scalar's length, and nothing about an unverifiable 32-byte
+        # blob says it is a checksum rather than a secret. Stopping there returns the
+        # digest and never looks inside `keys`, where the real 64-byte blob is.
+        #
+        # So this collects rather than settles. An extra key that is not a key costs one
+        # failed comparison; a missed one costs everything below it.
         if member.constructed:
             keys.extend(_identity_keys(member, depth - 1))
             continue
