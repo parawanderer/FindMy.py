@@ -783,3 +783,92 @@ def test_p521_is_not_a_length_this_matches() -> None:
     from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
 
     assert scalar_in(bytes(range(66))) is None
+
+
+def a_payload_with_key_blobs(encryption: bytes, signing: bytes | None = None) -> bytes:
+    """A v2 payload whose key blobs are given verbatim."""
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    keys = cf.PcsServiceKeys(encryption_key=cf.PcsPrivateKey(key=encryption))
+    if signing is not None:
+        keys.signing_key.key = signing
+    return der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
+
+
+def public_form(key, form: str) -> bytes:  # noqa: ANN001
+    """One of the ways a public half might be written."""
+    uncompressed = key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    if form == "x":
+        return uncompressed[1:33]
+    if form == "xy":
+        return uncompressed[1:]
+    if form == "compressed":
+        return key.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+    return uncompressed
+
+
+@pytest.mark.parametrize("form", ["x", "xy", "compressed", "uncompressed"])
+@pytest.mark.parametrize("scalar_first", [False, True])
+def test_a_key_blob_is_read_however_its_public_half_is_written(
+    form: str,
+    scalar_first: bool,
+) -> None:
+    # [observed] Find My's service key is 64 bytes for a P-256 key: the bare x coordinate
+    # and the scalar, with neither the 0x04 marker nor a sign byte. A reader that knows
+    # only the two X9.62 forms checks 33 and 65 bytes against a 32-byte prefix and rejects
+    # a perfectly good key.
+    real = ec.generate_private_key(ec.SECP256R1())
+    scalar = real.private_numbers().private_value.to_bytes(32, "big")
+    public = public_form(real, form)
+
+    blob = scalar + public if scalar_first else public + scalar
+
+    keys = service_keys_from_der(a_payload_with_key_blobs(blob))
+
+    assert keys.encryption_key.private_numbers().private_value == (
+        real.private_numbers().private_value
+    )
+
+
+def test_the_observed_sixty_four_byte_shape_is_read() -> None:
+    # The exact shape from a real account: 32 bytes of x, then 32 bytes of scalar.
+    real = ec.generate_private_key(ec.SECP256R1())
+    scalar = real.private_numbers().private_value.to_bytes(32, "big")
+    blob = public_form(real, "x") + scalar
+
+    assert len(blob) == 64
+
+    keys = service_keys_from_der(a_payload_with_key_blobs(blob, signing=blob))
+
+    assert keys.encryption_key.private_numbers().private_value == (
+        real.private_numbers().private_value
+    )
+    assert keys.signing_key is not None
+
+
+def test_a_public_half_that_does_not_match_is_still_rejected() -> None:
+    # Widening the forms must not widen what is accepted: each is compared against bytes
+    # the key itself produces, so a mismatch stays a mismatch.
+    from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
+
+    real = ec.generate_private_key(ec.SECP256R1())
+    other = ec.generate_private_key(ec.SECP256R1())
+    scalar = real.private_numbers().private_value.to_bytes(32, "big")
+
+    candidate = scalar_in(public_form(other, "x") + scalar)
+
+    assert candidate is None or candidate.verified is False
+
+
+def test_opaque_bytes_are_not_described_as_a_message() -> None:
+    # Key material parses as *something*, and an inline description of a key blob is noise
+    # that reads like structure. Field number zero does not exist, so a description
+    # containing one is proof the bytes are opaque.
+    from findmy.cloudkit.records import describe_wire  # noqa: PLC0415
+
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    keys = cf.PcsServiceKeys(encryption_key=cf.PcsPrivateKey(key=b"\x01\x0a\x00\x02"))
+    described = describe_wire(keys.SerializeToString())
+
+    assert "0:" not in described

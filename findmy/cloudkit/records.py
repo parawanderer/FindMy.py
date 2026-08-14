@@ -156,7 +156,7 @@ def describe_wire(data: bytes, depth: int = 2) -> str:
                 continue
 
             inner = describe_wire(payload, depth - 1) if depth > 0 and payload else ""
-            if inner and inner != "<empty>" and "<unparseable>" not in inner:
+            if inner and _looks_like_a_message(inner):
                 parts.append(f"{number}:bytes {len(payload)}B{{{inner}}}")
             else:
                 parts.append(f"{number}:bytes {len(payload)}B")
@@ -164,6 +164,21 @@ def describe_wire(data: bytes, depth: int = 2) -> str:
         parts.append("<unparseable>")
 
     return ", ".join(parts) or "<empty>"
+
+
+def _looks_like_a_message(described: str) -> bool:
+    """
+    Whether a nested description is a real message rather than a mis-parse.
+
+    Key material parses as *something* -- random bytes yield plausible-looking fields --
+    so an inline description of a key blob is noise that reads like structure. Field
+    number zero does not exist in protobuf, so a description containing one is proof the
+    bytes are opaque, and that is the cheapest reliable signal there is.
+    """
+    if described in ("", "<empty>") or "<unparseable>" in described:
+        return False
+
+    return all(part.split(":", 1)[0] != "0" for part in described.split(", "))
 
 
 def reference_name(value: ck.Record.Value) -> str:

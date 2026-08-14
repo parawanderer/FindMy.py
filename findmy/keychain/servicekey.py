@@ -136,29 +136,52 @@ def scalar_in(blob: bytes) -> ScalarCandidate | None:
         if len(blob) <= length:
             continue
 
-        scalar, prefix = blob[-length:], blob[:-length]
-        try:
-            key = ec.derive_private_key(int.from_bytes(scalar, "big"), curve())
-        except ValueError:
-            continue
+        # Either end: the scalar may lead or trail, and both readings check themselves, so
+        # trying both costs nothing and removes a coin-flip about which was meant.
+        for scalar, rest in ((blob[-length:], blob[:-length]), (blob[:length], blob[length:])):
+            try:
+                key = ec.derive_private_key(int.from_bytes(scalar, "big"), curve())
+            except ValueError:
+                continue
 
-        public = key.public_key()
-        encodings = (
-            public.public_bytes(Encoding.X962, PublicFormat.CompressedPoint),
-            public.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint),
-        )
-        if prefix in encodings:
-            logger.debug(
-                "A %d-byte key blob is a point followed by its %d-byte scalar",
-                len(blob),
-                length,
-            )
-            return ScalarCandidate(scalar=scalar, verified=True)
+            if rest in _public_forms(key, length):
+                logger.debug(
+                    "A %d-byte key blob is a %d-byte public form beside its %d-byte scalar",
+                    len(blob),
+                    len(rest),
+                    length,
+                )
+                return ScalarCandidate(scalar=scalar, verified=True)
 
     if len(blob) in _CURVES_BY_SCALAR_LENGTH:
         return ScalarCandidate(scalar=blob, verified=False)
 
     return None
+
+
+def _public_forms(key: ec.EllipticCurvePrivateKey, length: int) -> set[bytes]:
+    """
+    Every way the public half of a key might be written beside its scalar.
+
+    Four, because "compressed" is not one thing. **[observed]** Find My's service key is a
+    64-byte blob for a P-256 key -- the bare x coordinate followed by the scalar, with
+    neither the `0x04` marker nor the sign byte that the X9.62 encodings carry. A reader
+    that knows only the two X9.62 forms rejects it, having checked 33 and 65 bytes against
+    a 32-byte prefix.
+
+    Listing them is safe where guessing lengths is not: each is compared against bytes the
+    key itself produces, so a wrong form cannot match. That is the difference between
+    widening this and widening a table of scalar lengths, which has nothing to check.
+    """
+    public = key.public_key()
+    uncompressed = public.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+
+    return {
+        public.public_bytes(Encoding.X962, PublicFormat.CompressedPoint),
+        uncompressed,
+        uncompressed[1 : 1 + length],  # the bare x coordinate, no marker and no sign byte
+        uncompressed[1:],  # x and y, without the 0x04 marker
+    }
 
 
 def _candidates_in(payload: bytes) -> list[ScalarCandidate]:
