@@ -182,6 +182,24 @@ async def unlock(reader: AsyncFindMyReader) -> bool:
     return True
 
 
+async def locate(account, accessories: list) -> dict:  # noqa: ANN001
+    """
+    Locate each accessory in turn, saying whose search is running.
+
+    One at a time rather than in a batch, and only here: `fetch_location` queries a
+    rolling-key accessory separately anyway, so this costs nothing and makes the log
+    attributable. An accessory with no key-alignment record searches its whole history --
+    tens of thousands of indices, several minutes of `Fetched 0 new reports` -- and
+    without a name in front of it there is no way to tell which one is doing that.
+    """
+    located = {}
+    for accessory in accessories:
+        print(f"  {accessory.name or '<unnamed>'}...", flush=True)
+        located[accessory] = await account.fetch_location(accessory)
+
+    return located
+
+
 def report_accessories(accessories: list, located: dict) -> None:
     """Print what came out, which is the point of all of it."""
     print(f"\n{len(accessories)} accessor{'y' if len(accessories) == 1 else 'ies'}:")
@@ -226,7 +244,7 @@ async def main() -> int:
             # Nothing special about an accessory that came from iCloud: locating one is
             # `fetch_location`, the same call that locates an accessory read from a plist.
             print("\nAsking the Find My network for their last known locations...")
-            report_accessories(accessories, await account.fetch_location(accessories))
+            report_accessories(accessories, await locate(account, accessories))
     except UnhandledProtocolError as e:
         print(f"\nFailed: {e}")
         return 1
