@@ -715,9 +715,11 @@ def test_a_rejection_is_read_as_a_plist_rather_than_dumped_as_text() -> None:
     )
     error = _failure("recover", FakeResponse(409, body))
 
-    assert "status '-6015'" in str(error)
-    assert "CLUBH ERROR" in str(error)
-    assert "respBlob came back too" in str(error)
+    assert "status -6015" in str(error)
+    assert "CLUBH ERROR: Credentials did not verify" in str(error)
+    # Status first and short, message second and whole: the status is what a reader
+    # searches for, the message is what they read.
+    assert str(error).index("status") < str(error).index("CLUBH")
     # The service described this, rather than the request failing in transport.
     assert error.reported
 

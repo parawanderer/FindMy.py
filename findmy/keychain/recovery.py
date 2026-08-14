@@ -27,6 +27,7 @@ import binascii
 import hashlib
 import logging
 import secrets
+import textwrap
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -330,33 +331,47 @@ def unwrap_inner_blob(blob: bytes, passcode: str) -> bytes:
     return _strip_padding(plaintext)
 
 
-RETRY_LIMIT_UNVERIFIED = (
-    "Passcode-authenticated escrow services normally limit how many attempts a record"
-    " allows, and Apple's does; how many this one allows, and what happens at the end of"
-    " them, is **not established by the specification this implements**. Treat attempts as"
-    " a resource rather than as free retries, and prefer being sure of the passcode over"
-    " trying variations."
-)
-"""
-Why a rejected recovery is worth stopping on rather than retrying immediately.
+# **[observed] This call fails intermittently, and the same passcode succeeds on a retry.**
+# Seen as HTTP 409 with `status` -6015 and a `message` beginning `CLUBH ERROR:`, on an
+# account where the recovery had worked before and worked again immediately after.
+#
+# That reorders the advice. The specification's point -- that a wrong passcode and a
+# mis-parameterised exchange fail identically -- is still true and still worth saying, but
+# it is no longer the first thing to suspect, and leading with it sends somebody to check
+# a passcode that was right.
+TRANSIENT_STATUS = "-6015"
 
-Deliberately hedged, because the consequence of being wrong in the incautious direction --
-a record that stops being recoverable at all -- is far worse than the cost of being wrong
-in the cautious one, which is a sentence of advice nobody needed.
-"""
+_ADVICE = (
+    "Try again first: this call fails intermittently and the same passcode then works.",
+    "If it keeps failing, note that a wrong passcode and a mis-parameterised exchange"
+    " are indistinguishable here by design, so this says which half is at fault and not"
+    " which fault. srp_init was answered, so the record, the label and the transport are"
+    " right; only the proof or the passcode is in question.",
+    "Attempts may be a limited resource. Apple's escrow services generally cap them, and"
+    " what this one allows is not established here -- so prefer being sure of a passcode"
+    " over trying variations of one.",
+)
 
 
 def _rejected(error: EscrowError) -> RecoveryError:
-    """Explain a rejection the service reported, without claiming to know which fault."""
-    msg = (
-        f"The escrow proxy rejected the recovery: {error}\n\n"
-        "A wrong passcode and a mis-parameterised exchange fail identically here, by"
-        " design -- so this does not establish which. What it does establish is that the"
-        " first half succeeded: srp_init was answered, so the record, the transport and"
-        " the label are all right, and the fault is in the proof or the passcode.\n\n"
-        f"{RETRY_LIMIT_UNVERIFIED}"
+    """
+    Explain a rejection the service reported, in the order worth acting on.
+
+    Not in the order of likelihood-of-being-interesting: the intermittent case goes first
+    because it is both the most common and the cheapest to rule out, and because the
+    alternative -- leading with the passcode -- sends somebody to re-examine something
+    that was already right.
+    """
+    lines = "\n".join(
+        textwrap.fill(
+            f"{index}. {advice}",
+            width=78,
+            initial_indent="  ",
+            subsequent_indent="     ",
+        )
+        for index, advice in enumerate(_ADVICE, start=1)
     )
-    return RecoveryError(msg)
+    return RecoveryError(f"{error}\n\n{lines}")
 
 
 async def recover_bottled_peer(

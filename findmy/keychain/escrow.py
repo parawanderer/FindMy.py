@@ -469,14 +469,18 @@ def _failure(command: str, resp: object) -> EscrowError:
         data = None
 
     if isinstance(data, dict):
-        described = ", ".join(
-            f"{key} {data[key]!r}" for key in _FAILURE_FIELDS if data.get(key) is not None
-        )
-        blob = " (a respBlob came back too)" if data.get("respBlob") else ""
-        msg = (
-            f"Escrow proxy rejected {command} with HTTP {status_code}:"
-            f" {described or 'no status or message'}{blob}"
-        )
+        # Status first and short, message second and whole: the status is what a reader
+        # searches for and the message is what they read.
+        status = data.get("status") or data.get("errorCode")
+        message = data.get("message") or data.get("errorMessage")
+
+        described = f"HTTP {status_code}"
+        if status is not None:
+            described += f", status {status}"
+        if message:
+            described += f" -- {message}"
+
+        msg = f"Escrow proxy rejected {command}: {described}"
         # The service described this rather than the request failing in transport.
         return EscrowError(msg, reported=True)
 

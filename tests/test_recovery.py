@@ -300,3 +300,28 @@ def test_the_wrong_passcode_does_not_yield_the_material() -> None:
     blob = inner_blob("123456", b"the bottled peer")
 
     assert unwrap_inner_blob(blob, "654321") != b"the bottled peer"
+
+
+def test_a_rejected_recovery_leads_with_the_case_that_is_usually_true() -> None:
+    # **[observed]** this call fails intermittently and the same passcode then works, so
+    # leading with "your passcode may be wrong" sends somebody to re-examine something
+    # that was already right. The specification's ambiguity is still stated, second.
+    from findmy.keychain.escrow import EscrowError  # noqa: PLC0415
+    from findmy.keychain.recovery import _rejected  # noqa: PLC0415
+
+    text = str(_rejected(EscrowError("HTTP 409, status -6015")))
+
+    assert text.index("Try again first") < text.index("wrong passcode")
+    assert "status -6015" in text
+    # Wrapped, because this is read in a terminal rather than parsed.
+    assert max(len(line) for line in text.splitlines()) <= 80
+
+
+def test_the_rejection_says_which_half_of_the_exchange_worked() -> None:
+    from findmy.keychain.escrow import EscrowError  # noqa: PLC0415
+    from findmy.keychain.recovery import _rejected  # noqa: PLC0415
+
+    text = str(_rejected(EscrowError("boom")))
+
+    assert "srp_init was answered" in text
+    assert "limited resource" in text
