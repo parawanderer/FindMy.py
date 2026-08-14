@@ -511,11 +511,17 @@ def decrypt_records(
 
     Records this client holds no key for are counted and reported, not raised on: a zone
     legitimately contains records protected for other parties.
+
+    **The first missing key is reported in full**, not merely counted. "No key held" is the
+    same count whether the records really belong to someone else or the keys are compared
+    in the wrong encoding, and those lead in opposite directions -- so the one message that
+    tells them apart must not be swallowed by the tally that summarises it.
     """
     wanted = {RecordType.MASTER_BEACON, RecordType.BEACON_NAMING, RecordType.KEY_ALIGNMENT}
 
     decrypted: list[DecryptedRecord] = []
     skipped: dict[str, int] = {}
+    first_miss: str | None = None
 
     for record in records:
         if record.record_type not in wanted:
@@ -523,12 +529,16 @@ def decrypt_records(
             continue
         try:
             decrypted.append(decrypt_record(record, private_keys))
-        except MissingKeyError:
+        except MissingKeyError as e:
             skipped["no key held"] = skipped.get("no key held", 0) + 1
+            first_miss = first_miss or str(e)
         except PCSError:
             logger.exception("Could not decrypt %s (%s)", record.name, record.record_type)
 
     if skipped:
         logger.info("Skipped records: %s", ", ".join(f"{k} x{v}" for k, v in skipped.items()))
+
+    if first_miss is not None:
+        logger.info("Why no key was held: %s", first_miss)
 
     return decrypted

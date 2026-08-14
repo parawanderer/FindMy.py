@@ -499,3 +499,41 @@ def test_the_whole_flow_from_encrypted_records_to_an_accessory() -> None:
 
 def test_apple_epoch_is_2001_not_1970() -> None:
     assert beacons.APPLE_EPOCH.year == 2001
+
+
+def test_a_missing_key_is_explained_once_and_not_only_counted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # "No key held" is the same count whether the records belong to someone else or the
+    # keys were compared in the wrong encoding, and those lead in opposite directions. The
+    # tally that summarises the failure must not swallow the message that explains it.
+    import logging  # noqa: PLC0415
+
+    ours = ec.generate_private_key(ec.SECP256R1())
+    theirs = ec.generate_private_key(ec.SECP256R1())
+
+    master = bytes(range(16))
+    protection = build_protection(
+        entries=[
+            (pcs.compress_public_key(theirs.public_key()), wrap_master_key(theirs.public_key(), master), None),
+        ],
+        truncated_key_id=pcs.compute_key_id(master)[:4],
+        version=5,
+        hmac_master_key=master,
+    )
+
+    record = CloudKitRecord(
+        name="a-record",
+        zone_name="BeaconStore",
+        record_type=RecordType.MASTER_BEACON,
+        fields={},
+        protection_info=protection,
+        etag="",
+    )
+
+    with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
+        decrypt_records([record], [ours])
+
+    assert "Why no key was held" in caplog.text
+    # The sizes are what distinguish "not for us" from "compared the wrong bytes".
+    assert "bytes; the forms compared against are" in caplog.text
