@@ -358,18 +358,18 @@ class ViewKeys(_message.Message):
     def __init__(self, service: _Optional[str] = ..., top_level_key: _Optional[_Union[ViewKey, _Mapping]] = ..., class_a: _Optional[_Union[ViewKey, _Mapping]] = ..., class_c: _Optional[_Union[ViewKey, _Mapping]] = ..., old_top_level_key: _Optional[_Union[ViewKey, _Mapping]] = ...) -> None: ...
 
 class ViewKey(_message.Message):
-    __slots__ = ("key_id", "top_level_key_id", "key_number", "key", "field_5")
+    __slots__ = ("key_id", "top_level_key_id", "key_number", "key", "harware")
     KEY_ID_FIELD_NUMBER: _ClassVar[int]
     TOP_LEVEL_KEY_ID_FIELD_NUMBER: _ClassVar[int]
     KEY_NUMBER_FIELD_NUMBER: _ClassVar[int]
     KEY_FIELD_NUMBER: _ClassVar[int]
-    FIELD_5_FIELD_NUMBER: _ClassVar[int]
+    HARWARE_FIELD_NUMBER: _ClassVar[int]
     key_id: str
     top_level_key_id: str
     key_number: int
-    key: bytes
-    field_5: bytes
-    def __init__(self, key_id: _Optional[str] = ..., top_level_key_id: _Optional[str] = ..., key_number: _Optional[int] = ..., key: _Optional[bytes] = ..., field_5: _Optional[bytes] = ...) -> None: ...
+    key: str
+    harware: str
+    def __init__(self, key_id: _Optional[str] = ..., top_level_key_id: _Optional[str] = ..., key_number: _Optional[int] = ..., key: _Optional[str] = ..., harware: _Optional[str] = ...) -> None: ...
 
 class PcsServiceKeys(_message.Message):
     __slots__ = ("encryption_key", "signing_key")

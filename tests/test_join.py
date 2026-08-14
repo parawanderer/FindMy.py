@@ -575,9 +575,46 @@ def test_every_field_the_specification_types_is_declared_that_way() -> None:
         cf.FetchChangesRequest: {"sync_token": text},
         cf.CuttlefishJoinWithVoucherRequest: {"restore_point": text},
         cf.CuttlefishUpdateTrustRequest: {"restore_point": text, "peer_id": text},
+        # The one bytes field among four, against §6.9's pattern of declaring
+        # binary-looking values as strings.
+        cf.TlkKeyMaterial: {
+            "uuid": text,
+            "zone_name": text,
+            "key_class": text,
+            "key": data,
+        },
     }
 
     for message, fields in expected.items():
         declared = {field.name: field.type for field in message.DESCRIPTOR.fields}
         for name, kind in fields.items():
             assert declared[name] == kind, f"{message.DESCRIPTOR.name}.{name}"
+
+
+def test_view_keys_type_is_transcribed_but_has_never_been_written() -> None:
+    # Asserted for the same reason as the rest, and separately from them: **nothing in
+    # this project constructs a ViewKey**, so unlike every other message here this has
+    # never been exercised in the direction that would catch a wrong type. Its `key` is a
+    # string, following TlkShare rather than the key material message a few structures
+    # away, and the fifth field really is spelled `harware`. This checks the transcription
+    # and claims nothing more.
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    declared = {field.name: field.type for field in cf.ViewKey.DESCRIPTOR.fields}
+
+    assert declared["key_id"] == FieldDescriptor.TYPE_STRING
+    assert declared["top_level_key_id"] == FieldDescriptor.TYPE_STRING
+    assert declared["key_number"] == FieldDescriptor.TYPE_UINT32
+    assert declared["key"] == FieldDescriptor.TYPE_STRING
+    # Apple's spelling. Correcting it would name a field nothing is looking for.
+    assert declared["harware"] == FieldDescriptor.TYPE_STRING
+    assert "hardware" not in declared
+
+    # And the enclosing message, which this project always sends empty.
+    assert {f.name: f.number for f in cf.ViewKeys.DESCRIPTOR.fields} == {
+        "service": 1,
+        "top_level_key": 2,
+        "class_a": 3,
+        "class_c": 4,
+        "old_top_level_key": 5,
+    }

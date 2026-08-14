@@ -147,6 +147,11 @@ message ViewKeySet {
 
 // What a decrypted key share expands to. Field 4 is the view's top-level key itself --
 // symmetric material, not a container holding a key and not an EC private key.
+// `key` is the one `bytes` field, against the pattern of §6.9 where binary-looking values
+// are declared `string`. A writer should not need these declarations at all: a share is
+// re-created by passing this message's serialised bytes through untouched, because
+// re-encoding changes the bytes the receiver's key is bound to even when every field is
+// identical.
 message TlkKeyMaterial {
   optional string uuid = 1;
   optional string zone_name = 2;
@@ -351,15 +356,20 @@ message ViewKeys {
   optional ViewKey old_top_level_key = 5;
 }
 
+// Note that `key` is a `string`, following the pattern of TlkShare rather than that of
+// TlkKeyMaterial a few messages up -- and that **nothing in this project writes one**, so
+// unlike every other message here this has never been exercised in the direction that
+// would check it. A transcription no writer has constructed is weaker than one that has.
 message ViewKey {
   optional string key_id = 1;
   optional string top_level_key_id = 2;
   optional uint32 key_number = 3;
-  optional bytes key = 4;
+  optional string key = 4;
 
-  // Field 5's name is misspelled in every schema examined, so it is left unnamed here
-  // rather than silently corrected.
-  optional bytes field_5 = 5;
+  // Spelled as Apple spells it: `harware`, missing its `d`. Misspelled in every schema
+  // examined, and that spelling is the wire format -- correcting it here would name a
+  // field nothing on the other side is looking for.
+  optional string harware = 5;
 }
 
 // The payload of a v2 PCS private key structure: Stage 5 SS3.2's
