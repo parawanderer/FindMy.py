@@ -723,7 +723,30 @@ def test_a_negative_field_is_rendered_rather_than_refused() -> None:
 
     data = share_signed_data(share)
 
-    assert data.endswith(b"\x01\x00\x00\x00\x00\x00\x00\x00" + b"\xff" * 8 + bytes(4))
+    # curve, epoch, poisoned -- eight bytes each, poisoned included.
+    assert data.endswith(b"\x01" + bytes(7) + b"\xff" * 8 + bytes(8))
+
+
+def test_every_signed_integer_is_eight_bytes_including_the_uint32_ones() -> None:
+    # version and poisoned are uint32 on the message and their own type on the record.
+    # The signed form is neither: all four are eight bytes. At four, both being zero on
+    # real shares leaves the digest short and the share is skipped -- which reads as a
+    # peer with no shares to give rather than as a verification failure.
+    from findmy.keychain.shares import ShareRecord, share_signed_data  # noqa: PLC0415
+
+    share = ShareRecord(
+        sender="",
+        receiver="",
+        receiver_public_encryption_key=b"",
+        wrapped_key=b"",
+        signature=b"",
+        curve=4,
+        epoch=1,
+        poisoned=0,
+        version=0,
+    )
+
+    assert len(share_signed_data(share)) == 4 * 8
 
 
 def test_a_negative_value_is_two_s_complement_not_an_absolute_value() -> None:
@@ -787,3 +810,170 @@ def test_a_share_for_the_recovered_peer_passes_that_check() -> None:
     share = unwrap_share(a_share(ours), ours, expected_receiver="PEER-US")
 
     assert share.plaintext == b"the view key"
+
+
+# --------------------------------------------------------------------------------------
+# Creating a share (§6.9.2)
+# --------------------------------------------------------------------------------------
+
+
+def _key():
+    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+
+    return ec.generate_private_key(ec.SECP384R1())
+
+
+def _material() -> bytes:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    return cf.TlkKeyMaterial(
+        uuid="7F0A2C1E-0000-4000-8000-000000000001",
+        zone_name="Manatee",
+        key_class="tlk",
+        key=b"\x11" * 32,
+    ).SerializeToString()
+
+
+def test_a_written_share_is_one_the_reader_can_open() -> None:
+    # The decisive test for the writer: the reader was built from §6.7.0, describing the
+    # same archive from the receiving side, and it trims the overrun the writer has to
+    # produce. If the two disagree about that quantity, nothing comes back.
+    from findmy.keychain.shares import archive_sfies, sfies_decrypt_archive, sfies_encrypt  # noqa: PLC0415
+
+    key = _key()
+    archive = archive_sfies(sfies_encrypt(key.public_key(), _material()))
+
+    assert sfies_decrypt_archive(key, archive) == _material()
+
+
+def test_the_archived_ciphertext_carries_the_overrun_and_it_is_zeros() -> None:
+    from findmy.keychain.shares import (  # noqa: PLC0415
+        archive_sfies,
+        sfies_encrypt,
+        sfies_parts,
+    )
+
+    parts = sfies_encrypt(_key().public_key(), _material())
+    archived = sfies_parts(archive_sfies(parts))
+
+    # The reader trims by len(point) + len(code), so what it recovers is what was encrypted.
+    assert archived.ciphertext == parts.ciphertext
+
+    from findmy.keychain.shares import archived_members  # noqa: PLC0415
+
+    members = archive_sfies(parts)
+    raw = next(v for k, v in archived_members(members).items() if "SFCiphertext" in k)
+
+    assert len(raw) == len(parts.ciphertext) + len(parts.point) + len(parts.code)
+    # Zeros, not the uninitialised heap Apple leaks: the overrun has to exist, its
+    # contents do not have to be anybody's memory.
+    assert raw[len(parts.ciphertext) :] == bytes(len(parts.point) + len(parts.code))
+
+
+def test_the_misspelled_member_name_is_written_as_apple_spells_it() -> None:
+    # A reader can match the fragment and forgive it. A writer cannot: the correctly
+    # spelled name is one Apple's unarchiver will not find the ephemeral key under.
+    from findmy.keychain.shares import archive_sfies, archived_members, sfies_encrypt  # noqa: PLC0415
+
+    members = archived_members(archive_sfies(sfies_encrypt(_key().public_key(), b"x")))
+    names = " ".join(members)
+
+    assert "ExternaRepresentation" in names
+    assert "ExternalRepresentation" not in names
+
+
+def test_a_created_share_verifies_under_the_peer_that_made_it() -> None:
+    # End to end: the seven-part signature, the widths, the endianness and the field
+    # values, checked by the verifier used on shares that arrive.
+    import base64  # noqa: PLC0415
+
+    from findmy.keychain.peers import Peer  # noqa: PLC0415
+    from findmy.keychain.shares import (  # noqa: PLC0415
+        ShareRecord,
+        make_share,
+        verify_share_signature,
+    )
+
+    signing, encryption = _key(), _key()
+    share = make_share(
+        _material(),
+        peer_id="SHA256:abc",
+        encryption_key=encryption.public_key(),
+        signing_key=signing,
+    )
+
+    record = ShareRecord(
+        sender=share.sender,
+        receiver=share.receiver,
+        receiver_public_encryption_key=base64.b64decode(share.receiver_public_encryption_key),
+        wrapped_key=base64.b64decode(share.wrapped_key),
+        signature=base64.b64decode(share.signature),
+        curve=share.curve,
+        epoch=share.epoch,
+        poisoned=share.poisoned,
+        version=share.version,
+    )
+    sender = Peer(
+        hash="SHA256:abc",
+        signing_key=signing.public_key().public_bytes(
+            Encoding.DER,
+            PublicFormat.SubjectPublicKeyInfo,
+        ),
+        encryption_key=b"",
+        machine_id="",
+        model_id="",
+    )
+
+    assert verify_share_signature(record, sender)
+
+
+def test_a_created_share_names_itself_at_both_ends() -> None:
+    from findmy.keychain.shares import make_share  # noqa: PLC0415
+
+    share = make_share(
+        _material(),
+        peer_id="SHA256:me",
+        encryption_key=_key().public_key(),
+        signing_key=_key(),
+    )
+
+    assert share.sender == share.receiver == "SHA256:me"
+    assert share.service == "Manatee"
+    assert share.key_id == "7F0A2C1E-0000-4000-8000-000000000001"
+    assert share.curve == 4
+    assert share.epoch == 1
+    # Omitted from the message, and signed as zero regardless.
+    assert not share.HasField("poisoned")
+    assert not share.HasField("version")
+
+
+def test_the_receiver_key_travels_as_a_point_not_as_der() -> None:
+    # The one place in this stage where a public key does not travel as DER SPKI.
+    import base64  # noqa: PLC0415
+
+    from findmy.keychain.shares import make_share  # noqa: PLC0415
+
+    encryption = _key()
+    share = make_share(
+        _material(),
+        peer_id="SHA256:me",
+        encryption_key=encryption.public_key(),
+        signing_key=_key(),
+    )
+    decoded = base64.b64decode(share.receiver_public_encryption_key)
+
+    assert decoded[0] == 0x04  # uncompressed
+    assert len(decoded) == 97
+
+
+def test_key_material_with_no_zone_is_refused() -> None:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.shares import ShareError, make_share  # noqa: PLC0415
+
+    with pytest.raises(ShareError, match="no zone or no uuid"):
+        make_share(
+            cf.TlkKeyMaterial(key=b"\x00" * 32).SerializeToString(),
+            peer_id="SHA256:me",
+            encryption_key=_key().public_key(),
+            signing_key=_key(),
+        )

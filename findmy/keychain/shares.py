@@ -520,24 +520,44 @@ def _little_endian(value: int, width: int) -> bytes:
     return (value & ((1 << (8 * width)) - 1)).to_bytes(width, "little")
 
 
+SIGNED_INTEGER_WIDTH = 8
+"""
+**All four integers are eight bytes**, `version` and `poisoned` included.
+
+They are not eight bytes anywhere else: the §6.9 message declares those two as `uint32`
+and the CloudKit record carries its own integer type. The signed form is neither.
+
+This started as four, from an earlier revision of the table, and it is the wrong that costs
+most: both fields are zero on real shares, so a four-byte rendering leaves the digest four
+zero bytes short, the check fails, and the share is **skipped**. The symptom is a peer that
+appears to have no shares to give -- not a verification error, and not anything that points
+here.
+"""
+
+
 def share_signed_data(share: ShareRecord) -> bytes:
     """
     Assemble the bytes a key share's signature covers.
 
-    Seven fields in a fixed order, and **the integers are little-endian** -- which is the
-    trap. Everything else in this protocol is big-endian: CloudKit's protobuf, the
-    KeyVault framing, the PCS structures. This one construction is not, and getting it
-    wrong produces a signature that will not verify with nothing to say why.
+    Seven fields in a fixed order, all seven always present, and **the integers are
+    little-endian** -- which is the trap. Everything else in this protocol is big-endian:
+    CloudKit's protobuf, the KeyVault framing, the PCS structures. This one construction is
+    not, and getting it wrong produces a signature that will not verify with nothing to say
+    why.
+
+    None of the seven may be skipped. A share that omits `poisoned` and `version` on the
+    wire still signs them, as zero -- so building this by walking the populated fields
+    produces a five-part digest that verifies nowhere.
     """
     return b"".join(
         (
-            _little_endian(share.version, 4),
+            _little_endian(share.version, SIGNED_INTEGER_WIDTH),
             share.receiver.encode("utf-8"),
             share.sender.encode("utf-8"),
             share.wrapped_key,
-            _little_endian(share.curve, 8),
-            _little_endian(share.epoch, 8),
-            _little_endian(share.poisoned, 4),
+            _little_endian(share.curve, SIGNED_INTEGER_WIDTH),
+            _little_endian(share.epoch, SIGNED_INTEGER_WIDTH),
+            _little_endian(share.poisoned, SIGNED_INTEGER_WIDTH),
         ),
     )
 
@@ -1035,3 +1055,175 @@ def summarise(shares: Sequence[KeyShare]) -> str:
 def public_point(key: ec.EllipticCurvePrivateKey) -> bytes:
     """Render a key's uncompressed public point, to compare against a share's receiver."""
     return key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+
+
+# --------------------------------------------------------------------------------------
+# Creating a share (§6.9.2)
+# --------------------------------------------------------------------------------------
+
+SHARE_CURVE_P384 = 4
+"""What `curve` names for P-384. The rest of the enumeration is unspecified."""
+
+SHARE_EPOCH = 1
+"""What `epoch` carries on a share this client creates."""
+
+# Apple's own key for the ephemeral point, spelled as Apple spells it: `Externa`, with no
+# final `l`. A reader can match the fragment and forgive it; a writer cannot. The correctly
+# spelled name is one Apple's unarchiver will not find the ephemeral key under, and the
+# failure arrives as a share that authenticates against nothing.
+MEMBER_POINT = "SFEphemeralSenderPublicKeyExternaRepresentation"
+MEMBER_CIPHERTEXT = "SFCiphertext"
+MEMBER_CODE = "SFIESAuthenticationCode"
+
+
+def sfies_encrypt(
+    receiver_public: ec.EllipticCurvePublicKey,
+    plaintext: bytes,
+    ephemeral: ec.EllipticCurvePrivateKey | None = None,
+) -> SfiesParts:
+    """
+    Encrypt to a peer's public key, the inverse of :func:`sfies_decrypt`.
+
+    A fresh ephemeral key pair each time -- its uncompressed point is both what gets
+    archived and the shared info the derivation is bound to, so the two cannot disagree.
+
+    :param receiver_public: The receiving peer's encryption key.
+    :param plaintext: The serialised key material.
+    :param ephemeral: The ephemeral key. Generated if not supplied; a parameter so a test
+        can produce the same ciphertext twice.
+    :returns: The three parts, with the ciphertext at its true length -- the overrun that
+        §6.9.2 requires is added when archiving, since it is a property of the archived
+        member rather than of the ciphertext.
+    """
+    ephemeral = ephemeral or ec.generate_private_key(receiver_public.curve)
+    point = public_point(ephemeral)
+
+    shared = ephemeral.exchange(ec.ECDH(), receiver_public)
+    material = _x963_kdf(shared, point, _SFIES_KEY_LENGTH + _SFIES_NONCE_LENGTH)
+
+    encryptor = Cipher(
+        algorithms.AES(material[:_SFIES_KEY_LENGTH]),
+        modes.GCM(material[_SFIES_KEY_LENGTH:]),
+    ).encryptor()
+    body = encryptor.update(plaintext) + encryptor.finalize()
+
+    return SfiesParts(point=point, ciphertext=body, code=encryptor.tag)
+
+
+def archive_sfies(parts: SfiesParts) -> bytes:
+    """
+    Write the three parts as the keyed archive a share carries.
+
+    Two things here are not what a fresh implementation would produce, and both are the
+    format rather than a quirk to tidy:
+
+    **The ciphertext member is longer than the ciphertext.** Apple's writer sizes that
+    buffer for all three parts and archives it untrimmed, and Apple's reader subtracts that
+    much unconditionally -- so a tightly-sized ciphertext arrives with its last bytes cut
+    off and fails authentication. The pad is derived from the other two members rather than
+    written as 113, because a different curve makes it a different number. **Zeros**, not
+    the uninitialised heap Apple leaks there: the overrun has to exist, its contents do not
+    have to be anybody's memory.
+
+    **The ephemeral point's member name is misspelled**, and that spelling is the wire
+    format -- see :data:`MEMBER_POINT`.
+
+    The envelope is a plain dictionary. Nothing declares `$class` naming `SFIESCiphertext`
+    or reconstructs its hierarchy, because Apple's side finds the members by name; the one
+    class that matters is the `NSMutableData` on the point, which is a property of that
+    member rather than of the envelope.
+    """
+    overrun = len(parts.point) + len(parts.code)
+
+    archive = {
+        "$version": 100000,
+        "$archiver": "NSKeyedArchiver",
+        "$top": {"root": plistlib.UID(1)},
+        "$objects": [
+            "$null",
+            {
+                MEMBER_CIPHERTEXT: plistlib.UID(2),
+                MEMBER_CODE: plistlib.UID(3),
+                MEMBER_POINT: plistlib.UID(4),
+            },
+            parts.ciphertext + bytes(overrun),
+            parts.code,
+            {"NS.data": parts.point, "$class": plistlib.UID(5)},
+            {"$classes": ["NSMutableData", "NSData", "NSObject"], "$classname": "NSMutableData"},
+        ],
+    }
+
+    return plistlib.dumps(archive, fmt=plistlib.FMT_BINARY)
+
+
+def make_share(
+    plaintext: bytes,
+    *,
+    peer_id: str,
+    encryption_key: ec.EllipticCurvePublicKey,
+    signing_key: ec.EllipticCurvePrivateKey,
+) -> cf.TlkShare:
+    """
+    Build one `TlkShare`: a view key, re-addressed to the joining peer.
+
+    **A joining peer shares to itself.** Both `sender` and `receiver` are the new peer's
+    identifier and the wrapping key is its own encryption key, which reads like a no-op and
+    is not: the keys were recovered from a *different* peer's shares, and Cuttlefish only
+    recognises a peer as holding a view key when a share addressed to that peer says so.
+    The join is where the keys are re-addressed from the recovered identity to this one.
+
+    `service` and `keyId` come from the key material itself rather than from the share --
+    the CloudKit record form carries neither, which is a fact about reading one.
+
+    :param plaintext: The serialised `TlkKeyMaterial`, as recovered.
+    :param peer_id: The new peer's identifier, which is both ends of this share.
+    :param encryption_key: The new peer's public encryption key.
+    :param signing_key: The new peer's signing key, for the share's own signature.
+    """
+    material = parse_key_material(plaintext)
+    if not material.zone_name or not material.uuid:
+        msg = (
+            "This key material names no zone or no uuid, so a share built from it would"
+            f" carry no service or key id: {material}"
+        )
+        raise ShareError(msg)
+
+    wrapped = archive_sfies(sfies_encrypt(encryption_key, plaintext))
+
+    # Rendered through the same type the reader verifies, so the signature is built by the
+    # one function that knows the field order, the widths and the endianness.
+    signed = share_signed_data(
+        ShareRecord(
+            sender=peer_id,
+            receiver=peer_id,
+            receiver_public_encryption_key=encryption_key.public_bytes(
+                Encoding.X962,
+                PublicFormat.UncompressedPoint,
+            ),
+            wrapped_key=wrapped,
+            signature=b"",
+            curve=SHARE_CURVE_P384,
+            epoch=SHARE_EPOCH,
+            # Omitted from the message and signed as zero. Both, always.
+            poisoned=0,
+            version=0,
+        ),
+    )
+
+    return cf.TlkShare(
+        service=material.zone_name,
+        key_id=material.uuid,
+        curve=SHARE_CURVE_P384,
+        epoch=SHARE_EPOCH,
+        receiver=peer_id,
+        sender=peer_id,
+        # base64 of the uncompressed point, not the SPKI -- the one place in this stage
+        # where a public key does not travel as DER.
+        receiver_public_encryption_key=base64.b64encode(
+            encryption_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint),
+        ).decode(),
+        wrapped_key=base64.b64encode(wrapped).decode(),
+        signature=base64.b64encode(
+            signing_key.sign(signed, ec.ECDSA(hashes.SHA256())),
+        ).decode(),
+    )
