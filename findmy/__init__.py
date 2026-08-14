@@ -10,6 +10,7 @@ from .accessory import (
 from .errors import (
     InvalidCredentialsError,
     InvalidStateError,
+    MobileMeDelegateError,
     UnauthorizedError,
     UnhandledProtocolError,
 )
@@ -36,6 +37,8 @@ from .reports import (
     SmsSecondFactorMethod,
     SyncSmsSecondFactor,
     SyncTrustedDeviceSecondFactor,
+    Terms,
+    TermsError,
     TrustedDeviceSecondFactorMethod,
 )
 from .scanner import (
@@ -73,6 +76,7 @@ __all__ = (
     "LocationReportEncryptedMapping",
     "LocationReportMapping",
     "LoginState",
+    "MobileMeDelegateError",
     "NearbyOfflineFindingDevice",
     "OfflineFindingDevice",
     "OfflineFindingScanner",
@@ -83,6 +87,8 @@ __all__ = (
     "SmsSecondFactorMethod",
     "SyncSmsSecondFactor",
     "SyncTrustedDeviceSecondFactor",
+    "Terms",
+    "TermsError",
     "TrustedDeviceSecondFactorMethod",
     "UnauthorizedError",
     "UnhandledProtocolError",

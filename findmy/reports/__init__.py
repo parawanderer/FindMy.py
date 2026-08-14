@@ -16,6 +16,7 @@ from .reports import (
     LocationReportMapping,
 )
 from .state import LoginState
+from .terms import Terms, TermsError
 from .twofactor import (
     AsyncSmsSecondFactor,
     AsyncTrustedDeviceSecondFactor,
@@ -48,5 +49,7 @@ __all__ = (
     "SmsSecondFactorMethod",
     "SyncSmsSecondFactor",
     "SyncTrustedDeviceSecondFactor",
+    "Terms",
+    "TermsError",
     "TrustedDeviceSecondFactorMethod",
 )

@@ -26,6 +26,10 @@ The passcode is read with `getpass`, used inside one call, and not stored, logge
 retained. **No key material is written to disk** -- the keys live in memory for this run
 only, which is why this asks each time rather than caching.
 
+Step 3 is really four -- escrow recovery, a bottle, key shares, a keychain item -- and
+from out here they fail alike. **If it fails, run `trace_key_recovery.py`**, which walks
+the same four and reports each separately.
+
 The flow itself is :class:`findmy.icloud.AsyncFindMyReader`; what is here is the reporting
 around it. Logging is turned up deliberately, because the interesting output is usually a
 warning rather than a result: an unmodelled protobuf field, a mismatch between the escrow

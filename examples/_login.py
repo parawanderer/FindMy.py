@@ -5,10 +5,18 @@ from findmy import (
     AsyncAppleAccount,
     LocalAnisetteProvider,
     LoginState,
+    MobileMeDelegateError,
     RemoteAnisetteProvider,
     SmsSecondFactorMethod,
     TrustedDeviceSecondFactorMethod,
 )
+
+
+def _point_at_the_terms_flow() -> None:
+    """Name the one remedy for a delegate failure, without applying it."""
+    print("\nIf that message is about iCloud terms of service, accept_icloud_terms.py")
+    print("will show them and let you accept them yourself. Nothing else gets past it:")
+    print("Apple otherwise takes acceptance only on one of its devices or iCloud.com.")
 
 
 def _login_sync(account: AppleAccount) -> None:
@@ -80,7 +88,13 @@ def get_account_sync(
             else RemoteAnisetteProvider(anisette_url)
         )
         acc = AppleAccount(ani)
-        _login_sync(acc)
+        try:
+            _login_sync(acc)
+        except MobileMeDelegateError:
+            # Pointed at rather than done here: accepting terms is a deliberate act, not
+            # a step signing in takes on your behalf.
+            _point_at_the_terms_flow()
+            raise
 
         acc.to_json(store_path)
 
@@ -102,7 +116,11 @@ async def get_account_async(
             else RemoteAnisetteProvider(anisette_url)
         )
         acc = AsyncAppleAccount(ani)
-        await _login_async(acc)
+        try:
+            await _login_async(acc)
+        except MobileMeDelegateError:
+            _point_at_the_terms_flow()
+            raise
 
         acc.to_json(store_path)
 

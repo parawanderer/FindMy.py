@@ -32,6 +32,7 @@ from findmy.errors import (
     EmptyResponseError,
     InvalidCredentialsError,
     InvalidStateError,
+    MobileMeDelegateError,
     UnauthorizedError,
     UnhandledProtocolError,
 )
@@ -39,6 +40,16 @@ from findmy.errors import (
 from .anisette import AnisetteMapping, get_provider_from_mapping
 from .reports import LocationReport, LocationReportsFetcher
 from .state import LoginState
+from .terms import (
+    ICLOUD_TERMS,
+    TERMS_UI_URL,
+    Terms,
+    TermsError,
+    parse_buddyml,
+    require_fetched,
+    setup_headers,
+    terms_request_body,
+)
 from .twofactor import (
     AsyncSecondFactorMethod,
     AsyncSmsSecondFactor,
@@ -259,6 +270,35 @@ class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapp
         raise NotImplementedError
 
     @abstractmethod
+    def fetch_terms(self, *names: str) -> MaybeCoro[list[Terms]]:
+        """
+        Fetch the iCloud terms of service, so they can be shown to the user.
+
+        Unaccepted terms block the login, and the only ways Apple offers to accept them
+        need one of its devices. This is the first half of accepting them here.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def accept_terms(self, terms: Terms) -> MaybeCoro[None]:
+        """
+        Record the user's agreement to terms obtained from :meth:`fetch_terms`.
+
+        Call only once they have read them and agreed. It takes the fetched object rather
+        than a name so that nothing can accept terms it never showed anyone.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def complete_login(self) -> MaybeCoro[LoginState]:
+        """
+        Repeat the delegate exchange, finishing a login that something interrupted.
+
+        The last step of the terms flow, once acceptance is recorded.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def get_2fa_methods(self) -> MaybeCoro[Sequence[BaseSecondFactorMethod]]:
         """
         Get a list of 2FA methods that can be used as a secondary challenge.
@@ -407,6 +447,7 @@ class AsyncAppleAccount(BaseAppleAccount):
     # auth endpoints
     _ENDPOINT_GSA = "https://gsa.apple.com/grandslam/GsService2"
     _ENDPOINT_LOGIN_MOBILEME = "https://setup.icloud.com/setup/iosbuddy/loginDelegates"
+    _ENDPOINT_TERMS_UI = TERMS_UI_URL
 
     # 2fa auth endpoints
     _ENDPOINT_2FA_METHODS = "https://gsa.apple.com/auth"
@@ -772,6 +813,149 @@ class AsyncAppleAccount(BaseAppleAccount):
 
         return pet
 
+    async def _fresh_pet(self) -> str:
+        """
+        Renew the PET if this account can, and return one fit to send.
+
+        **The terms flow puts a human reading a contract in the middle of a five-minute
+        credential.** Sending whatever token the failed delegate request used means the
+        agreement is posted with an expired PET and rejected -- after the user has read
+        the terms and agreed to them, which is the worst moment to demand a re-login. So
+        each terms request authenticates again immediately beforehand.
+
+        Falls back to the token already held rather than raising, for a session restored
+        without a password or one that is asked for a second factor. That leaves the
+        request to fail on its own terms, which says more than a failure here would.
+        """
+        held = self._login_state_data.get("idms_pet", "")
+        if not self._password:
+            logger.debug("No stored password, so the PET already held is the one sent")
+            return held
+
+        previous = (self._login_state, self._login_state_data, self._account_info)
+        try:
+            state = await self._gsa_authenticate()
+        except (InvalidCredentialsError, UnauthorizedError, UnhandledProtocolError):
+            logger.warning("Could not renew the PET; sending the one held", exc_info=True)
+            state = None
+
+        if state != LoginState.AUTHENTICATED:
+            if state is not None:
+                logger.warning(
+                    "Re-authentication ended at %s rather than AUTHENTICATED, so the PET"
+                    " was not renewed and the request may be rejected as expired",
+                    state,
+                )
+            self._login_state, self._login_state_data, self._account_info = previous
+            return held
+
+        return self._login_state_data.get("idms_pet", held)
+
+    @_require_login_state(LoginState.AUTHENTICATED)
+    async def fetch_terms(self, *names: str) -> list[Terms]:
+        """
+        Fetch the iCloud terms of service, so they can be shown to the user.
+
+        An account with terms it has not accepted fails the delegate exchange, and the
+        only places Apple offers to accept are one of its own devices or iCloud.com --
+        a dead end for someone here because they have neither. So this fetches the text,
+        and :meth:`accept_terms` records agreement to what this returned.
+
+        **This is where the terms flow starts, and it is deliberately not the whole of
+        it.** Show what comes back, let the user read it, and call :meth:`accept_terms`
+        only if they agree. Nothing here accepts anything.
+
+        Callable while the account is `AUTHENTICATED` -- the state a failed delegate
+        request leaves it in.
+
+        :param names: Which terms documents to ask for. Defaults to iCloud's.
+        :returns: One :class:`~findmy.reports.terms.Terms` per page returned.
+        :raises TermsError: If the response cannot be read or carries no terms.
+        """
+        wanted = names or (ICLOUD_TERMS,)
+        logger.info("Fetching terms of service: %s", ", ".join(wanted))
+
+        headers = await self.get_anisette_headers()
+        headers.update(
+            setup_headers(self.client_info, self._username or "", await self._fresh_pet()),
+        )
+        headers.update(
+            {
+                "Accept": "application/x-buddyml",
+                "Content-Type": "text/plist",
+                "X-Apple-I-Appearance": "1",
+            },
+        )
+
+        resp = await self._http.post(
+            self._ENDPOINT_TERMS_UI,
+            headers=headers,
+            data=terms_request_body(wanted),
+        )
+        if not resp.ok:
+            msg = f"Fetching the terms of service failed with status {resp.status_code}"
+            raise TermsError(msg)
+
+        return parse_buddyml(resp.text())
+
+    @_require_login_state(LoginState.AUTHENTICATED)
+    async def accept_terms(self, terms: Terms) -> None:
+        """
+        Record the user's agreement to terms obtained from :meth:`fetch_terms`.
+
+        **Call this only after the user has read them and said yes.** Taking the fetched
+        object rather than a name is the point: a library cannot tell whether a human
+        read anything, but it can refuse to agree to a contract it never obtained, and
+        that is the strongest guarantee available here.
+
+        Afterwards the delegate request should succeed, which :meth:`complete_login`
+        repeats.
+
+        .. note::
+            **The credential is renewed immediately before the request.** A PET lasts
+            about five minutes, and reading a contract takes longer than that, so a flow
+            that showed the terms and then sent whatever token it started with would fail
+            for everyone who actually read them -- and fail *after* they agreed, which is
+            the worst place to put a re-login. See :meth:`_fresh_pet`.
+
+        :param terms: Exactly what :meth:`fetch_terms` returned for the document being
+            agreed to.
+        :raises TermsError: If the terms did not come from a fetch, or if Apple did not
+            accept the agreement. **A non-success is raised rather than swallowed**:
+            reporting acceptance that did not happen fails confusingly a stage later.
+        """
+        require_fetched(terms)
+
+        logger.info("Accepting terms of service: %s", terms.page_id)
+
+        headers = await self.get_anisette_headers()
+        headers.update(
+            setup_headers(self.client_info, self._username or "", await self._fresh_pet()),
+        )
+        headers["Content-Type"] = "application/xml"
+
+        # No body: the URL is the whole of the request.
+        resp = await self._http.post(terms.agree_url, headers=headers, data=b"")
+        if not resp.ok:
+            msg = (
+                f"Accepting the {terms.page_id} terms failed with status"
+                f" {resp.status_code}, so they have not been accepted."
+            )
+            raise TermsError(msg)
+
+        logger.info("Terms of service accepted: %s", terms.page_id)
+
+    @_require_login_state(LoginState.AUTHENTICATED)
+    async def complete_login(self) -> LoginState:
+        """
+        Repeat the delegate exchange, finishing a login that something interrupted.
+
+        The last step of the terms flow: authentication succeeded, the delegate request
+        did not, and once the reason is dealt with the exchange is simply repeated. It is
+        the same step :meth:`login` runs on its own when nothing goes wrong.
+        """
+        return await self._login_mobileme()
+
     @_require_login_state(LoginState.LOGGED_IN)
     async def fetch_raw_reports(  # noqa: C901
         self,
@@ -1075,17 +1259,41 @@ class AsyncAppleAccount(BaseAppleAccount):
         data = resp.plist()
 
         mobileme_data = data.get("delegates", {}).get("com.apple.mobileme", {})
-        status = mobileme_data.get("status") or data.get("status")
-        if status != 0:
-            status_message = mobileme_data.get("status-message") or data.get("status-message")
-            msg = f"com.apple.mobileme login failed with status {status}: {status_message}"
-            raise UnhandledProtocolError(msg)
+
+        # Checked in the order Stage 2 §4 gives, which is not the order that looks
+        # natural: `localizedError` is a separate channel from the two `status` fields,
+        # and it is where a response explains itself. Reading only `status` -- which is
+        # the obvious implementation, since a success is defined by it -- turns a
+        # response that named the problem into "failed with status 1".
+        localized_error = data.get("localizedError")
+        status = data.get("status")
+        failed = localized_error is not None or (status is not None and status != 0)
+
+        # A missing `service-data` is that delegate having failed, not a malformed
+        # response, so its own status is the explanation rather than a KeyError here.
+        service_data = mobileme_data.get("service-data")
+        if failed or service_data is None:
+            error = MobileMeDelegateError(
+                localized_error=localized_error,
+                description=data.get("description"),
+                status=status if failed else mobileme_data.get("status"),
+                status_message=mobileme_data.get("status-message"),
+            )
+            if localized_error is not None:
+                # Logged as well as raised: which value means "terms pending" is not
+                # established, so the first account to hit one is how it becomes known.
+                logger.warning(
+                    "The delegate request reported localizedError=%r, description=%r",
+                    localized_error,
+                    data.get("description"),
+                )
+            raise error
 
         return self._set_login_state(
             LoginState.LOGGED_IN,
             {
                 "dsid": data["dsid"],
-                "mobileme_data": mobileme_data["service-data"],
+                "mobileme_data": service_data,
                 # Carried forward rather than discarded: it is a different identifier from
                 # `dsid`, some services want it, and re-authenticating to recover it is a
                 # round trip for a value already in hand.
@@ -1281,6 +1489,24 @@ class AppleAccount(BaseAppleAccount):
     def login(self, username: str, password: str) -> LoginState:
         """See :meth:`AsyncAppleAccount.login`."""
         coro = self._asyncacc.login(username, password)
+        return self._evt_loop.run_until_complete(coro)
+
+    @override
+    def fetch_terms(self, *names: str) -> list[Terms]:
+        """See :meth:`AsyncAppleAccount.fetch_terms`."""
+        coro = self._asyncacc.fetch_terms(*names)
+        return self._evt_loop.run_until_complete(coro)
+
+    @override
+    def accept_terms(self, terms: Terms) -> None:
+        """See :meth:`AsyncAppleAccount.accept_terms`."""
+        coro = self._asyncacc.accept_terms(terms)
+        return self._evt_loop.run_until_complete(coro)
+
+    @override
+    def complete_login(self) -> LoginState:
+        """See :meth:`AsyncAppleAccount.complete_login`."""
+        coro = self._asyncacc.complete_login()
         return self._evt_loop.run_until_complete(coro)
 
     @override

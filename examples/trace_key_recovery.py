@@ -1,11 +1,24 @@
 """
-Recover a peer's identity from an escrow record, and unwrap the keychain keys it holds.
+Walk the key recovery one step at a time, reporting each. **A diagnostic, not the way in.**
 
-This exercises Stage 3 of the protocol specification end to end: the SRP exchange in which
-a device passcode is the password, the bottle that yields, and the key shares that bottle's
-identity is entitled to receive.
+To read a real account's accessories, run `fetch_beacons_from_icloud.py`. It does
+everything this does, inside one `unlock()` call, and then goes on to decrypt and locate.
+Run *this* when that call failed, because the four steps behind it fail in ways that look
+alike from outside and are fixed in completely different places:
 
-    cd examples && python3 recover_escrow_material.py
+    cd examples && python3 trace_key_recovery.py
+
+  1. **Escrow recovery** -- an SRP exchange in which a device's passcode is the password.
+     Yields a peer identity. Reported as the record's fields and the HKDF salt.
+  2. **The bottle** -- the sponsor's keys, checked against the ones derived from the
+     passcode. The encoding they matched under is printed, and *that line is the proof the
+     passcode was right*. Everything after it failing means the passcode was not the
+     problem.
+  3. **Key shares** -- what that identity is entitled to receive, one per keychain view.
+     Each is printed with its sender and either a size or the reason it did not unwrap. No
+     shares at all is a different fault from shares that would not open.
+  4. **The service key item** -- the view key is symmetric, and Stage 5 needs an EC private
+     key. The view key decrypts a keychain item whose contents are that EC key.
 
 **It does not write to your account.** Every step here reads. A share is wrapped to the
 *receiving* peer's encryption key, and recovery yields exactly that key -- so the keys
@@ -20,8 +33,9 @@ model and serial so you can tell which passcode to reach for.
 The passcode is read with `getpass`, so it is not echoed and does not reach your shell
 history. It is used twice inside one call and is not stored, logged or retained.
 
-A wrong passcode and a misread exchange fail identically by design, so if it fails, try
-another device's record before concluding the implementation is at fault.
+A wrong passcode and a misread exchange fail identically at step 1 by design, so if it
+fails there, try another device's record before concluding the implementation is at fault.
+Past step 1 that ambiguity is gone, which is why the steps are reported separately at all.
 """
 
 from __future__ import annotations
