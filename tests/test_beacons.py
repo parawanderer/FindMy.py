@@ -266,11 +266,37 @@ def test_records_are_joined_by_identifier_not_by_position() -> None:
     assert accessories["BEACON-2"].name == "Second"
 
 
-def test_a_master_beacon_with_no_naming_record_is_not_an_accessory() -> None:
-    # [observed] The zone holds master beacons for things that are not tags: an account
-    # with no iPad produced an `iPad13,18` entry, unnamed and serial-less, dated the day
-    # of the export. Resolving to a naming record is what tells a tag from one of those.
-    assert accessories_from_records([beacon_record()]) == []
+def test_a_beacon_with_no_private_key_is_not_an_accessory() -> None:
+    # The test is privateKey, and only privateKey. Without one the accessory cannot be
+    # located, so exporting it produces an entry that can never do anything -- whatever
+    # kind of thing the record turns out to be. It is also the rule the macOS exporter
+    # has always used, so a bundle from this route holds what a bundle from a Mac holds.
+    device = beacon_record("A-DEVICE")
+    del device.values["privateKey"]
+
+    assert accessories_from_records([device, naming_record("A-DEVICE")]) == []
+
+
+def test_a_locatable_beacon_with_no_naming_record_is_still_exported() -> None:
+    # The rule this replaced. A missing naming record is a reason to look at what came
+    # back, not the test itself: an accessory that is genuinely nameless is an accessory.
+    (accessory,) = accessories_from_records([beacon_record("NAMELESS")])
+
+    assert accessory.identifier == "NAMELESS"
+
+
+def test_a_nameless_beacon_is_reported_even_though_it_is_kept(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # It is how one account's stale device entry got noticed, so it is worth saying even
+    # now that it decides nothing.
+    import logging  # noqa: PLC0415
+
+    with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
+        accessories_from_records([beacon_record("NAMELESS")])
+
+    assert "NAMELESS" in caplog.text
+    assert "no naming record" in caplog.text
 
 
 def test_discarded_beacons_are_named_rather_than_dropped_quietly(
@@ -280,24 +306,28 @@ def test_discarded_beacons_are_named_rather_than_dropped_quietly(
     # identical from the outside, so the difference has to be said.
     import logging  # noqa: PLC0415
 
+    device = beacon_record("NOT-A-TAG")
+    del device.values["privateKey"]
+
     with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
-        accessories_from_records([beacon_record("NOT-A-TAG")])
+        accessories_from_records([device])
 
     assert "NOT-A-TAG" in caplog.text
-    assert "no naming record" in caplog.text
+    assert "no private key" in caplog.text
 
 
 def test_a_discarded_beacon_reports_which_secondary_secret_it_carries(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # §2.3's discriminator: an accessory carries sharedSecret2, an iPhone, iPad or Mac
-    # carries secureLocationsSharedSecret. If the unnamed ones all hold the latter they
-    # are the owner's own devices, and discarding them is right rather than convenient.
-    # Nothing else records it -- the discard happens before any secret is read.
+    # carries secureLocationsSharedSecret. It decides nothing -- privateKey does -- but
+    # nothing else records it, because the discard happens before any secret is read, and
+    # a client that drops these silently can never answer the question it raises.
     import logging  # noqa: PLC0415
 
     device = beacon_record("A-DEVICE", secondary_field="secureLocationsSharedSecret")
     device.values["model"] = "iPad13,18"
+    del device.values["privateKey"]
 
     with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
         accessories_from_records([device])

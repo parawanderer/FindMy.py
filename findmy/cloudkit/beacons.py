@@ -439,23 +439,21 @@ def build_plaintext(value_type: int, value: object) -> bytes:
     raise BeaconExportError(msg)
 
 
-def _describe_unnamed(beacon: DecryptedRecord) -> str:
+def _describe_beacon(beacon: DecryptedRecord) -> str:
     """
-    Describe a master beacon that resolved to no naming record, with the evidence why.
+    Describe a master beacon that is being discarded, with the evidence for what it is.
 
-    **The model very nearly answers it on its own.** An accessory's `model` is empty --
-    the committed macOS export's AirTag carries `''` and identifies itself through
-    `productId` and `vendorId` -- while a real zone's unnamed record carried `iPad13,18`,
-    the `<family><major>,<minor>` form Apple devices use for themselves. So an unnamed
-    record is most likely one of the owner's own findable devices, which has no naming
-    record because its name comes from the device.
+    **The model very nearly says on its own.** An accessory's `model` is empty -- the
+    committed macOS export's AirTag carries `''` and identifies itself through `productId`
+    and `vendorId` -- while a real zone's unlocatable record carried `iPad13,18`, the
+    `<family><major>,<minor>` form Apple devices use for themselves.
 
     **The secondary secret confirms it**: an accessory carries `sharedSecret2`, an iPhone,
     iPad or Mac carries `secureLocationsSharedSecret` instead. Both are reported, because
     the discard happens before anything else reads either, so this is the only place they
     are recorded together.
 
-    Logged rather than acted on. Nothing branches on it until it is established.
+    Logged rather than acted on. What decides the discard is :func:`can_be_located`.
     """
     values = beacon.values
     carried = [
@@ -470,22 +468,37 @@ def _describe_unnamed(beacon: DecryptedRecord) -> str:
     )
 
 
+def can_be_located(beacon: DecryptedRecord) -> bool:
+    """
+    Whether a master beacon is something the Find My network could actually find.
+
+    **The test is `privateKey`, and it is the only one.** The zone holds master beacons
+    for more than tags -- the owner's own iPhone, iPad and Mac are findable too -- and an
+    earlier version of this used "has a naming record" to tell them apart. That was the
+    wrong question twice over: it needs a taxonomy nobody has, and it is not what makes a
+    record useful.
+
+    Without a private key an accessory cannot be located, so exporting one produces an
+    entry that can never do anything. Whether the record is an iPad, a stale duplicate or
+    a kind nobody has seen, the question has the same answer and the same consequence.
+
+    It is also the rule the macOS exporter has always used -- it skips an `OwnedBeacons`
+    record with no `privateKey` and calls it a *device* -- so a bundle from this route
+    holds what a bundle from a Mac holds.
+    """
+    return isinstance(beacon.values.get("privateKey"), bytes)
+
+
 def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyAccessory]:
     """
     Join decrypted records into accessories.
 
     Joins on `associatedBeacon` and `beaconIdentifier`, via :func:`group_records`.
 
-    **A master beacon with no naming record is not an accessory**, and is discarded rather
-    than exported unnamed. The zone holds master beacons for things that are not tags: one
-    account's records included an `iPad13,18` entry, unnamed and serial-less, dated the
-    day of the export. Resolving to a naming record is what distinguishes a tag from one
-    of those, and OpenTagViewer discards them for the same reason.
-
-    **Why they have no naming record is not yet established.** The likely answer is that
-    they are the owner's own findable devices, which take their name from the device --
-    see :func:`_describe_unnamed` for the discriminator that would settle it, which is
-    logged on every discard.
+    **What is discarded is a beacon that cannot be located**, which means one with no
+    private key -- see :func:`can_be_located`. A missing naming record is a *reason to
+    look*, not the test: it is how one account's stale iPad entry was noticed, but an
+    accessory that is genuinely nameless is still an accessory and is still exported.
 
     Key alignment is genuinely optional and its absence is tolerated: exports before
     format `0.0.2` carry none, and an accessory without one still works by probing.
@@ -498,19 +511,31 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
     naming = [r for r in records if r.record_type == RecordType.BEACON_NAMING]
     alignment = [r for r in records if r.record_type == RecordType.KEY_ALIGNMENT]
 
-    unnamed = [group.beacon for group in groups if group.naming is None]
-    if unnamed:
+    locatable = [group for group in groups if can_be_located(group.beacon)]
+
+    unlocatable = [group.beacon for group in groups if not can_be_located(group.beacon)]
+    if unlocatable:
         # Counted and named, never dropped quietly: "fewer accessories than expected" and
         # "some of those records were never accessories" look identical from the outside.
         #
-        # The model and the secondary secret come too, because they are the evidence for
-        # *why* these have no naming record -- see :func:`_describe_unnamed`. Discarding
-        # happens before anything reads a secret, so nothing else records which one they
-        # carry, and it is the one field that would settle it.
+        # The model and the secondary secret come too. They are the evidence for what
+        # these records are, the discard happens before anything else reads a secret, and
+        # a client that drops them silently can never answer the question it raises.
         logger.info(
-            "Discarding %d master beacon(s) with no naming record, so not accessories: %s",
-            len(unnamed),
-            ", ".join(sorted(_describe_unnamed(b) for b in unnamed)),
+            "Discarding %d master beacon(s) with no private key, so not locatable: %s",
+            len(unlocatable),
+            ", ".join(sorted(_describe_beacon(b) for b in unlocatable)),
+        )
+
+    # Not a discard, and not an error: an accessory can genuinely have no name. It is
+    # worth saying because it is how a stale device entry was noticed once, so it is a
+    # reason to look at what came back rather than a reason to drop it.
+    nameless = [group.beacon.name for group in locatable if group.naming is None]
+    if nameless:
+        logger.info(
+            "%d locatable beacon(s) have no naming record and will be exported unnamed: %s",
+            len(nameless),
+            ", ".join(sorted(nameless)),
         )
 
     # An accessory that gets no alignment record searches its whole history when located
@@ -518,21 +543,20 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
     # and until now that happened with nothing said. A record that is *present but
     # unreadable* warns; one that simply did not join was silent, which is the worse of
     # the two because it looks like an accessory that never had one.
-    named = [group for group in groups if group.naming is not None]
-    unaligned = [group.beacon.name for group in named if group.alignment is None]
+    unaligned = [group.beacon.name for group in locatable if group.alignment is None]
     if unaligned:
         logger.warning(
             "%d of %d accessor(ies) have no key-alignment record and will search their"
             " whole history when located: %s. %d alignment record(s) were fetched, so if"
             " that number is not zero these did not join.",
             len(unaligned),
-            len(named),
+            len(locatable),
             ", ".join(sorted(unaligned)),
             len(alignment),
         )
 
     accessories: list[FindMyAccessory] = []
-    for group in named:
+    for group in locatable:
         try:
             accessories.append(
                 accessory_from_record(
