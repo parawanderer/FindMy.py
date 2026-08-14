@@ -248,8 +248,6 @@ async def main() -> int:  # noqa: C901, PLR0915 -- a probe; linear reads better
             print(f"    serial:     {accessory.serial_number}")
             print(f"    paired:     {accessory.paired_at:%Y-%m-%d}")
 
-        print("\nThe INFO line above naming the key wrap and KDF is the answer to")
-        print("GAPS.md sections B1 and B2. Please write it down.")
     finally:
         await store.close()
         await account.close()

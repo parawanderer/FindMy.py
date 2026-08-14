@@ -884,3 +884,49 @@ def test_compressed_public_keys_are_what_the_keyset_is_matched_on() -> None:
 
     assert len(compressed) == 33
     assert compressed[0] in (0x02, 0x03)
+
+
+def test_a_key_is_matched_however_its_public_half_is_written() -> None:
+    # "Compressed" is not X9.62 here: [observed] the service key item's acct is 32 bytes
+    # with no sign byte. Comparing 33-byte X9.62 bytes against that never matches, and the
+    # failure claims the record is not encrypted for this client, which is far stronger and
+    # wrong.
+    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+    from cryptography.hazmat.primitives.serialization import (  # noqa: PLC0415
+        Encoding,
+        PublicFormat,
+    )
+
+    from findmy.cloudkit.pcs import public_key_forms  # noqa: PLC0415
+
+    key = ec.generate_private_key(ec.SECP256R1()).public_key()
+    uncompressed = key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    forms = public_key_forms(key)
+
+    assert key.public_bytes(Encoding.X962, PublicFormat.CompressedPoint) in forms
+    assert uncompressed in forms
+    assert uncompressed[1:33] in forms  # the bare x coordinate, as acct holds it
+    assert uncompressed[1:] in forms
+
+
+def test_the_bare_x_form_is_the_length_a_real_acct_is() -> None:
+    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+
+    from findmy.cloudkit.pcs import public_key_forms  # noqa: PLC0415
+
+    key = ec.generate_private_key(ec.SECP256R1()).public_key()
+
+    assert 32 in {len(form) for form in public_key_forms(key)}
+
+
+def test_another_key_still_does_not_match_any_form() -> None:
+    # Widening the forms must not widen what matches: every form is bytes the key itself
+    # produces, so a different key cannot collide with one.
+    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+
+    from findmy.cloudkit.pcs import public_key_forms  # noqa: PLC0415
+
+    ours = public_key_forms(ec.generate_private_key(ec.SECP256R1()).public_key())
+    theirs = public_key_forms(ec.generate_private_key(ec.SECP256R1()).public_key())
+
+    assert not (ours & theirs)

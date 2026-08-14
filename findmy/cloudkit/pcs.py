@@ -522,6 +522,32 @@ def compress_public_key(public_key: ec.EllipticCurvePublicKey) -> bytes:
     return public_key.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
 
 
+def public_key_forms(public_key: ec.EllipticCurvePublicKey) -> set[bytes]:
+    """
+    Every way this protocol writes a public key, for matching one against another.
+
+    **"Compressed" does not mean X9.62 here.** The service key item's `acct` is
+    **[observed]** 32 bytes beginning `0xb5` -- a bare x coordinate, with neither the
+    `0x02`/`0x03` sign byte of a compressed point nor the `0x04` of an uncompressed one --
+    and Stage 3 §6.8.1's key blobs are written the same way. A reader comparing 33-byte
+    X9.62 bytes against those never matches, and the failure presents as "this record is
+    not encrypted for this client", which is a different and much more discouraging claim.
+
+    Matching on a bare x is slightly weaker than matching on a full point, since x alone
+    does not fix the sign of y. That ambiguity is the protocol's own -- it is what storing
+    x alone means -- and it is not introduced here.
+    """
+    uncompressed = public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    coordinate = (public_key.curve.key_size + 7) // 8
+
+    return {
+        public_key.public_bytes(Encoding.X962, PublicFormat.CompressedPoint),
+        uncompressed,
+        uncompressed[1 : 1 + coordinate],  # the bare x coordinate
+        uncompressed[1:],  # x and y, without the 0x04 marker
+    }
+
+
 # --------------------------------------------------------------------------------------
 # Unwrapping (§4)
 # --------------------------------------------------------------------------------------
@@ -883,17 +909,29 @@ def _find_our_key(
     private_keys: Sequence[ec.EllipticCurvePrivateKey],
 ) -> tuple[ShareKey, ec.EllipticCurvePrivateKey]:
     """Find the keyset entry whose public key is one we hold the private half of."""
-    by_public = {compress_public_key(key.public_key()): key for key in private_keys}
+    by_public: dict[bytes, ec.EllipticCurvePrivateKey] = {}
+    for key in private_keys:
+        for form in public_key_forms(key.public_key()):
+            by_public[form] = key
 
     for share_key in protection.keys:
         private_key = by_public.get(share_key.public_key)
         if private_key is not None:
             return share_key, private_key
 
+    # Naming the sizes distinguishes the two reasons this fails, which lead in opposite
+    # directions: an entry the same size as one of our forms means the record really is
+    # for someone else, while sizes that appear nowhere in ours means the encoding is
+    # wrong and no key would ever have matched.
+    theirs = sorted({len(k.public_key) for k in protection.keys})
+    ours = sorted(
+        {len(form) for key in private_keys for form in public_key_forms(key.public_key())},
+    )
+
     msg = (
         f"None of the {len(private_keys)} key(s) held locally appears among the"
-        f" {len(protection.keys)} entries protecting this record. This record is not"
-        " encrypted for this client."
+        f" {len(protection.keys)} entries protecting this record. Their public keys are"
+        f" {theirs} bytes; the forms compared against are {ours}."
     )
     raise MissingKeyError(msg)
 
