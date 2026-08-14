@@ -227,3 +227,109 @@ def test_a_signature_does_not_carry_across_blob_types() -> None:
 
     assert as_voucher.signature != as_stable.signature
     assert as_voucher.verify(key.public_key(), b"TPPB.PeerStableInfo") is False
+
+
+# --------------------------------------------------------------------------------------
+# The identity a join sends (§6.8.2)
+# --------------------------------------------------------------------------------------
+
+
+def a_key() -> ec.EllipticCurvePrivateKey:
+    return ec.generate_private_key(ec.SECP384R1())
+
+
+def test_a_joining_peers_stable_clock_is_the_circles_highest_plus_one() -> None:
+    from findmy.keychain.join import next_stable_clock  # noqa: PLC0415
+    from findmy.keychain.peers import Peer, PeerDirectory  # noqa: PLC0415
+
+    def peer(name: str, clock: int) -> Peer:
+        return Peer(
+            hash=name,
+            signing_key=b"",
+            encryption_key=b"",
+            machine_id="",
+            model_id="",
+            stable_clock=clock,
+        )
+
+    directory = PeerDirectory(peers={"a": peer("a", 3), "b": peer("b", 7)})
+
+    assert next_stable_clock(directory) == 8
+
+
+def test_a_first_peer_sends_clock_one_not_zero() -> None:
+    # Zero is the DYNAMIC info's value. Both fields are called clock and they differ.
+    from findmy.keychain.join import next_stable_clock  # noqa: PLC0415
+    from findmy.keychain.peers import PeerDirectory  # noqa: PLC0415
+
+    assert next_stable_clock(PeerDirectory()) == 1
+
+
+def test_a_joining_peers_dynamic_info_asserts_nothing() -> None:
+    # includeds is empty, which is the opposite of what the field name suggests: trust is
+    # asserted afterwards by updateTrust, once the peer is in and has synced.
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.join import make_dynamic_info  # noqa: PLC0415
+
+    blob = make_dynamic_info(a_key())
+
+    info = cf.PeerDynamicInfo()
+    info.ParseFromString(blob.info)
+    assert info.clock == 0
+    assert list(info.includeds) == []
+    assert list(info.excludeds) == []
+
+
+def test_the_stable_info_carries_both_policies_verbatim() -> None:
+    # Digests of Apple's own policy documents, not anything to compute. A wrong value is
+    # not detectable locally, which is why they are constants rather than defaults.
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.join import make_stable_info  # noqa: PLC0415
+
+    blob = make_stable_info(a_key(), clock=4, os_version="18.1", serial_number="X")
+
+    info = cf.PeerStableInfo()
+    info.ParseFromString(blob.info)
+    assert info.frozen_policy_version == 5
+    assert info.frozen_policy_hash == b"SHA256:O/ECQlWhvNlLmlDNh2+nal/yekUC87bXpV3k+6kznSo="
+    assert info.flexible_policy_version == 20
+    assert info.flexible_policy_hash == b"SHA256:OIzjC3WyLGrM8GAd/EyIfVzTJdYmcGoKPFdQeWeRZTY="
+    assert info.user_controllable_view_status == 1
+    assert info.is_inherited_account is False
+
+
+def test_each_blob_is_signed_under_its_own_type_string() -> None:
+    # The prefix is what stops a blob of one kind being presented as another, so a blob
+    # must not verify under a different kind's prefix.
+    from findmy.keychain.join import (  # noqa: PLC0415
+        TYPE_DYNAMIC_INFO,
+        TYPE_STABLE_INFO,
+        make_dynamic_info,
+    )
+
+    key = a_key()
+    blob = make_dynamic_info(key)
+
+    assert blob.verify(key.public_key())
+    assert not blob.verify(key.public_key(), TYPE_STABLE_INFO)
+    assert blob.verify(key.public_key(), TYPE_DYNAMIC_INFO)
+
+
+def test_a_peers_identifier_is_the_digest_of_the_permanent_info_it_signed() -> None:
+    # The end-to-end shape of §6.8.2: the bytes that get signed are the bytes that get
+    # digested, and the identifier is what a voucher's beneficiary must equal.
+    from findmy.keychain.join import make_permanent_info  # noqa: PLC0415
+    from findmy.keychain.peers import peer_identifier  # noqa: PLC0415
+
+    key = a_key()
+    blob = make_permanent_info(
+        key,
+        signing_public=b"\x04" + bytes(96),
+        encryption_public=b"\x04" + bytes(96),
+        machine_id="MACHINE",
+        model_id="iPhone14,2",
+        creation_time=1700000000,
+    )
+
+    assert blob.verify(key.public_key())
+    assert peer_identifier(blob.info, blob.signature).startswith("SHA256:")

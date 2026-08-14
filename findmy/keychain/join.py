@@ -33,6 +33,8 @@ from findmy.errors import UnhandledProtocolError
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from .peers import PeerDirectory
+
 # The voucher reason this project uses. The enumeration is not specified; zero is the
 # protobuf default and is what an unset reason would serialise as.
 VOUCHER_REASON_DEFAULT = 0
@@ -120,6 +122,127 @@ class SignedBlob:
         except Exception:  # noqa: BLE001 -- cryptography raises InvalidSignature and more
             return False
         return True
+
+
+# The two policy hashes are constants -- digests of Apple's own trust policy documents. A
+# client asserts which policy version it speaks rather than deriving anything, so these are
+# sent verbatim. **A wrong value here is not detectable locally**, which is why they are
+# named constants rather than parameters with defaults.
+POLICY_FROZEN_VERSION = 5
+POLICY_FROZEN_HASH = b"SHA256:O/ECQlWhvNlLmlDNh2+nal/yekUC87bXpV3k+6kznSo="
+POLICY_FLEXIBLE_VERSION = 20
+POLICY_FLEXIBLE_HASH = b"SHA256:OIzjC3WyLGrM8GAd/EyIfVzTJdYmcGoKPFdQeWeRZTY="
+
+USER_CONTROLLABLE_VIEWS_ENABLED = 1
+"""What a real client sends for `userControllableViewStatus`."""
+
+
+def next_stable_clock(directory: PeerDirectory) -> int:
+    """
+    Work out the `clock` a joining peer's stable info should carry.
+
+    **The highest clock in the circle plus one, so a first peer sends 1 rather than 0.**
+    Zero is the dynamic info's value, not this one, and the two being different is easy to
+    miss when both fields are called `clock`.
+
+    :param directory: The circle, from :func:`~findmy.keychain.peers.fetch_peer_directory`.
+    """
+    return max((peer.stable_clock for peer in directory.peers.values()), default=0) + 1
+
+
+def make_permanent_info(  # noqa: PLR0913 -- every field of the message, and it is six
+    signing_key: ec.EllipticCurvePrivateKey,
+    *,
+    signing_public: bytes,
+    encryption_public: bytes,
+    machine_id: str,
+    model_id: str,
+    epoch: int = 0,
+    creation_time: int,
+) -> SignedBlob:
+    """
+    Build and sign the permanent info, which is what a peer's identifier digests.
+
+    **Nothing in it may change afterwards.** The peer's identifier is a digest over these
+    exact bytes and their signature, so a peer that re-issues its permanent info is a
+    different peer -- and every voucher, share and escrow label naming the old one stops
+    resolving.
+
+    :param signing_key: The new identity's own signing key. A peer signs its own permanent
+        info; the sponsor's key signs only the voucher.
+    :param signing_public: The new identity's public signing key, as sent.
+    :param encryption_public: Its public encryption key.
+    :param machine_id: This installation's machine identifier.
+    :param model_id: The model this client claims to be.
+    :param creation_time: When this identity was made. Passed in rather than read from the
+        clock so that the bytes are reproducible, which matters for a value a digest
+        covers.
+    """
+    info = cf.PeerPermanentInfo(
+        epoch=epoch,
+        signing_key=signing_public,
+        encryption_key=encryption_public,
+        machine_id=machine_id,
+        model_id=model_id,
+        creation_time=creation_time,
+    )
+    return SignedBlob.sign(info.SerializeToString(), signing_key, TYPE_PERMANENT_INFO)
+
+
+def make_stable_info(
+    signing_key: ec.EllipticCurvePrivateKey,
+    *,
+    clock: int,
+    os_version: str,
+    serial_number: str,
+    device_name: str = "",
+) -> SignedBlob:
+    """
+    Build and sign the stable info: what this peer asserts about itself.
+
+    **An incomplete one is admitted and then behaves oddly rather than refused**, which is
+    the worse failure and lands long after the join. So the policy fields are always sent,
+    at the constants above, and everything the specification does not list is omitted
+    rather than defaulted.
+
+    :param clock: From :func:`next_stable_clock`. **Not zero** -- see there.
+    :param os_version: This client's OS string.
+    :param serial_number: The serial this client declares, as Stage 1 §2.2 uses.
+    :param device_name: How this peer appears to the user. May be empty, and naming it
+        after a person is a choice the README's labelling rules cover.
+    """
+    info = cf.PeerStableInfo(
+        clock=clock,
+        frozen_policy_version=POLICY_FROZEN_VERSION,
+        frozen_policy_hash=POLICY_FROZEN_HASH,
+        flexible_policy_version=POLICY_FLEXIBLE_VERSION,
+        flexible_policy_hash=POLICY_FLEXIBLE_HASH,
+        os_version=os_version,
+        device_name=device_name,
+        serial_number=serial_number,
+        user_controllable_view_status=USER_CONTROLLABLE_VIEWS_ENABLED,
+        is_inherited_account=False,
+    )
+    return SignedBlob.sign(info.SerializeToString(), signing_key, TYPE_STABLE_INFO)
+
+
+def make_dynamic_info(signing_key: ec.EllipticCurvePrivateKey) -> SignedBlob:
+    """
+    Build and sign the dynamic info a *joining* peer sends: `clock: 0` and nothing else.
+
+    **`includeds` is empty**, which is the opposite of what the field's name suggests.
+    Trust is asserted afterwards by a separate `updateTrust`, once the peer is in the
+    circle and has synced it -- a peer trying to enter has nothing to assert about the
+    circle yet, and enumerating the one it wants to join is not what the message means.
+
+    The same reset applies later: a client that finds itself *not* in the circle returns
+    here rather than resending whatever it last asserted.
+    """
+    return SignedBlob.sign(
+        cf.PeerDynamicInfo(clock=0).SerializeToString(),
+        signing_key,
+        TYPE_DYNAMIC_INFO,
+    )
 
 
 def make_voucher(

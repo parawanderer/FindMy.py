@@ -141,6 +141,15 @@ class Peer:
     permanent_signature: bytes = b""
     """The signature over the above. The other half of what the identifier digests."""
 
+    stable_clock: int = 0
+    """
+    This peer's `PeerStableInfo.clock`.
+
+    Kept for one reason: a joining peer's own clock is the highest in the circle plus one,
+    so building an identity means reading everyone else's -- see
+    :func:`~findmy.keychain.join.next_stable_clock`.
+    """
+
     def signing_public_key(self) -> ec.EllipticCurvePublicKey | None:
         """Load the signing key, or None if it is not in a shape this understands."""
         return load_public_key(self.signing_key)
@@ -209,7 +218,27 @@ def _peer_from_proto(peer: cf.CuttlefishPeer) -> Peer | None:
         # re-encoding of `info` above would produce a different peer id for the same peer.
         permanent_info=peer.permanent_info.info,
         permanent_signature=peer.permanent_info.signature,
+        stable_clock=_stable_clock(peer),
     )
+
+
+def _stable_clock(peer: cf.CuttlefishPeer) -> int:
+    """
+    Read a peer's stable clock, treating an unreadable one as zero.
+
+    Zero is the safe direction: a joining peer takes the highest clock in the circle and
+    adds one, so a peer whose clock could not be read lowers the result rather than
+    raising it, and a clock that is too low is a peer that looks stale rather than one
+    that claims to supersede peers it has never seen.
+    """
+    info = cf.PeerStableInfo()
+    try:
+        info.ParseFromString(peer.stable_info.info)
+    except DecodeError:
+        logger.debug("Peer %s has stable info that does not decode", peer.hash)
+        return 0
+
+    return info.clock
 
 
 @dataclass(frozen=True)
