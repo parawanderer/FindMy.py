@@ -801,6 +801,29 @@ def verify_protection_hmac(protection: ShareProtection, master_key: bytes) -> bo
 
 
 @dataclass(frozen=True)
+class MetaContents:
+    """
+    What a protection structure's `meta` holds once decrypted.
+
+    **This is where the keys actually are.** Steps 1 to 5 yield exactly one key -- the
+    master key wrapped to us -- and everything else the structure carries lives here,
+    encrypted under it.
+    """
+
+    symmetric_keys: list[bytes] = field(default_factory=list)
+    """Additional PCS master keys, from `symmKeys`. These decrypt fields."""
+
+    private_keys: list[ec.EllipticCurvePrivateKey] = field(default_factory=list)
+    """
+    The EC private keys, from every identity's nested keyset.
+
+    **These unwrap the next level down**, and are what §4 step 0 keeps at the zone. They
+    are not what decrypts a field, and taking the wrong half at a level is the mistake the
+    two-level table exists to prevent.
+    """
+
+
+@dataclass(frozen=True)
 class UnwrappedProtection:
     """A record's master key, and how it was arrived at."""
 
@@ -822,6 +845,23 @@ class UnwrappedProtection:
 
     None when the check was skipped, which the read-only flag causes.
     """
+
+    meta: MetaContents = field(default_factory=MetaContents)
+    """
+    What `meta` held. Empty when it could not be decrypted, which is not fatal at the
+    record level -- the master key alone decrypts fields -- and is fatal at the zone level,
+    since the zone's whole purpose is the keys inside it.
+    """
+
+    @property
+    def master_keys(self) -> list[bytes]:
+        """Every key that might decrypt a field: ours first, then `symmKeys`."""
+        return [self.master_key, *self.meta.symmetric_keys]
+
+    @property
+    def private_keys(self) -> list[ec.EllipticCurvePrivateKey]:
+        """The EC keys this structure carries, for unwrapping the level below."""
+        return self.meta.private_keys
 
 
 def unwrap_protection(
@@ -901,7 +941,176 @@ def unwrap_protection(
         read_only=share_key.read_only,
         hmac_verified=hmac_verified,
         signature_verified=signature_verified,
+        meta=read_meta(protection.meta, master_key),
     )
+
+
+def unwrap_zone(
+    protection_info: bytes,
+    service_keys: Sequence[ec.EllipticCurvePrivateKey],
+) -> list[ec.EllipticCurvePrivateKey]:
+    """
+    Unwrap a zone's protection structure into the keys its records are protected under.
+
+    **This is §4 step 0, and skipping it is undetectable from the record level.** A
+    record's keyset does not name the keychain service key; it names a *zone* key, and zone
+    keys live inside the zone's own structure. A reader that takes the service key straight
+    to a record finds no matching entry and reports that the record is protected for
+    someone else -- which is what being locked out looks like, and is not what happened.
+
+    Note which half is taken. Unwrapping yields both master keys and EC private keys; the
+    zone level wants the **EC private keys**, and the record level below wants the master
+    keys. Taking the same half at both is the next mistake available.
+
+    :param protection_info: The zone's `protectionInfo` bytes.
+    :param service_keys: The keychain service keys, from Stage 3.
+    :raises MissingKeyError: If no service key appears in the zone's keyset.
+    :raises PCSError: If the structure cannot be unwrapped.
+    """
+    unwrapped = unwrap_protection(ShareProtection.from_der(protection_info), service_keys)
+
+    if not unwrapped.private_keys:
+        msg = (
+            "The zone's protection structure unwrapped but carries no elliptic-curve keys,"
+            " so there is nothing for its records to be protected under. Its meta is where"
+            " those keys live, and it held"
+            f" {len(unwrapped.meta.symmetric_keys)} symmetric key(s) and none of the other"
+            " kind."
+        )
+        raise PCSError(msg)
+
+    logger.info("The zone yields %d key(s) for its records", len(unwrapped.private_keys))
+    return unwrapped.private_keys
+
+
+# --------------------------------------------------------------------------------------
+# The meta member, which is where the keys are (§4 step 6)
+# --------------------------------------------------------------------------------------
+
+_META_SYMM_KEYS = 0
+_META_IDENTITIES = 2
+
+
+def read_meta(meta: bytes, master_key: bytes) -> MetaContents:
+    """
+    Decrypt a protection structure's `meta` and read the keys out of it.
+
+    Steps 1 to 5 yield **one** key. The rest of what a structure carries is here: further
+    master keys under `symmKeys`, and -- more importantly -- the EC private keys that
+    unwrap the *next level down*. A reader that stops at the master key has the means to
+    decrypt this level's fields and nothing with which to reach the level below, which is
+    exactly the shape of "no key is held for this record".
+
+    Failures are reported rather than raised: at the record level `meta` is not needed to
+    decrypt a field, so an unreadable one should not cost the master key that was already
+    recovered. A caller that *does* need the keys inside should check the result is not
+    empty.
+    """
+    if not meta:
+        return MetaContents()
+
+    try:
+        # A structure member has no zone, record or field name to bind to, so the AAD is
+        # the header alone. The one place §6's context rule does not apply.
+        plaintext = decrypt_field(
+            meta,
+            UnwrappedProtection(
+                master_key=master_key,
+                share_key_derived=False,
+                read_only=False,
+                hmac_verified=False,
+                signature_verified=None,
+            ),
+            FieldContext.none(),
+            check_key_id=False,
+        )
+    except PCSError as e:
+        logger.warning("A protection structure's meta did not decrypt: %s", e)
+        return MetaContents()
+
+    try:
+        return parse_meta(plaintext)
+    except (der.DerError, PCSError) as e:
+        logger.warning("A protection structure's meta decrypted but did not parse: %s", e)
+        return MetaContents()
+
+
+def parse_meta(plaintext: bytes) -> MetaContents:
+    """
+    Read the DER a decrypted `meta` holds.
+
+    `[0]` is `symmKeys`, more master keys. `[2]` is `identities`, and the EC keys are one
+    level further in: each identity carries a `keyset` **OCTET STRING that is itself DER**,
+    whose `keys` are the same private-key CHOICE a keychain item's `v_Data` uses.
+
+    `[1]` is carried and not understood, and skipping it is deliberate rather than an
+    omission.
+    """
+    element, _ = der.parse_one(plaintext)
+
+    symmetric: list[bytes] = []
+    private: list[ec.EllipticCurvePrivateKey] = []
+
+    for child in element.children():
+        if child.is_context(_META_SYMM_KEYS):
+            symmetric.extend(entry.as_bytes() for entry in child.unwrap().children())
+        elif child.is_context(_META_IDENTITIES):
+            for identity in child.unwrap().children():
+                private.extend(_identity_keys(identity))
+
+    logger.debug(
+        "meta holds %d symmetric key(s) and %d private key(s)",
+        len(symmetric),
+        len(private),
+    )
+    return MetaContents(symmetric_keys=symmetric, private_keys=private)
+
+
+def _identity_keys(identity: der.DerElement) -> list[ec.EllipticCurvePrivateKey]:
+    """Read the EC private keys out of one identity's nested keyset."""
+    from findmy.keychain.servicekey import (  # noqa: PLC0415 -- avoids an import cycle
+        ServiceKeyError,
+        service_keys_from_der,
+    )
+
+    keys: list[ec.EllipticCurvePrivateKey] = []
+
+    for member in identity.children():
+        # The keyset is an OCTET STRING holding DER rather than an inline structure, so
+        # this descends into any member that parses as one rather than assuming a position.
+        if member.constructed:
+            continue
+        try:
+            nested, _ = der.parse_one(member.as_bytes())
+        except der.DerError:
+            continue
+        keys.extend(_keys_in_keyset(nested, service_keys_from_der, ServiceKeyError))
+
+    return keys
+
+
+def _keys_in_keyset(
+    keyset: der.DerElement,
+    read_key: object,
+    key_error: type[Exception],
+) -> list[ec.EllipticCurvePrivateKey]:
+    """Read every private key out of a nested keyset structure."""
+    keys: list[ec.EllipticCurvePrivateKey] = []
+
+    if not keyset.constructed:
+        return keys
+
+    for member in keyset.children():
+        if not member.constructed:
+            continue
+        for candidate in member.children():
+            try:
+                found = read_key(candidate.raw)  # type: ignore[operator]
+            except (key_error, der.DerError):
+                continue
+            keys.extend(found.for_pcs())
+
+    return keys
 
 
 def _find_our_key(
@@ -963,7 +1172,17 @@ class FieldContext:
 
     def as_bytes(self) -> bytes:
         """Render the context the way it is authenticated: names joined by hyphens."""
+        if not (self.zone_name or self.record_name or self.field_name):
+            # A structure member has no zone, record or field name to bind to, so the AAD
+            # is the header alone. §4 step 6's `meta` is the one place this applies -- the
+            # exception to §6's rule rather than a contradiction of it.
+            return b""
         return f"{self.zone_name}-{self.record_name}-{self.field_name}".encode("ascii")
+
+    @classmethod
+    def none(cls) -> FieldContext:
+        """Build the empty context, for a structure member rather than a record field."""
+        return cls(zone_name="", record_name="", field_name="")
 
 
 @dataclass(frozen=True)

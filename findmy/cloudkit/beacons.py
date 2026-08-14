@@ -33,6 +33,7 @@ from .pcs import (
     ShareProtection,
     decrypt_field,
     unwrap_protection,
+    unwrap_zone,
 )
 from .proto import cloudkit_pb2 as ck
 from .records import CloudKitRecord, records_from_changes
@@ -485,21 +486,63 @@ class AsyncBeaconStore:
         ]
         return records_from_changes(changes, BEACON_STORE_ZONE)
 
+    async def zone_keys(
+        self,
+        service_keys: Sequence[ec.EllipticCurvePrivateKey],
+    ) -> list[ec.EllipticCurvePrivateKey]:
+        """
+        Unwrap the zone's protection structure into the keys its records use.
+
+        **§4 step 0, and the level a reader is most likely to skip.** A record's keyset
+        names a zone key rather than the keychain service key, so going straight from the
+        keychain to a record finds nothing -- and reports it as the record being protected
+        for someone else, which is indistinguishable from being locked out.
+
+        :param service_keys: The keychain service keys, from Stage 3.
+        :raises PCSError: If the zone is absent or carries no protection structure.
+        """
+        zones = await self._client.zone_retrieve()
+
+        protection = next(
+            (
+                z.target_zone.protection_info.protection_info
+                for z in zones
+                if z.target_zone.zone_identifier.value.name == BEACON_STORE_ZONE
+                and z.target_zone.HasField("protection_info")
+            ),
+            None,
+        )
+        if not protection:
+            names = ", ".join(
+                z.target_zone.zone_identifier.value.name or "<unnamed>" for z in zones
+            )
+            msg = (
+                f"The {BEACON_STORE_ZONE} zone carries no protection structure, so there"
+                f" are no keys for its records. Zones retrieved: {names or 'none'}"
+            )
+            raise PCSError(msg)
+
+        return unwrap_zone(protection, service_keys)
+
     async def fetch_accessories(
         self,
-        private_keys: Sequence[ec.EllipticCurvePrivateKey],
+        service_keys: Sequence[ec.EllipticCurvePrivateKey],
         *,
         continuation_token: bytes | None = None,
     ) -> list[FindMyAccessory]:
         """
         Fetch and decrypt the account's accessories.
 
-        :param private_keys: Keys from the `Manatee` keychain view. Obtaining them is
-            Stage 3 of the specification and is not implemented by this library.
+        Two unwraps, not one: the zone's structure is opened with the keychain service
+        keys, and the records are opened with what the zone yields.
+
+        :param service_keys: Keys from the `Manatee` keychain view -- what Stage 3
+            produces. **Not** the keys a record's keyset names; see :meth:`zone_keys`.
         :param continuation_token: As :meth:`fetch_records`.
         """
+        keys = await self.zone_keys(service_keys)
         records = await self.fetch_records(continuation_token=continuation_token)
-        return accessories_from_records(decrypt_records(records, private_keys))
+        return accessories_from_records(decrypt_records(records, keys))
 
 
 def decrypt_records(

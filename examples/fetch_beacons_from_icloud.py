@@ -45,6 +45,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from findmy.cloudkit import AsyncBeaconStore, MissingKeyError, decrypt_records
 from findmy.cloudkit.beacons import accessories_from_records
+from findmy.cloudkit.pcs import PCSError
 from findmy.errors import UnhandledProtocolError
 from findmy.keychain import AsyncKeychainSession
 
@@ -174,7 +175,7 @@ async def keys_to_decrypt_with(account) -> list[ec.EllipticCurvePrivateKey]:  # 
         return supplied
 
 
-async def main() -> int:  # noqa: C901, PLR0915 -- a probe; linear reads better
+async def main() -> int:  # noqa: C901, PLR0912, PLR0915 -- a probe; linear reads better
     """Fetch, and decrypt if keys were supplied."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(name)s: %(message)s")
     logging.getLogger("findmy.cloudkit").setLevel(logging.DEBUG)
@@ -235,11 +236,21 @@ async def main() -> int:  # noqa: C901, PLR0915 -- a probe; linear reads better
             print("a file of PEM private keys to supply them another way.")
             return 0
 
-        print(f"\nDecrypting with {len(keys)} key(s)...")
+        # Two unwraps, not one. The keychain service keys open the *zone*; the zone
+        # yields the keys a record's keyset actually names. Going straight from the
+        # keychain to a record finds nothing, and says the record belongs to someone else.
+        print(f"\nUnwrapping the zone with {len(keys)} keychain key(s)...")
         try:
-            decrypted = decrypt_records(records, keys)
+            record_keys = await store.zone_keys(keys)
+        except PCSError as e:
+            print(f"The zone did not unwrap: {e}")
+            return 1
+
+        print(f"The zone yields {len(record_keys)} key(s). Decrypting records...")
+        try:
+            decrypted = decrypt_records(records, record_keys)
         except MissingKeyError:
-            print("None of the supplied keys protects any of these records.")
+            print("None of the zone's keys protects any of these records.")
             return 1
 
         for record in decrypted:

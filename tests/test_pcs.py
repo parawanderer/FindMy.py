@@ -930,3 +930,152 @@ def test_another_key_still_does_not_match_any_form() -> None:
     theirs = public_key_forms(ec.generate_private_key(ec.SECP256R1()).public_key())
 
     assert not (ours & theirs)
+
+
+# --------------------------------------------------------------------------------------
+# Two levels, and the half each one takes (§4 step 0)
+# --------------------------------------------------------------------------------------
+
+
+def build_meta(
+    master_key: bytes,
+    *,
+    symm_keys: list[bytes] | None = None,
+    identity_keys: list[bytes] | None = None,
+) -> bytes:
+    """Build a meta member: DER, then encrypted under the master key with no context."""
+    from findmy.cloudkit.pcs import (  # noqa: PLC0415
+        FieldContext,
+        UnwrappedProtection,
+        encrypt_field,
+    )
+
+    def length(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(body)]) + body
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + length(len(body)) + body
+
+    members = b""
+
+    if symm_keys:
+        inner = b"".join(tlv(0x04, k) for k in symm_keys)
+        members += tlv(0xA0, tlv(0x31, inner))
+
+    if identity_keys:
+        # Each identity: SEQUENCE { string, keyset OCTET STRING holding DER }
+        keysets = b""
+        for scalar in identity_keys:
+            v_data = tlv(0x65, tlv(0x04, _pcs_key_message(scalar)))
+            # The nested keyset, per §4 step 6: a string, the keys, a set, and a hash.
+            nested = tlv(
+                0x30,
+                tlv(0x0C, b"k") + tlv(0x31, v_data) + tlv(0x31, b"") + tlv(0x04, bytes(32)),
+            )
+            # An identity is { integer, keyset }, and the keyset is an OCTET STRING of DER.
+            keysets += tlv(0x30, tlv(0x02, b"\x01") + tlv(0x04, nested))
+        members += tlv(0xA2, tlv(0x31, keysets))
+
+    plaintext = tlv(0x30, members)
+
+    holder = UnwrappedProtection(
+        master_key=master_key,
+        share_key_derived=False,
+        read_only=False,
+        hmac_verified=False,
+        signature_verified=None,
+    )
+    return encrypt_field(plaintext, holder, FieldContext.none(), iv=bytes(12))
+
+
+def _pcs_key_message(scalar: bytes) -> bytes:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    return cf.PcsServiceKeys(encryption_key=cf.PcsPrivateKey(key=scalar)).SerializeToString()
+
+
+def test_meta_yields_both_halves_and_they_are_different_things() -> None:
+    # Steps 1 to 5 yield one key. Everything else the structure carries is in meta, and the
+    # two halves are for different levels: master keys decrypt fields, EC keys unwrap the
+    # level below. Taking the same half at both levels is the mistake the table prevents.
+    from findmy.cloudkit.pcs import read_meta  # noqa: PLC0415
+
+    master = bytes(range(16))
+    extra = bytes(range(16, 32))
+    scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+
+    meta = build_meta(master, symm_keys=[extra], identity_keys=[scalar.to_bytes(32, "big")])
+    contents = read_meta(meta, master)
+
+    assert contents.symmetric_keys == [extra]
+    assert len(contents.private_keys) == 1
+    assert contents.private_keys[0].private_numbers().private_value == scalar
+
+
+def test_meta_is_authenticated_with_an_empty_context() -> None:
+    # A structure member has no zone, record or field name to bind to, so the AAD is the
+    # header alone. This is the one place §6's context rule does not apply.
+    from findmy.cloudkit.pcs import FieldContext  # noqa: PLC0415
+
+    assert FieldContext.none().as_bytes() == b""
+    assert FieldContext("BeaconStore", "rec", "f").as_bytes() == b"BeaconStore-rec-f"
+
+
+def test_an_unreadable_meta_does_not_cost_the_master_key() -> None:
+    # At the record level meta is not needed to decrypt a field, so a meta this cannot read
+    # must not discard the key that was already recovered.
+    from findmy.cloudkit.pcs import read_meta  # noqa: PLC0415
+
+    contents = read_meta(b"\x03\x00\x00\x02\x00\x00" + bytes(40), bytes(range(16)))
+
+    assert contents.symmetric_keys == []
+    assert contents.private_keys == []
+
+
+def test_a_zone_unwraps_into_the_keys_its_records_use() -> None:
+    # §4 step 0. The service key opens the zone; the zone yields the EC keys a record's
+    # keyset names. Going straight from keychain to record finds nothing and reports the
+    # record as protected for someone else, which is what being locked out looks like.
+    from findmy.cloudkit.pcs import unwrap_zone  # noqa: PLC0415
+
+    service_key = ec.generate_private_key(ec.SECP256R1())
+    zone_master = bytes(range(16))
+    zone_scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+
+    zone_der = build_protection(
+        entries=[(pcs.compress_public_key(service_key.public_key()), wrap_master_key(
+            service_key.public_key(), zone_master), None)],
+        truncated_key_id=pcs.compute_key_id(zone_master)[:4],
+        version=5,
+        hmac_master_key=zone_master,
+        meta=build_meta(zone_master, identity_keys=[zone_scalar.to_bytes(32, "big")]),
+    )
+
+    keys = unwrap_zone(zone_der, [service_key])
+
+    assert len(keys) == 1
+    assert keys[0].private_numbers().private_value == zone_scalar
+
+
+def test_a_zone_carrying_no_elliptic_curve_keys_says_so() -> None:
+    # The zone's whole purpose is the keys inside it, so an empty one is fatal here even
+    # though the same emptiness at the record level is not.
+    from findmy.cloudkit.pcs import PCSError, unwrap_zone  # noqa: PLC0415
+
+    service_key = ec.generate_private_key(ec.SECP256R1())
+    zone_master = bytes(range(16))
+
+    zone_der = build_protection(
+        entries=[(pcs.compress_public_key(service_key.public_key()), wrap_master_key(
+            service_key.public_key(), zone_master), None)],
+        truncated_key_id=pcs.compute_key_id(zone_master)[:4],
+        version=5,
+        hmac_master_key=zone_master,
+        meta=build_meta(zone_master, symm_keys=[bytes(16)]),
+    )
+
+    with pytest.raises(PCSError, match="no elliptic-curve keys"):
+        unwrap_zone(zone_der, [service_key])
