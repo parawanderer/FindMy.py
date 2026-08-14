@@ -147,7 +147,25 @@ def scalar_in(blob: bytes) -> ScalarCandidate | None:
     """
     for length, curve in _CURVES_BY_SCALAR_LENGTH.items():
         if len(blob) == length:
-            logger.debug("A %d-byte key blob is a scalar with no public half", len(blob))
+            # Report the bytes themselves, not only their length. A blob with no public
+            # half cannot be checked, so whether it is a private scalar or a *public* x
+            # written where a key was expected is not something this can tell -- and the
+            # two are opposite. If these bytes turn out to be a key someone else names,
+            # this was never a private key at all.
+            try:
+                key = ec.derive_private_key(int.from_bytes(blob, "big"), curve())
+            except ValueError:
+                derived = b""
+            else:
+                derived = _public_x(key.public_key(), length)
+
+            logger.debug(
+                "A %d-byte key blob has no public half to check: it is %s, and read as a"
+                " scalar it derives to %s",
+                len(blob),
+                blob[:8].hex(),
+                derived[:8].hex() or "nothing valid",
+            )
             return ScalarCandidate(scalar=blob, verified=False)
 
         if len(blob) != 2 * length:
