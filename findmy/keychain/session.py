@@ -132,6 +132,21 @@ values for fields nothing reads.
 # their passcode.
 PET_LIFETIME_SECONDS = 240
 
+JOIN_HAPPENED = (
+    "Treat this as the join having happened. The peer is in the circle and the escrow"
+    " record exists; what was lost is the change set and the sync token, and both come"
+    " back from re-reading the directory. **Do not retry**: retrying joins twice, leaving"
+    " a second peer, a second bottle and a second escrow record, all permanent."
+)
+"""
+What any failure after `joinWithVoucher` is sent has to say.
+
+The reflex on a failed call is to repeat it, and this is the one call in the library where
+that reflex is destructive. It applies to a response that will not decode and to a timeout
+alike -- with a timeout it is not even known whether a response was sent, which is a reason
+to assume it was rather than a reason to try again.
+"""
+
 METHOD_JOIN_WITH_VOUCHER = "joinWithVoucher"
 """
 The one write in this stage.
@@ -685,6 +700,11 @@ class AsyncKeychainSession(Closable):
         its own right, so that it holds keys addressed to itself; it is not how the keys
         are first obtained.
 
+        **A failure after the request is sent is never a reason to call this again.** A
+        response that will not decode is not a call that failed, and a timeout does not
+        establish that no response was sent -- so both raise with :data:`JOIN_HAPPENED`
+        rather than looking like something to repeat. Recover by syncing the directory.
+
         The order is §6.9.4's, and the part of it that matters is that **the escrow record
         is enrolled before the join is sent**. The two failure modes are not comparable: a
         join that succeeds with no record leaves a peer nobody can ever recover, invisible
@@ -786,23 +806,24 @@ class AsyncKeychainSession(Closable):
             restore_point=directory.sync_token,
         )
 
-        serialized = await self._cuttlefish.function_invoke(
-            CUTTLEFISH_SERVICE,
-            METHOD_JOIN_WITH_VOUCHER,
-            request.SerializeToString(),
-        )
+        # Never with `auto_retry`. The HTTP layer's retry is off by default and nothing
+        # here turns it on, because a retry at that level is a second join with no way for
+        # anything above to know it happened.
+        try:
+            serialized = await self._cuttlefish.function_invoke(
+                CUTTLEFISH_SERVICE,
+                METHOD_JOIN_WITH_VOUCHER,
+                request.SerializeToString(),
+            )
+        except Exception as e:
+            msg = f"The join failed or its result was not seen ({e}). {JOIN_HAPPENED}"
+            raise KeychainSessionError(msg) from e
 
         reply = cf.CuttlefishJoinWithVoucherResponse()
         try:
             reply.ParseFromString(serialized)
         except DecodeError as e:
-            # The join itself succeeded -- this is the reply to it. Worth saying so, since
-            # the instinct on a decode failure is to retry the call.
-            msg = (
-                f"The join was accepted but its response did not decode ({e}). The peer"
-                " and the escrow record exist; only the trust changes and the sync token"
-                " are lost, and re-reading the circle recovers both."
-            )
+            msg = f"The join was accepted but its response did not decode ({e}). {JOIN_HAPPENED}"
             raise KeychainSessionError(msg) from None
 
         # Applied rather than discarded: the reply reports what the circle now looks like

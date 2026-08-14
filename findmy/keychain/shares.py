@@ -1175,7 +1175,11 @@ def make_share(
     `service` and `keyId` come from the key material itself rather than from the share --
     the CloudKit record form carries neither, which is a fact about reading one.
 
-    :param plaintext: The serialised `TlkKeyMaterial`, as recovered.
+    :param plaintext: The serialised `TlkKeyMaterial`, **passed through byte for byte**
+        rather than re-encoded. Only `zoneName` and `uuid` are read out of it, so this
+        carries none of the risk of a field whose declared type is wrong -- which
+        `string` and `bytes` sharing a wire type makes invisible until something writes
+        one. Re-encoding would also change the bytes the receiver's key is bound to.
     :param peer_id: The new peer's identifier, which is both ends of this share.
     :param encryption_key: The new peer's public encryption key.
     :param signing_key: The new peer's signing key, for the share's own signature.

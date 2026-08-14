@@ -689,5 +689,38 @@ async def test_a_reply_that_does_not_decode_says_the_join_still_happened(
 
     cuttlefish.function_invoke = rubbish  # pyright: ignore [reportAttributeAccessIssue]
 
-    with pytest.raises(KeychainSessionError, match="peer and the escrow record exist"):
+    with pytest.raises(KeychainSessionError, match="peer is in the circle"):
+        await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_sending_says_not_to_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A timeout does not establish that no response was sent, and the reflex on a failed
+    # call is to repeat it. Repeating this one leaves a second peer, a second bottle and
+    # a second escrow record, all permanent.
+    session, recovered, _, cuttlefish = _a_joinable_session(monkeypatch)
+
+    async def times_out(service: str, method: str, payload: bytes) -> bytes:
+        raise TimeoutError
+
+    cuttlefish.function_invoke = times_out  # pyright: ignore [reportAttributeAccessIssue]
+
+    with pytest.raises(KeychainSessionError, match="Do not retry"):
+        await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
+
+
+@pytest.mark.asyncio
+async def test_the_undecodable_reply_says_the_same_thing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, recovered, _, cuttlefish = _a_joinable_session(monkeypatch)
+
+    async def rubbish(service: str, method: str, payload: bytes) -> bytes:
+        return b"\xff\xff\xff\xff"
+
+    cuttlefish.function_invoke = rubbish  # pyright: ignore [reportAttributeAccessIssue]
+
+    with pytest.raises(KeychainSessionError, match="Do not retry"):
         await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")

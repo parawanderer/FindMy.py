@@ -532,3 +532,52 @@ def test_a_peers_identifier_is_the_digest_of_the_permanent_info_it_signed() -> N
 
     assert blob.verify(key.public_key())
     assert peer_identifier(blob.info, blob.signature).startswith("SHA256:")
+
+
+def test_every_field_the_specification_types_is_declared_that_way() -> None:
+    # `string` and `bytes` share a protobuf wire type, so a wrongly declared field decodes
+    # cleanly, reads correctly, and passes every test -- until something has to write it.
+    # That has happened twice in this stage, both times on values only ever read before.
+    # So a type is transcribed as carefully as a field number, and checked here.
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    text, data = FieldDescriptor.TYPE_STRING, FieldDescriptor.TYPE_BYTES
+    expected = {
+        cf.SignedInfo: {"info": data, "signature": data},
+        cf.Voucher: {"beneficiary": text, "sponsor": text},
+        cf.PeerPermanentInfo: {
+            "signing_key": data,
+            "encryption_key": data,
+            "machine_id": text,
+            "model_id": text,
+        },
+        cf.PeerDynamicInfo: {"includeds": text, "excludeds": text, "preapprovals": text},
+        cf.Bottle: {
+            "bottle": data,
+            "escrowed_signing_key": data,
+            "escrowed_key_signature": data,
+            "peer_key_signature": data,
+            "peer_id": text,
+            "bottle_id": text,
+        },
+        cf.OTBottle: {"peer_id": text, "bottle_id": text, "escrowed_signing_key": data},
+        # Binary-looking, and string on the wire regardless.
+        cf.TlkShare: {
+            "wrapped_key": text,
+            "signature": text,
+            "receiver_public_encryption_key": text,
+            "service": text,
+            "key_id": text,
+        },
+        # The token that comes back from a join is the one a join sends: a string at both
+        # ends, which is the pair that was wrong before anything had to write it.
+        cf.CuttlefishChanges: {"sync_token": text},
+        cf.FetchChangesRequest: {"sync_token": text},
+        cf.CuttlefishJoinWithVoucherRequest: {"restore_point": text},
+        cf.CuttlefishUpdateTrustRequest: {"restore_point": text, "peer_id": text},
+    }
+
+    for message, fields in expected.items():
+        declared = {field.name: field.type for field in message.DESCRIPTOR.fields}
+        for name, kind in fields.items():
+            assert declared[name] == kind, f"{message.DESCRIPTOR.name}.{name}"
