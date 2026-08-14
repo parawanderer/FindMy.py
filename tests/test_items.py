@@ -682,52 +682,68 @@ def test_a_v2_structure_holding_no_octet_string_says_what_it_holds() -> None:
         service_keys_from_der(empty_sequence)
 
 
-def a_compound_key_payload(scalar: bytes, *, compressed: bool = True) -> bytes:
-    """A key blob written as its public point followed by its scalar."""
-    key = ec.derive_private_key(int.from_bytes(scalar, "big"), ec.SECP256R1())
-    form = PublicFormat.CompressedPoint if compressed else PublicFormat.UncompressedPoint
-    point = key.public_key().public_bytes(Encoding.X962, form)
-
+def a_key_blob_payload(blob: bytes) -> bytes:
+    """A v2 payload whose key field carries the given blob verbatim."""
     from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
 
-    keys = cf.PcsServiceKeys(encryption_key=cf.PcsPrivateKey(key=point + scalar))
+    keys = cf.PcsServiceKeys(encryption_key=cf.PcsPrivateKey(key=blob))
     return der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
 
 
-def test_a_key_written_as_a_point_then_a_scalar_is_read() -> None:
-    # §6.7.0's peer keys are a point followed by their scalar, so a key blob longer than a
-    # scalar is not malformed -- it is that layout, and the halves check each other.
-    scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
-    raw = scalar.to_bytes(32, "big")
-
-    for compressed in (True, False):
-        keys = service_keys_from_der(a_compound_key_payload(raw, compressed=compressed))
-        assert keys.encryption_key.private_numbers().private_value == scalar
+def a_key_blob(key) -> bytes:  # noqa: ANN001
+    """The 64-byte blob for a key: public x first, then the scalar."""
+    uncompressed = key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    scalar = key.private_numbers().private_value.to_bytes(32, "big")
+    return uncompressed[1:33] + scalar
 
 
-def test_the_halves_must_check_each_other_before_a_compound_key_is_accepted() -> None:
-    # The point is what makes this safe to try rather than a guess: a mismatched prefix is
-    # rejected, so a wrong reading is impossible rather than merely unlikely.
+def test_a_key_blob_is_public_x_then_scalar() -> None:
+    real = ec.generate_private_key(ec.SECP256R1())
+
+    keys = service_keys_from_der(a_key_blob_payload(a_key_blob(real)))
+
+    assert keys.encryption_key.private_numbers().private_value == (
+        real.private_numbers().private_value
+    )
+
+
+def test_the_halves_are_checked_at_the_point_of_parse() -> None:
+    # Reading them the other way round does not fail: it yields a perfectly valid key on
+    # the curve whose public x matches nothing, and everything downstream then reports "no
+    # key held" rather than "wrong key". Checking here is what makes that loud.
+    from findmy.keychain.servicekey import KeyBlobError, scalar_in  # noqa: PLC0415
+
+    real = ec.generate_private_key(ec.SECP256R1())
+    blob = a_key_blob(real)
+    reversed_halves = blob[32:] + blob[:32]
+
+    with pytest.raises(KeyBlobError, match="halves disagree"):
+        scalar_in(reversed_halves)
+
+
+def test_reading_the_leading_half_as_the_scalar_yields_a_valid_key() -> None:
+    # The reason the check is needed rather than merely tidy: the wrong reading produces a
+    # key, not an error, so nothing downstream can tell it from being locked out.
+    real = ec.generate_private_key(ec.SECP256R1())
+    blob = a_key_blob(real)
+
+    wrong = ec.derive_private_key(int.from_bytes(blob[:32], "big"), ec.SECP256R1())
+
+    assert wrong.public_key().public_numbers().x != real.public_key().public_numbers().x
+
+
+def test_a_thirty_two_byte_blob_is_the_scalar_alone() -> None:
+    # It occurs too, and has no public half to check against -- so dispatch on length
+    # rather than assuming either form.
     from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
 
-    scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
-    raw = scalar.to_bytes(32, "big")
-    other = ec.generate_private_key(ec.SECP256R1()).public_key()
-    wrong = other.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+    real = ec.generate_private_key(ec.SECP256R1())
+    scalar = real.private_numbers().private_value.to_bytes(32, "big")
 
-    assert scalar_in(wrong + raw) is None
-
-
-def test_a_bare_scalar_is_taken_but_marked_unverified() -> None:
-    # Nothing checks a length match, so it must not be presented as equivalent to a
-    # compound blob whose halves agree.
-    from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
-
-    raw = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
-    candidate = scalar_in(raw.to_bytes(32, "big"))
+    candidate = scalar_in(scalar)
 
     assert candidate is not None
-    assert candidate.scalar == raw.to_bytes(32, "big")
+    assert candidate.scalar == scalar
     assert candidate.verified is False
 
 
@@ -750,13 +766,14 @@ def test_a_verified_candidate_outranks_one_that_only_matched_by_length() -> None
     from findmy.keychain.servicekey import service_keys_from_der  # noqa: PLC0415
 
     real = ec.generate_private_key(ec.SECP256R1())
-    scalar = real.private_numbers().private_value.to_bytes(32, "big")
-    point = real.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+    blob = a_key_blob(real)
 
     keys = cf.PcsServiceKeys()
-    # An impostor of exactly a scalar's length, placed first.
+    # An impostor of exactly a scalar's length, placed first. A 32-byte blob is a scalar
+    # with no public half, so nothing checks it -- which is why it must not outrank one
+    # whose halves agree.
     keys.encryption_key.key = b"\x11" * 32
-    keys.signing_key.key = point + scalar
+    keys.signing_key.key = blob
 
     payload = der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
 
@@ -770,12 +787,10 @@ def test_a_candidate_that_will_not_derive_is_skipped_rather_than_fatal() -> None
     from findmy.keychain.servicekey import service_keys_from_der  # noqa: PLC0415
 
     real = ec.generate_private_key(ec.SECP256R1())
-    scalar = real.private_numbers().private_value.to_bytes(32, "big")
-    point = real.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
 
     keys = cf.PcsServiceKeys()
     keys.encryption_key.key = bytes(32)  # zero is not a valid scalar
-    keys.signing_key.key = point + scalar
+    keys.signing_key.key = a_key_blob(real)
 
     payload = der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
 
@@ -802,46 +817,10 @@ def a_payload_with_key_blobs(encryption: bytes, signing: bytes | None = None) ->
     return der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
 
 
-def public_form(key, form: str) -> bytes:  # noqa: ANN001
-    """One of the ways a public half might be written."""
-    uncompressed = key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
-    if form == "x":
-        return uncompressed[1:33]
-    if form == "xy":
-        return uncompressed[1:]
-    if form == "compressed":
-        return key.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
-    return uncompressed
-
-
-@pytest.mark.parametrize("form", ["x", "xy", "compressed", "uncompressed"])
-@pytest.mark.parametrize("scalar_first", [False, True])
-def test_a_key_blob_is_read_however_its_public_half_is_written(
-    form: str,
-    scalar_first: bool,
-) -> None:
-    # [observed] Find My's service key is 64 bytes for a P-256 key: the bare x coordinate
-    # and the scalar, with neither the 0x04 marker nor a sign byte. A reader that knows
-    # only the two X9.62 forms checks 33 and 65 bytes against a 32-byte prefix and rejects
-    # a perfectly good key.
-    real = ec.generate_private_key(ec.SECP256R1())
-    scalar = real.private_numbers().private_value.to_bytes(32, "big")
-    public = public_form(real, form)
-
-    blob = scalar + public if scalar_first else public + scalar
-
-    keys = service_keys_from_der(a_payload_with_key_blobs(blob))
-
-    assert keys.encryption_key.private_numbers().private_value == (
-        real.private_numbers().private_value
-    )
-
-
 def test_the_observed_sixty_four_byte_shape_is_read() -> None:
     # The exact shape from a real account: 32 bytes of x, then 32 bytes of scalar.
     real = ec.generate_private_key(ec.SECP256R1())
-    scalar = real.private_numbers().private_value.to_bytes(32, "big")
-    blob = public_form(real, "x") + scalar
+    blob = a_key_blob(real)
 
     assert len(blob) == 64
 
@@ -853,18 +832,19 @@ def test_the_observed_sixty_four_byte_shape_is_read() -> None:
     assert keys.signing_key is not None
 
 
-def test_a_public_half_that_does_not_match_is_still_rejected() -> None:
-    # Widening the forms must not widen what is accepted: each is compared against bytes
-    # the key itself produces, so a mismatch stays a mismatch.
-    from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
+def test_a_public_half_belonging_to_another_key_is_refused_loudly() -> None:
+    # A blob whose halves belong to different keys is a real inconsistency, not a blob of
+    # another kind -- so it raises rather than being quietly passed over.
+    from findmy.keychain.servicekey import KeyBlobError, scalar_in  # noqa: PLC0415
 
     real = ec.generate_private_key(ec.SECP256R1())
     other = ec.generate_private_key(ec.SECP256R1())
-    scalar = real.private_numbers().private_value.to_bytes(32, "big")
 
-    candidate = scalar_in(public_form(other, "x") + scalar)
+    theirs = other.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    mismatched = theirs[1:33] + real.private_numbers().private_value.to_bytes(32, "big")
 
-    assert candidate is None or candidate.verified is False
+    with pytest.raises(KeyBlobError, match="halves disagree"):
+        scalar_in(mismatched)
 
 
 def test_opaque_bytes_are_not_described_as_a_message() -> None:
@@ -922,10 +902,7 @@ def test_a_v1_structure_reads_a_compound_key_blob_as_v2_does() -> None:
     # point-and-scalar form -- and rejects it as "matches no curve", which names nothing a
     # reader would connect to the other arm.
     real = ec.generate_private_key(ec.SECP256R1())
-    scalar = real.private_numbers().private_value.to_bytes(32, "big")
-    blob = public_form(real, "x") + scalar
-
-    v1 = der(0x30, der(0x04, blob))
+    v1 = der(0x30, der(0x04, a_key_blob(real)))
 
     keys = service_keys_from_der(v1)
 

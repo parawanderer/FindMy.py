@@ -101,87 +101,83 @@ def private_key_from_scalar(scalar: bytes) -> ec.EllipticCurvePrivateKey:
 
 @dataclass(frozen=True)
 class ScalarCandidate:
-    """A possible private scalar, and whether anything actually confirmed it."""
+    """A private scalar read out of a key blob, and whether its public half confirmed it."""
 
     scalar: bytes
 
     verified: bool
     """
-    Whether the blob carried a public point that this scalar reproduces.
+    Whether the blob carried a public x that this scalar reproduces.
 
-    The distinction matters more than it looks. A **verified** candidate cannot be wrong:
-    deriving its public key reproduced the leading bytes exactly. An unverified one matched
-    on **length alone**, which is a guess with nothing checking it -- and taking one of
-    those in preference to a verified one is how a 66-byte member became a P-521 key.
+    True for a 64-byte blob, which carries both halves precisely so this can be checked.
+    False for a 32-byte one, which is the scalar alone and has nothing to check against.
     """
+
+
+class KeyBlobError(ServiceKeyError):
+    """Raised when a key blob's two halves do not agree."""
 
 
 def scalar_in(blob: bytes) -> ScalarCandidate | None:
     """
-    Read a private scalar out of a key blob, whatever it is carried alongside.
+    Read the private scalar out of a key blob.
 
-    A "compressed private key" is not always a bare scalar. §6.7.0's peer keys are a
-    public point followed by their scalar, and the same layout appears here -- so a blob
-    is tried as a point followed by its **trailing** scalar-sized run, and taken as a bare
-    scalar only if nothing else fits.
+    **The layout is public x first, then the scalar** -- 32 bytes each for P-256, and the
+    same for both arms of the private-key CHOICE, so one reader serves V1's octets and each
+    of V2's protobuf key fields.
 
-    The compound reading is self-verifying and free: deriving the public key from the
-    candidate must reproduce the leading bytes exactly, in one of the two point encodings.
-    That reading cannot be wrong. The bare-length reading can, so it is reported as
-    unverified rather than treated as equivalent.
+    Two lengths occur and this dispatches on which:
 
-    :returns: The candidate, or None if the blob holds no plausible scalar.
+    ============ ==================================================================
+    64 bytes     the public x, then the scalar. **Checked**: deriving the public key
+                 from the scalar must reproduce bytes 0 to 31.
+    32 bytes     the scalar alone, with no public half and nothing to check against.
+    ============ ==================================================================
+
+    **Reading the leading half as the scalar does not fail.** It yields a perfectly valid
+    key on the curve whose public x matches nothing, and everything downstream then reports
+    "no key held" rather than "wrong key" -- because once the wrong key is a *valid* key the
+    two are indistinguishable. That is why the check belongs here, at the point of parse,
+    rather than being left to whatever consumes the key five levels later.
+
+    :returns: The candidate, or None if the blob is not a length this understands.
+    :raises KeyBlobError: If a 64-byte blob's halves disagree. That is a real inconsistency
+        rather than a blob of another kind, and staying quiet about it is what produced a
+        valid-but-wrong key before.
     """
     for length, curve in _CURVES_BY_SCALAR_LENGTH.items():
-        if len(blob) <= length:
+        if len(blob) == length:
+            return ScalarCandidate(scalar=blob, verified=False)
+
+        if len(blob) != 2 * length:
             continue
 
-        # Either end: the scalar may lead or trail, and both readings check themselves, so
-        # trying both costs nothing and removes a coin-flip about which was meant.
-        for scalar, rest in ((blob[-length:], blob[:-length]), (blob[:length], blob[length:])):
-            try:
-                key = ec.derive_private_key(int.from_bytes(scalar, "big"), curve())
-            except ValueError:
-                continue
+        public_x, scalar = blob[:length], blob[length:]
+        try:
+            key = ec.derive_private_key(int.from_bytes(scalar, "big"), curve())
+        except ValueError as e:
+            msg = f"A {len(blob)}-byte key blob's trailing half is not a valid scalar: {e}"
+            raise KeyBlobError(msg) from None
 
-            if rest in _public_forms(key, length):
-                logger.debug(
-                    "A %d-byte key blob is a %d-byte public form beside its %d-byte scalar",
-                    len(blob),
-                    len(rest),
-                    length,
-                )
-                return ScalarCandidate(scalar=scalar, verified=True)
+        derived = _public_x(key.public_key(), length)
+        if derived != public_x:
+            msg = (
+                f"A {len(blob)}-byte key blob's halves disagree: its scalar derives to"
+                f" {derived[:8].hex()}… but the blob's public half is {public_x[:8].hex()}…."
+                " The layout is public x first, then the scalar; reading them the other way"
+                " round yields a valid key that matches nothing."
+            )
+            raise KeyBlobError(msg)
 
-    if len(blob) in _CURVES_BY_SCALAR_LENGTH:
-        return ScalarCandidate(scalar=blob, verified=False)
+        return ScalarCandidate(scalar=scalar, verified=True)
 
     return None
 
 
-def _public_forms(key: ec.EllipticCurvePrivateKey, length: int) -> set[bytes]:
-    """
-    Every way the public half of a key might be written beside its scalar.
-
-    Four, because "compressed" is not one thing. **[observed]** Find My's service key is a
-    64-byte blob for a P-256 key -- the bare x coordinate followed by the scalar, with
-    neither the `0x04` marker nor the sign byte that the X9.62 encodings carry. A reader
-    that knows only the two X9.62 forms rejects it, having checked 33 and 65 bytes against
-    a 32-byte prefix.
-
-    Listing them is safe where guessing lengths is not: each is compared against bytes the
-    key itself produces, so a wrong form cannot match. That is the difference between
-    widening this and widening a table of scalar lengths, which has nothing to check.
-    """
-    public = key.public_key()
-    uncompressed = public.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
-
-    return {
-        public.public_bytes(Encoding.X962, PublicFormat.CompressedPoint),
-        uncompressed,
-        uncompressed[1 : 1 + length],  # the bare x coordinate, no marker and no sign byte
-        uncompressed[1:],  # x and y, without the 0x04 marker
-    }
+def _public_x(public_key: ec.EllipticCurvePublicKey, length: int) -> bytes:
+    """Render the public key's x coordinate alone, the half a blob carries."""
+    uncompressed = public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    return uncompressed[1 : 1 + length]
 
 
 def _candidates_in(payload: bytes) -> list[ScalarCandidate]:

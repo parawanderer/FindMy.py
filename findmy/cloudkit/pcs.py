@@ -1169,6 +1169,7 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
     known length, so a wrong element does not produce a wrong key -- it produces no key.
     """
     from findmy.keychain.servicekey import (  # noqa: PLC0415 -- avoids an import cycle
+        KeyBlobError,
         ServiceKeyError,
         service_keys_from_der,
     )
@@ -1188,6 +1189,11 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
             try:
                 keys.extend(service_keys_from_der(member.raw).for_pcs())
                 continue
+            except KeyBlobError:
+                # Distinct from "this is not a key": the halves of something shaped exactly
+                # like a key disagree. A search that swallows this is how a valid-but-wrong
+                # key reached five levels downstream and reported as no key at all.
+                logger.warning("A key blob's halves disagree", exc_info=True)
             except (ServiceKeyError, der.DerError):
                 pass
 
