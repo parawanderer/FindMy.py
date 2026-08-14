@@ -368,6 +368,23 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
             ", ".join(sorted(b.name for b in unnamed)),
         )
 
+    # An accessory that gets no alignment record searches its whole history when located
+    # -- tens of thousands of keys against a service answering a few hundred at a time --
+    # and until now that happened with nothing said. A record that is *present but
+    # unreadable* warns; one that simply did not join was silent, which is the worse of
+    # the two because it looks like an accessory that never had one.
+    unaligned = [b.name for b in beacons if b.name in naming and b.name not in alignment]
+    if unaligned:
+        logger.warning(
+            "%d of %d accessor(ies) have no key-alignment record and will search their"
+            " whole history when located: %s. %d alignment record(s) were fetched, so if"
+            " that number is not zero these did not join.",
+            len(unaligned),
+            len(naming),
+            ", ".join(sorted(unaligned)),
+            len(alignment),
+        )
+
     accessories: list[FindMyAccessory] = []
     for beacon in beacons:
         if beacon.name not in naming:

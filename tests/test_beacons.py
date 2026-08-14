@@ -560,3 +560,65 @@ def test_a_missing_key_is_explained_once_and_not_only_counted(
     assert "Why no key was held" in caplog.text
     # The sizes are what distinguish "not for us" from "compared the wrong bytes".
     assert "bytes; the forms compared against are" in caplog.text
+
+
+def alignment_record(beacon: str = "BEACON-1") -> DecryptedRecord:
+    """The record that stops an accessory searching its whole history."""
+    return DecryptedRecord(
+        name=f"ALIGN-{beacon}",
+        record_type=RecordType.KEY_ALIGNMENT,
+        values={
+            "beaconIdentifier": beacon,
+            "lastIndexObserved": 50_000,
+            "lastIndexObservationDate": PAIRED_AT,
+        },
+    )
+
+
+def test_an_accessory_with_no_alignment_record_is_named_not_merely_absent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Without one it searches its whole history when located -- tens of thousands of keys
+    # against a service answering a few hundred at a time. An unreadable record warns; one
+    # that simply did not join was silent, which looks like an accessory that never had
+    # one rather than a join that failed.
+    import logging  # noqa: PLC0415
+
+    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.beacons"):
+        accessories_from_records([beacon_record("TAG-1"), naming_record("TAG-1")])
+
+    assert "TAG-1" in caplog.text
+    assert "whole history" in caplog.text
+
+
+def test_an_accessory_that_joined_its_alignment_record_is_not_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging  # noqa: PLC0415
+
+    records = [beacon_record("TAG-1"), naming_record("TAG-1"), alignment_record("TAG-1")]
+
+    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.beacons"):
+        accessories = accessories_from_records(records)
+
+    assert len(accessories) == 1
+    assert "whole history" not in caplog.text
+
+
+def test_the_warning_says_how_many_alignment_records_were_fetched(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The difference between "this account has none" and "they did not join" is the whole
+    # question, and a count of accessories without one does not answer it.
+    import logging  # noqa: PLC0415
+
+    records = [
+        beacon_record("TAG-1"),
+        naming_record("TAG-1"),
+        alignment_record("SOMETHING-ELSE"),
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.beacons"):
+        accessories_from_records(records)
+
+    assert "1 alignment record(s) were fetched" in caplog.text
