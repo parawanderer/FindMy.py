@@ -72,8 +72,9 @@ message EscrowMeta {}
 
 message FetchChangesRequest {
   // Omit on a first call. Keeping the token the response returns is what makes this a
-  // feed rather than a re-read of the whole circle every run.
-  optional bytes sync_token = 1;
+  // feed rather than a re-read of the whole circle every run -- and it is the same value
+  // a join sends back as `restore_point`, which is why it is a string rather than bytes.
+  optional string sync_token = 1;
 }
 
 message FetchChangesResponse {
@@ -81,12 +82,14 @@ message FetchChangesResponse {
   // `repeated CuttlefishChange changes = 1` -- parses without error and yields one change
   // per response with no `add` in it, so the circle reads as empty. Nothing reports a
   // problem; every share downstream simply ends up with a sender nothing can identify.
-  optional ChangeSet changes = 1;
+  optional CuttlefishChanges changes = 1;
 }
 
-message ChangeSet {
-  optional bytes sync_token = 1;
-  repeated CuttlefishChange change = 2;
+// What every call that reports trust changes returns: fetchChanges, joinWithVoucher and
+// updateTrust alike. One message, one code path, one place that applies changes.
+message CuttlefishChanges {
+  optional string sync_token = 1;
+  repeated CuttlefishChange changes = 2;
 }
 
 message CuttlefishChange {
@@ -173,6 +176,28 @@ message CuttlefishJoinWithVoucherRequest {
 
   // Sent when *establishing* keys rather than receiving them, so this project sends none.
   repeated ViewKeys keys = 5;
+}
+
+message CuttlefishJoinWithVoucherResponse {
+  // The same changes fetchChanges returns, so a join's result goes through the path that
+  // already exists: apply them to the directory and keep the token.
+  optional CuttlefishChanges changes = 1;
+}
+
+// Handing view keys to a peer that is already in the circle. Not what a join uses -- a
+// join carries its own shares -- but it is how a member stays current across key
+// rotation, which is the reason for joining in the first place.
+message CuttlefishUpdateTrustRequest {
+  optional string restore_point = 1;
+  optional string peer_id = 2;
+  optional SignedInfo stable_info = 3;
+  optional SignedInfo dynamic_info = 4;
+  repeated TlkShare tlkshares = 5;
+  repeated ViewKeys view_keys = 6;
+}
+
+message CuttlefishUpdateTrustResponse {
+  optional CuttlefishChanges changes = 1;
 }
 
 // A peer: an identity in the trust circle. Everything but the hash is a signed blob.

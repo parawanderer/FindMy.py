@@ -38,22 +38,22 @@ class EscrowMeta(_message.Message):
 class FetchChangesRequest(_message.Message):
     __slots__ = ("sync_token",)
     SYNC_TOKEN_FIELD_NUMBER: _ClassVar[int]
-    sync_token: bytes
-    def __init__(self, sync_token: _Optional[bytes] = ...) -> None: ...
+    sync_token: str
+    def __init__(self, sync_token: _Optional[str] = ...) -> None: ...
 
 class FetchChangesResponse(_message.Message):
     __slots__ = ("changes",)
     CHANGES_FIELD_NUMBER: _ClassVar[int]
-    changes: ChangeSet
-    def __init__(self, changes: _Optional[_Union[ChangeSet, _Mapping]] = ...) -> None: ...
+    changes: CuttlefishChanges
+    def __init__(self, changes: _Optional[_Union[CuttlefishChanges, _Mapping]] = ...) -> None: ...
 
-class ChangeSet(_message.Message):
-    __slots__ = ("sync_token", "change")
+class CuttlefishChanges(_message.Message):
+    __slots__ = ("sync_token", "changes")
     SYNC_TOKEN_FIELD_NUMBER: _ClassVar[int]
-    CHANGE_FIELD_NUMBER: _ClassVar[int]
-    sync_token: bytes
-    change: _containers.RepeatedCompositeFieldContainer[CuttlefishChange]
-    def __init__(self, sync_token: _Optional[bytes] = ..., change: _Optional[_Iterable[_Union[CuttlefishChange, _Mapping]]] = ...) -> None: ...
+    CHANGES_FIELD_NUMBER: _ClassVar[int]
+    sync_token: str
+    changes: _containers.RepeatedCompositeFieldContainer[CuttlefishChange]
+    def __init__(self, sync_token: _Optional[str] = ..., changes: _Optional[_Iterable[_Union[CuttlefishChange, _Mapping]]] = ...) -> None: ...
 
 class CuttlefishChange(_message.Message):
     __slots__ = ("add",)
@@ -124,6 +124,34 @@ class CuttlefishJoinWithVoucherRequest(_message.Message):
     shares: _containers.RepeatedCompositeFieldContainer[TlkShare]
     keys: _containers.RepeatedCompositeFieldContainer[ViewKeys]
     def __init__(self, restore_point: _Optional[str] = ..., peer: _Optional[_Union[CuttlefishPeer, _Mapping]] = ..., bottle: _Optional[_Union[Bottle, _Mapping]] = ..., shares: _Optional[_Iterable[_Union[TlkShare, _Mapping]]] = ..., keys: _Optional[_Iterable[_Union[ViewKeys, _Mapping]]] = ...) -> None: ...
+
+class CuttlefishJoinWithVoucherResponse(_message.Message):
+    __slots__ = ("changes",)
+    CHANGES_FIELD_NUMBER: _ClassVar[int]
+    changes: CuttlefishChanges
+    def __init__(self, changes: _Optional[_Union[CuttlefishChanges, _Mapping]] = ...) -> None: ...
+
+class CuttlefishUpdateTrustRequest(_message.Message):
+    __slots__ = ("restore_point", "peer_id", "stable_info", "dynamic_info", "tlkshares", "view_keys")
+    RESTORE_POINT_FIELD_NUMBER: _ClassVar[int]
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    STABLE_INFO_FIELD_NUMBER: _ClassVar[int]
+    DYNAMIC_INFO_FIELD_NUMBER: _ClassVar[int]
+    TLKSHARES_FIELD_NUMBER: _ClassVar[int]
+    VIEW_KEYS_FIELD_NUMBER: _ClassVar[int]
+    restore_point: str
+    peer_id: str
+    stable_info: SignedInfo
+    dynamic_info: SignedInfo
+    tlkshares: _containers.RepeatedCompositeFieldContainer[TlkShare]
+    view_keys: _containers.RepeatedCompositeFieldContainer[ViewKeys]
+    def __init__(self, restore_point: _Optional[str] = ..., peer_id: _Optional[str] = ..., stable_info: _Optional[_Union[SignedInfo, _Mapping]] = ..., dynamic_info: _Optional[_Union[SignedInfo, _Mapping]] = ..., tlkshares: _Optional[_Iterable[_Union[TlkShare, _Mapping]]] = ..., view_keys: _Optional[_Iterable[_Union[ViewKeys, _Mapping]]] = ...) -> None: ...
+
+class CuttlefishUpdateTrustResponse(_message.Message):
+    __slots__ = ("changes",)
+    CHANGES_FIELD_NUMBER: _ClassVar[int]
+    changes: CuttlefishChanges
+    def __init__(self, changes: _Optional[_Union[CuttlefishChanges, _Mapping]] = ...) -> None: ...
 
 class CuttlefishPeer(_message.Message):
     __slots__ = ("hash", "permanent_info", "stable_info", "dynamic_info", "voucher")

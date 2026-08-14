@@ -37,6 +37,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from google.protobuf.message import DecodeError
 from typing_extensions import Self, override
 
 from findmy.cloudkit.client import AsyncCloudKitClient
@@ -780,26 +781,47 @@ class AsyncKeychainSession(Closable):
                 )
                 for plaintext in recovered
             ],
+            # Exactly what Cuttlefish last sent, as a string at both ends. A client that
+            # has never synced has none, which is the ordinary case for a first join.
+            restore_point=directory.sync_token,
         )
 
-        response = await self._cuttlefish.function_invoke(
+        serialized = await self._cuttlefish.function_invoke(
             CUTTLEFISH_SERVICE,
             METHOD_JOIN_WITH_VOUCHER,
             request.SerializeToString(),
         )
 
-        # Everything read before the join described a circle this peer was not in.
-        self._peers = None
+        reply = cf.CuttlefishJoinWithVoucherResponse()
+        try:
+            reply.ParseFromString(serialized)
+        except DecodeError as e:
+            # The join itself succeeded -- this is the reply to it. Worth saying so, since
+            # the instinct on a decode failure is to retry the call.
+            msg = (
+                f"The join was accepted but its response did not decode ({e}). The peer"
+                " and the escrow record exist; only the trust changes and the sync token"
+                " are lost, and re-reading the circle recovers both."
+            )
+            raise KeychainSessionError(msg) from None
+
+        # Applied rather than discarded: the reply reports what the circle now looks like
+        # with this peer in it, and carries the token every later sync resumes from.
+        self._peers = directory.updated(reply.changes)
         self._options = None
 
-        logger.info("Joined as %s; Cuttlefish returned %d bytes", identity.peer_id, len(response))
+        logger.info(
+            "Joined as %s; the reply carried %d change(s)",
+            identity.peer_id,
+            len(reply.changes.changes),
+        )
         return JoinOutcome(
             identity=identity,
             bottle=bottle,
             label=label,
             trust=trust,
             shares=len(request.shares),
-            response=response,
+            directory=self._peers,
         )
 
     async def _enrol_for_join(
@@ -868,12 +890,23 @@ class JoinOutcome:
     shares: int
     """How many view keys were re-addressed to the new peer."""
 
-    response: bytes
+    directory: PeerDirectory
     """
-    Cuttlefish's reply, undecoded.
+    The circle with the join's own changes applied, and the token they arrived with.
 
-    §6.9.4 step 9 says to apply the trust changes it carries, and **no message for it is
-    specified**. Guessing at one would be a parse that silently yields empty fields, which
-    is the failure §6.7.0 documents for the share record. So it is handed back whole.
+    §6.9.4 step 9's "apply the returned changes" -- and the reply carries the same
+    `CuttlefishChanges` that `fetchChanges` returns, so it goes through the path that
+    already exists rather than a second reading of what a change is.
     """
+
+    @property
+    def sync_token(self) -> str | None:
+        """
+        Where the circle now stands, for the next read to resume from.
+
+        **Worth persisting.** This response is where a new peer first gets one, and it is
+        what makes every later sync incremental instead of a full re-read -- which is the
+        point of being a member rather than a recoverer.
+        """
+        return self.directory.sync_token
 

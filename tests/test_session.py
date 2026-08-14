@@ -311,9 +311,13 @@ class JoinCuttlefish:
         self.payload = b""
 
     async def function_invoke(self, service: str, method: str, payload: bytes) -> bytes:
+        from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
         self.calls.append(method)
         self.payload = payload
-        return b"the-changes"
+        return cf.CuttlefishJoinWithVoucherResponse(
+            changes=cf.CuttlefishChanges(sync_token="tok-after-join"),
+        ).SerializeToString()
 
     async def close(self) -> None:
         return
@@ -492,7 +496,6 @@ async def test_the_join_carries_the_peer_its_bottle_and_its_shares(
     assert len(request.shares) == 1
     # Never sent: this project receives view keys, it does not establish them.
     assert list(request.keys) == []
-    assert outcome.response == b"the-changes"
 
 
 @pytest.mark.asyncio
@@ -611,3 +614,80 @@ async def test_joining_without_usable_shares_is_refused(
         await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_reply_is_decoded_and_its_token_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The response carries the same CuttlefishChanges fetchChanges returns, so it goes
+    # through the path that already exists -- and the token it brings is what makes every
+    # later sync incremental. Discarding the reply drops both.
+    session, recovered, _, _ = _a_joinable_session(monkeypatch)
+
+    outcome = await session.join(
+        recovered,
+        passcode="123456",
+        device=_a_device(),
+        os_version="6.1",
+    )
+
+    assert outcome.sync_token == "tok-after-join"
+    assert outcome.directory.sync_token == "tok-after-join"
+    assert session._peers is outcome.directory  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_first_join_sends_no_restore_point(monkeypatch: pytest.MonkeyPatch) -> None:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    session, recovered, _, cuttlefish = _a_joinable_session(monkeypatch)
+
+    await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
+
+    request = cf.CuttlefishJoinWithVoucherRequest()
+    request.ParseFromString(cuttlefish.payload)
+
+    assert not request.HasField("restore_point")
+
+
+@pytest.mark.asyncio
+async def test_a_held_token_is_sent_back_exactly(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A string at both ends. Nothing to encode, nothing to guess.
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.peers import PeerDirectory  # noqa: PLC0415
+
+    session, recovered, _, cuttlefish = _a_joinable_session(monkeypatch)
+
+    held = await session.peer_directory()
+    import dataclasses  # noqa: PLC0415
+
+    async def with_token(_: object) -> PeerDirectory:
+        return dataclasses.replace(held, sync_token="tok-before")
+
+    monkeypatch.setattr("findmy.keychain.session.fetch_peer_directory", with_token)
+
+    await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
+
+    request = cf.CuttlefishJoinWithVoucherRequest()
+    request.ParseFromString(cuttlefish.payload)
+
+    assert request.restore_point == "tok-before"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_does_not_decode_says_the_join_still_happened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The instinct on a decode failure is to retry the call. Retrying this one would try
+    # to join twice.
+    session, recovered, _, cuttlefish = _a_joinable_session(monkeypatch)
+
+    async def rubbish(service: str, method: str, payload: bytes) -> bytes:
+        cuttlefish.calls.append(method)
+        return b"\xff\xff\xff\xff"
+
+    cuttlefish.function_invoke = rubbish  # pyright: ignore [reportAttributeAccessIssue]
+
+    with pytest.raises(KeychainSessionError, match="peer and the escrow record exist"):
+        await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")

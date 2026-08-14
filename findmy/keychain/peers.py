@@ -191,12 +191,14 @@ class PeerDirectory:
 
     peers: dict[str, Peer] = field(default_factory=dict)
 
-    sync_token: bytes | None = None
+    sync_token: str | None = None
     """
     Where the feed reached.
 
-    Worth persisting. Fetching from the beginning every run re-reads the whole circle for
-    no benefit.
+    Worth persisting: fetching from the beginning every run re-reads the whole circle for
+    no benefit. It is also what a join sends back as its `restorePoint`, and what the
+    join's own response returns a fresh one of -- a **string** at both ends, so nothing
+    here encodes or decodes it. Send back exactly what Cuttlefish last sent.
     """
 
     def get(self, peer_hash: str) -> Peer | None:
@@ -210,6 +212,41 @@ class PeerDirectory:
     def __contains__(self, peer_hash: object) -> bool:
         """Whether a peer is known."""
         return peer_hash in self.peers
+
+    def updated(self, changes: cf.CuttlefishChanges) -> PeerDirectory:
+        """
+        Fold a batch of changes in, returning a new directory.
+
+        Every call that reports trust changes returns the same message -- `fetchChanges`,
+        `joinWithVoucher`, `updateTrust` -- so they all arrive here rather than each
+        growing its own reading of what a change is.
+        """
+        peers = dict(self.peers)
+        apply_changes(peers, changes)
+
+        token = changes.sync_token if changes.HasField("sync_token") else self.sync_token
+        return PeerDirectory(peers=peers, sync_token=token)
+
+
+def apply_changes(peers: dict[str, Peer], changes: cf.CuttlefishChanges) -> int:
+    """
+    Fold one batch of changes into a peer map, in place.
+
+    Anything that is not an `add` is another kind of change, not a peer and not a problem:
+    a change at a field this does not know parses into the unknown set and lands here.
+
+    :returns: How many peers were added.
+    """
+    added = 0
+    for change in changes.changes:
+        if not change.HasField(CHANGE_ADD):
+            continue
+        peer = _peer_from_proto(change.add)
+        if peer is not None:
+            peers[peer.hash] = peer
+            added += 1
+
+    return added
 
 
 def _peer_from_proto(peer: cf.CuttlefishPeer) -> Peer | None:
@@ -353,7 +390,7 @@ def check_peer_identifiers(directory: PeerDirectory) -> IdentifierCheck:
 async def fetch_peer_directory(
     client: AsyncCloudKitClient,
     *,
-    sync_token: bytes | None = None,
+    sync_token: str | None = None,
     max_pages: int = MAX_PAGES,
 ) -> PeerDirectory:
     """
@@ -386,18 +423,8 @@ async def fetch_peer_directory(
             token = None
             continue
 
-        changes = response.changes.change
-        added = 0
-        for change in changes:
-            # Anything that is not an `add` is another kind of change, not a peer and not
-            # a problem. Skipping quietly is the correct handling of both -- a change at
-            # a field this does not know parses into the unknown set and lands here.
-            if not change.HasField(CHANGE_ADD):
-                continue
-            peer = _peer_from_proto(change.add)
-            if peer is not None:
-                peers[peer.hash] = peer
-                added += 1
+        changes = response.changes.changes
+        added = apply_changes(peers, response.changes)
 
         if response.changes.HasField("sync_token"):
             token = response.changes.sync_token
@@ -430,7 +457,7 @@ async def fetch_peer_directory(
 
 async def _fetch_page(
     client: AsyncCloudKitClient,
-    token: bytes | None,
+    token: str | None,
 ) -> cf.FetchChangesResponse:
     """Ask for one page of the trust circle's changes."""
     request = cf.FetchChangesRequest()
