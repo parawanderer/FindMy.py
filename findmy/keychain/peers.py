@@ -96,11 +96,16 @@ def peer_identifier(permanent_info: bytes, signature: bytes) -> str:
     concatenated with its signature -- the payload bytes then the signature bytes, in that
     order, with nothing between them.
 
-    **This is what makes joining checkable before it is irreversible.** A voucher names its
-    beneficiary by this identifier, and a wrong one produces a voucher for a peer that does
-    not exist -- a failure that lands *after* `joinWithVoucher`, the one call in this
-    project that cannot be taken back. :func:`check_peer_identifiers` recomputes it for
-    every peer already in the circle, which settles the derivation while still read-only.
+    **[observed] Confirmed: this reproduces all 13 peers of a real trust circle.** That is
+    a stronger result than most confirmations in this project, because the oracle is an
+    exact SHA-256 match -- thirteen accidental digest collisions is not a thing that
+    happens, so one run settles the construction outright.
+
+    It is also why the check exists. A voucher names its beneficiary by this identifier,
+    derived for an identity that does not exist yet, so nothing about a join can validate
+    it: a wrong derivation surfaces *after* `joinWithVoucher`, the one call in this project
+    that cannot be taken back. Every peer already in the circle was named by the same rule,
+    so :func:`check_peer_identifiers` settles it while still read-only.
 
     :param permanent_info: The serialised `PeerPermanentInfo`, **as it arrived**. Not a
         re-encoding of a parsed one: protobuf does not promise those are the same bytes.
