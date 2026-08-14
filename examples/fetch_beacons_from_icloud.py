@@ -120,27 +120,29 @@ async def report_recovery_options(session: AsyncKeychainSession) -> None:
     holds the human-readable metadata, and the trust-circle service knows which bottles
     are actually usable. Both are read-only.
 
-    Worth looking at even though nothing here acts on it. Escrow records outlive the
-    devices that made them and Apple exposes them in no interface at all, so an account
-    can accumulate them invisibly -- this is the only way to see what is there.
+    Only the recoverable ones are listed. This probe's use for a record is the keys it
+    yields, and one that cannot be recovered from yields none -- the rest are counted so
+    that an account quietly accumulating them still says so. `delete_escrow_records.py`
+    lists them in full, because there they are the subject rather than the preamble.
     """
     print("\n--- What this account could be recovered from ---")
 
     options = await session.recovery_options()
 
-    total = len(options.recoverable) + len(options.described_but_not_viable)
-    print(f"{total} record(s) across {options.device_count} device(s); {options.describe()}")
+    for record in options.recoverable:
+        print(f"  {record.describe()}")
 
-    for kind, records in (
-        ("recoverable", options.recoverable),
-        ("not viable ", options.described_but_not_viable),
-    ):
-        for record in records:
-            suffix = " [companion]" if record.is_companion else ""
-            print(f"  {kind}: {record.describe()}{suffix}")
+    # The rest cannot yield keys, and this probe's only use for a record is its keys. They
+    # are worth a count rather than a list: an account accumulates them invisibly -- Apple
+    # exposes them in no interface -- so their number is the interesting part, and
+    # delete_escrow_records.py is where anything is done about it.
+    stale = len(options.described_but_not_viable) + len(options.viable_but_undescribed)
+    if stale:
+        print(f"  ({stale} more that cannot be recovered from; see delete_escrow_records.py)")
 
-    for bottle_id in options.viable_but_undescribed:
-        print(f"  undescribed: {bottle_id}")
+    if not options.viability_is_trustworthy:
+        print("  Nothing was reported viable, which reads as a service having a bad day")
+        print("  rather than an account with no usable bottle. Worth trying again later.")
 
 
 async def keys_to_decrypt_with(account) -> list[ec.EllipticCurvePrivateKey]:  # noqa: ANN001
