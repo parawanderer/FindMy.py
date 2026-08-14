@@ -711,11 +711,17 @@ def test_the_halves_must_check_each_other_before_a_compound_key_is_accepted() ->
     assert scalar_in(wrong + raw) is None
 
 
-def test_a_bare_scalar_is_still_taken_as_one() -> None:
+def test_a_bare_scalar_is_taken_but_marked_unverified() -> None:
+    # Nothing checks a length match, so it must not be presented as equivalent to a
+    # compound blob whose halves agree.
     from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
 
     raw = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
-    assert scalar_in(raw.to_bytes(32, "big")) == raw.to_bytes(32, "big")
+    candidate = scalar_in(raw.to_bytes(32, "big"))
+
+    assert candidate is not None
+    assert candidate.scalar == raw.to_bytes(32, "big")
+    assert candidate.verified is False
 
 
 def test_a_failure_describes_the_payload_nested_not_only_at_the_top() -> None:
@@ -728,3 +734,52 @@ def test_a_failure_describes_the_payload_nested_not_only_at_the_top() -> None:
 
     assert "1:bytes" in described
     assert "{" in described  # the nested member is described inline
+
+
+def test_a_verified_candidate_outranks_one_that_only_matched_by_length() -> None:
+    # This is what went wrong: a member with a scalar's length was taken ahead of a blob
+    # whose halves actually agreed, and the unchecked guess won because it came first.
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.servicekey import service_keys_from_der  # noqa: PLC0415
+
+    real = ec.generate_private_key(ec.SECP256R1())
+    scalar = real.private_numbers().private_value.to_bytes(32, "big")
+    point = real.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+
+    keys = cf.PcsServiceKeys()
+    # An impostor of exactly a scalar's length, placed first.
+    keys.encryption_key.key = b"\x11" * 32
+    keys.signing_key.key = point + scalar
+
+    payload = der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
+
+    assert service_keys_from_der(payload).encryption_key.private_numbers().private_value == (
+        real.private_numbers().private_value
+    )
+
+
+def test_a_candidate_that_will_not_derive_is_skipped_rather_than_fatal() -> None:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.servicekey import service_keys_from_der  # noqa: PLC0415
+
+    real = ec.generate_private_key(ec.SECP256R1())
+    scalar = real.private_numbers().private_value.to_bytes(32, "big")
+    point = real.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+
+    keys = cf.PcsServiceKeys()
+    keys.encryption_key.key = bytes(32)  # zero is not a valid scalar
+    keys.signing_key.key = point + scalar
+
+    payload = der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
+
+    assert service_keys_from_der(payload).encryption_key.private_numbers().private_value == (
+        real.private_numbers().private_value
+    )
+
+
+def test_p521_is_not_a_length_this_matches() -> None:
+    # A 66-byte member is not a key here, and treating it as one is how this failed. No
+    # part of this protocol uses P-521, so the length must not be recognised at all.
+    from findmy.keychain.servicekey import scalar_in  # noqa: PLC0415
+
+    assert scalar_in(bytes(range(66))) is None

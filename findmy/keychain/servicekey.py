@@ -33,13 +33,16 @@ PRIVATE_KEY_V2_TAG = 5
 # The Find My service's PCS type, for checking an item is the one expected.
 FIND_MY_PCS_SERVICE = 82
 
-# A private scalar's length says which curve it belongs to. PCS is P-256 throughout, but
-# reading the length rather than assuming it means a P-384 key is recognised rather than
-# rejected as malformed.
+# A private scalar's length says which curve it belongs to.
+#
+# **P-521 is deliberately absent.** Nothing in this protocol uses it -- PCS is P-256
+# throughout (Stage 5 §5) and peer keys are P-384 (§6.7.0) -- and including it made a
+# 66-byte member of the payload match by length alone and be taken as a key it is not.
+# A speculative entry here is not free: length matching has nothing to check it against,
+# so every extra length is a way to be confidently wrong.
 _CURVES_BY_SCALAR_LENGTH = {
     32: ec.SECP256R1,
     48: ec.SECP384R1,
-    66: ec.SECP521R1,
 }
 
 
@@ -96,25 +99,39 @@ def private_key_from_scalar(scalar: bytes) -> ec.EllipticCurvePrivateKey:
         raise ServiceKeyError(msg) from None
 
 
-def scalar_in(blob: bytes) -> bytes | None:
+@dataclass(frozen=True)
+class ScalarCandidate:
+    """A possible private scalar, and whether anything actually confirmed it."""
+
+    scalar: bytes
+
+    verified: bool
+    """
+    Whether the blob carried a public point that this scalar reproduces.
+
+    The distinction matters more than it looks. A **verified** candidate cannot be wrong:
+    deriving its public key reproduced the leading bytes exactly. An unverified one matched
+    on **length alone**, which is a guess with nothing checking it -- and taking one of
+    those in preference to a verified one is how a 66-byte member became a P-521 key.
+    """
+
+
+def scalar_in(blob: bytes) -> ScalarCandidate | None:
     """
     Read a private scalar out of a key blob, whatever it is carried alongside.
 
     A "compressed private key" is not always a bare scalar. §6.7.0's peer keys are a
     public point followed by their scalar, and the same layout appears here -- so a blob
-    is taken as a scalar if its length says so, and otherwise its **trailing** scalar-sized
-    run is tried against whatever precedes it.
+    is tried as a point followed by its **trailing** scalar-sized run, and taken as a bare
+    scalar only if nothing else fits.
 
-    That check is self-verifying and free: deriving the public key from the candidate
-    scalar must reproduce the leading bytes exactly, in one of the two point encodings. So
-    a wrong reading is not merely unlikely, it is impossible rather than plausible -- which
-    is what makes trying this better than guessing at a layout.
+    The compound reading is self-verifying and free: deriving the public key from the
+    candidate must reproduce the leading bytes exactly, in one of the two point encodings.
+    That reading cannot be wrong. The bare-length reading can, so it is reported as
+    unverified rather than treated as equivalent.
 
-    :returns: The scalar, or None if the blob holds none.
+    :returns: The candidate, or None if the blob holds no plausible scalar.
     """
-    if len(blob) in _CURVES_BY_SCALAR_LENGTH:
-        return blob
-
     for length, curve in _CURVES_BY_SCALAR_LENGTH.items():
         if len(blob) <= length:
             continue
@@ -136,43 +153,78 @@ def scalar_in(blob: bytes) -> bytes | None:
                 len(blob),
                 length,
             )
-            return scalar
+            return ScalarCandidate(scalar=scalar, verified=True)
+
+    if len(blob) in _CURVES_BY_SCALAR_LENGTH:
+        return ScalarCandidate(scalar=blob, verified=False)
 
     return None
 
 
-def _scalars_in(payload: bytes) -> list[bytes]:
+def _candidates_in(payload: bytes) -> list[ScalarCandidate]:
     """
-    Pull the private scalars out of the v2 payload, in the order they appear.
+    Collect every plausible private scalar in the v2 payload, in wire order.
 
     The payload is a protobuf carrying an encryption key and a signing key, each with its
     key bytes and an optional DER public structure -- but **the field numbers are not
-    specified**. So rather than trusting a guess, this walks the wire in order and takes
-    the first length-delimited member of each submessage that yields a scalar.
+    specified**, so this walks the wire rather than trusting a guess.
 
-    Order is the discriminator, as the specification gives it: encryption key first.
+    Everything plausible is collected rather than the first match taken, because a member
+    that merely has a scalar's length may not be a key at all, and the reader cannot tell
+    until it has seen what else is on offer.
     """
-    scalars: list[bytes] = []
+    found: list[ScalarCandidate] = []
+
+    def consider(blob: bytes) -> bool:
+        candidate = scalar_in(blob)
+        if candidate is None:
+            return False
+        found.append(candidate)
+        return True
 
     for _, wire, member in iter_wire_fields(payload):
         if wire != 2 or not member:
             continue
 
         # A member may be the key blob itself, or a message wrapping one.
-        found = scalar_in(member)
-        if found is not None:
-            scalars.append(found)
+        if consider(member):
             continue
 
         for _, inner_wire, inner in iter_wire_fields(member):
-            if inner_wire != 2 or not inner:
-                continue
-            found = scalar_in(inner)
-            if found is not None:
-                scalars.append(found)
+            if inner_wire == 2 and inner and consider(inner):
                 break
 
-    return scalars
+    return found
+
+
+def _keys_from_candidates(
+    candidates: list[ScalarCandidate],
+) -> list[ec.EllipticCurvePrivateKey]:
+    """
+    Turn candidates into keys, confirmed ones first.
+
+    Order matters: the specification gives the encryption key first, so wire order is
+    preserved *within* each group rather than discarded. But a verified candidate outranks
+    an unverified one whatever their order, because one of them cannot be wrong and the
+    other is a length coincidence away from being exactly that.
+
+    A candidate that will not derive is skipped rather than raised on -- with several on
+    offer, one bad one is not a reason to fail.
+    """
+    ranked = [c for c in candidates if c.verified]
+    ranked += [c for c in candidates if not c.verified]
+
+    keys = [_derived(candidate) for candidate in ranked]
+    return [key for key in keys if key is not None]
+
+
+def _derived(candidate: ScalarCandidate) -> ec.EllipticCurvePrivateKey | None:
+    """Derive a key from a candidate, or None if it will not derive."""
+    try:
+        return private_key_from_scalar(candidate.scalar)
+    except ServiceKeyError as e:
+        logger.debug("Skipping a %d-byte candidate: %s", len(candidate.scalar), e)
+        return None
 
 
 def service_keys_from_der(payload: bytes) -> ServiceKeys:
@@ -255,30 +307,37 @@ def _from_v2(element: der.DerElement) -> ServiceKeys:
         keys = cf.PcsServiceKeys()
 
     declared = [scalar_in(blob) for blob in (keys.encryption_key.key, keys.signing_key.key)]
-    scalars = [s for s in declared if s is not None]
+    candidates = [c for c in declared if c is not None]
 
-    if not scalars:
-        scalars = _scalars_in(payload)
-        if scalars:
+    # Fall back to the wire when the assumed field numbers find nothing, and also when
+    # what they found is unverified -- a length match is a guess, and the wire may hold a
+    # blob that proves itself. Preferring an unchecked match over a checked one because it
+    # came from the expected field is exactly the mistake this ranking exists to prevent.
+    if not any(c.verified for c in candidates):
+        positional = _candidates_in(payload)
+        if positional:
             logger.debug(
-                "The v2 payload's key field numbers differ from the assumed ones; read"
-                " %d scalar(s) positionally instead",
-                len(scalars),
+                "Read %d scalar candidate(s) positionally from the v2 payload (%d verified)",
+                len(positional),
+                sum(c.verified for c in positional),
             )
+            candidates = positional or candidates
 
-    if not scalars:
+    usable = _keys_from_candidates(candidates)
+
+    if not usable:
         msg = (
             f"A v2 private key structure's {len(payload)}-byte payload carries no usable"
-            " private key. A key blob is taken as a scalar by its length, or as a point"
-            " followed by its scalar when the two check each other, and neither was found."
+            " private key. A key blob is taken as a point followed by its scalar when the"
+            " two check each other, or as a bare scalar by its length, and neither held."
             f" Its wire structure is: {describe_wire(payload)}"
         )
         raise ServiceKeyError(msg)
 
-    encryption = private_key_from_scalar(scalars[0])
-    signing = private_key_from_scalar(scalars[1]) if len(scalars) > 1 else None
-
-    return ServiceKeys(encryption_key=encryption, signing_key=signing)
+    return ServiceKeys(
+        encryption_key=usable[0],
+        signing_key=usable[1] if len(usable) > 1 else None,
+    )
 
 
 def _from_v1(element: der.DerElement) -> ServiceKeys:
