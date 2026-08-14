@@ -178,6 +178,33 @@ def iter_elements(data: bytes) -> Iterator[DerElement]:
         yield element
 
 
+def describe(element: DerElement, depth: int = 2) -> str:
+    """
+    Describe an element's shape by tag, for a structure that parsed but held nothing.
+
+    A DER structure that decodes cleanly and yields no members is the hardest kind to
+    diagnose from a failure message, because nothing is wrong -- the reader is simply
+    looking in the wrong place. Naming the tags that actually arrived says where to look.
+    """
+    classes = {CLASS_UNIVERSAL: "", CLASS_APPLICATION: "APP ", CLASS_CONTEXT: "["}
+    prefix = classes.get(element.tag_class, "?")
+    suffix = "]" if element.tag_class == CLASS_CONTEXT else ""
+    label = f"{prefix}{element.tag_number}{suffix}"
+
+    if not element.constructed:
+        return f"{label}({len(element.content)}B)"
+
+    if depth <= 0:
+        return f"{label}{{…}}"
+
+    try:
+        inner = ", ".join(describe(child, depth - 1) for child in element.children())
+    except DerError:
+        return f"{label}{{<unparseable>}}"
+
+    return f"{label}{{{inner}}}"
+
+
 def expect_application(data: bytes, tag_number: int) -> DerElement:
     """
     Parse an `[APPLICATION n] EXPLICIT` wrapper and return what is inside it.

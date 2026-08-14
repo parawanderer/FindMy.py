@@ -1079,3 +1079,49 @@ def test_a_zone_carrying_no_elliptic_curve_keys_says_so() -> None:
 
     with pytest.raises(PCSError, match="no elliptic-curve keys"):
         unwrap_zone(zone_der, [service_key])
+
+
+def test_a_meta_that_holds_neither_member_names_its_tags(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # It decoded and held nothing, which means the reader is looking in the wrong place
+    # rather than anything being malformed. That is the hardest failure to diagnose from a
+    # message, and naming the tags is what settles it.
+    import logging  # noqa: PLC0415
+
+    from findmy.cloudkit.pcs import parse_meta  # noqa: PLC0415
+
+    # A SEQUENCE holding [7] rather than [0] or [2].
+    plaintext = bytes([0x30, 0x04, 0xA7, 0x02, 0x04, 0x00])
+
+    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.pcs"):
+        contents = parse_meta(plaintext)
+
+    assert not contents.symmetric_keys
+    assert not contents.private_keys
+    assert "[7]" in caplog.text
+
+
+def test_a_meta_wrapped_in_an_application_tag_is_still_read() -> None:
+    # Every other structure here is application-tagged, so looking through one costs
+    # nothing and a wrapper that is not there is simply not found.
+    from findmy.cloudkit.pcs import parse_meta  # noqa: PLC0415
+
+    master = bytes(range(16))
+    inner = build_meta(master, symm_keys=[bytes(range(16, 32))])
+
+    from findmy.cloudkit.pcs import read_meta  # noqa: PLC0415
+
+    assert read_meta(inner, master).symmetric_keys == [bytes(range(16, 32))]
+    assert parse_meta(bytes([0x30, 0x00])).symmetric_keys == []
+
+
+def test_the_der_describer_names_nested_tags() -> None:
+    from findmy.cloudkit import der  # noqa: PLC0415
+
+    element, _ = der.parse_one(bytes([0x30, 0x06, 0xA0, 0x04, 0x31, 0x02, 0x04, 0x00]))
+
+    described = der.describe(element)
+
+    assert "[0]" in described
+    assert "16" in described  # the SEQUENCE's own universal tag

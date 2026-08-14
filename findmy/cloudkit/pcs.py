@@ -24,6 +24,7 @@ point at its own cause:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import logging
@@ -1048,6 +1049,13 @@ def parse_meta(plaintext: bytes) -> MetaContents:
     """
     element, _ = der.parse_one(plaintext)
 
+    # Every other structure in this protocol is wrapped in an application tag, so descend
+    # through one rather than requiring the members to be at the top. A wrapper that is
+    # not there costs nothing to look for.
+    if element.tag_class == der.CLASS_APPLICATION and element.constructed:
+        with contextlib.suppress(der.DerError):
+            element = element.unwrap()
+
     symmetric: list[bytes] = []
     private: list[ec.EllipticCurvePrivateKey] = []
 
@@ -1057,6 +1065,15 @@ def parse_meta(plaintext: bytes) -> MetaContents:
         elif child.is_context(_META_IDENTITIES):
             for identity in child.unwrap().children():
                 private.extend(_identity_keys(identity))
+
+    if not symmetric and not private:
+        # It decoded and held neither member, which means the reader is looking in the
+        # wrong place rather than anything being malformed -- the hardest failure to
+        # diagnose from a message, and the one where naming the tags settles it.
+        logger.warning(
+            "A decrypted meta carries neither symmKeys nor identities. Its shape is: %s",
+            der.describe(element),
+        )
 
     logger.debug(
         "meta holds %d symmetric key(s) and %d private key(s)",
