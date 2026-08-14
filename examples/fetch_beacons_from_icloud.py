@@ -185,26 +185,31 @@ def report_key_sources(records, *, keychain_keys, zone_keys) -> None:  # noqa: A
     among the *keychain* keys distinguishes them for free: if it is, the level is wrong
     again; if it is in neither set, no amount of reading either better would have found it.
     """
-    wanted = next((r for r in records if r.protection_info and r.record_type), None)
-    if wanted is None:
+    named: dict[bytes, set[str]] = {}
+    for record in records:
+        if not record.protection_info:
+            continue
+        try:
+            protection = ShareProtection.from_der(record.protection_info)
+        except Exception:  # noqa: BLE001, S112 -- a probe reporting, not a library deciding
+            continue
+        for entry in protection.keys:
+            named.setdefault(entry.public_key, set()).add(record.record_type or "<untyped>")
+
+    if not named:
         return
 
-    try:
-        protection = ShareProtection.from_der(wanted.protection_info)
-    except Exception as e:  # noqa: BLE001 -- a probe reporting, not a library deciding
-        print(f"  (could not read a record's protection structure: {e})")
-        return
+    ours = {bare_x(k.public_key()) for k in keychain_keys}
+    theirs = {bare_x(k.public_key()) for k in zone_keys}
 
-    named = {entry.public_key for entry in protection.keys}
-    in_keychain = any(bare_x(k.public_key()) in named for k in keychain_keys)
-    in_zone = any(bare_x(k.public_key()) in named for k in zone_keys)
+    print(f"\n  {len(records)} record(s) name {len(named)} distinct key(s):")
+    for key, types in sorted(named.items(), key=lambda item: item[0]):
+        where = "keychain" if key in ours else "zone" if key in theirs else "neither"
+        print(f"    {key[:8].hex()} -> {where}   ({', '.join(sorted(types))})")
 
-    print(f"\n  A {wanted.record_type} names {len(named)} key(s):")
-    print(f"    among the {len(keychain_keys)} keychain keys: {in_keychain}")
-    print(f"    among the {len(zone_keys)} zone keys:     {in_zone}")
-
-    if not in_keychain and not in_zone:
-        print("    So it is in neither set, and reading either better would not find it.")
+    if not (set(named) & (ours | theirs)):
+        print(f"    None is among the {len(ours)} keychain or {len(theirs)} zone keys, so")
+        print("    reading either source better would not have found it.")
 
 
 async def main() -> int:  # noqa: C901, PLR0912, PLR0915 -- a probe; linear reads better
