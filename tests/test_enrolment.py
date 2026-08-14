@@ -28,6 +28,7 @@ from findmy.keychain.enrolment import (
     build_escrow_blob,
     build_inner_message,
     build_metadata,
+    build_record,
     escrow_timestamp,
     record_label,
     seal_to_club,
@@ -42,7 +43,7 @@ LABEL = f"com.apple.icdp.record.{PEER_ID}"
 PASSCODE = "123456"
 NOW = datetime(2026, 1, 1, 12, 30, 45, tzinfo=timezone.utc)
 
-RECORD = plistlib.dumps({"BottledPeerEntropy": b"\x07" * 72})
+RECORD = build_record("2026-01-01 12:30:45", b"\x07" * 72)
 
 
 # --------------------------------------------------------------------------------------
@@ -275,19 +276,45 @@ def test_a_record_is_refused_under_an_empty_passcode() -> None:
         )
 
 
-def test_escrowing_material_with_no_entropy_is_reported(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with caplog.at_level("WARNING"):
+@pytest.mark.parametrize(
+    "material",
+    [plistlib.dumps({"something": "else"}), b"not a plist at all"],
+    ids=["a plist with no entropy", "not a plist"],
+)
+def test_escrowing_material_with_no_entropy_is_refused(material: bytes) -> None:
+    # Refused rather than warned about: a record with no entropy recovers *successfully*
+    # and yields nothing, and the proxy reports it as usable for as long as the account
+    # exists. That is worse than a failed enrolment, and nothing corrects it afterwards.
+    with pytest.raises(EnrolmentError, match="BottledPeerEntropy"):
         build_inner_message(
             dsid=DSID,
             label=LABEL,
             timestamp=escrow_timestamp(NOW),
             password=PASSCODE,
-            record=plistlib.dumps({"something": "else"}),
+            record=material,
         )
 
-    assert "BottledPeerEntropy" in caplog.text
+
+def test_the_record_is_three_keys_and_the_entropy_is_fresh() -> None:
+    fields = plistlib.loads(build_record("2026-01-01 12:30:45"))
+
+    assert sorted(fields) == [
+        "BackupVersion",
+        "BottledPeerEntropy",
+        "com.apple.securebackup.timestamp",
+    ]
+    assert len(fields["BottledPeerEntropy"]) == 72
+    assert fields["BackupVersion"] == "1"
+    assert fields["com.apple.securebackup.timestamp"] == "2026-01-01 12:30:45"
+
+    # Generated, not derived: two records built the same way share nothing.
+    other = plistlib.loads(build_record("2026-01-01 12:30:45"))
+    assert other["BottledPeerEntropy"] != fields["BottledPeerEntropy"]
+
+
+def test_entropy_of_the_wrong_length_is_refused() -> None:
+    with pytest.raises(EnrolmentError, match="72 bytes"):
+        build_record("2026-01-01 12:30:45", b"\x00" * 32)
 
 
 # --------------------------------------------------------------------------------------
@@ -444,7 +471,7 @@ def test_the_timestamp_has_a_space_and_no_zone() -> None:
     assert escrow_timestamp(NOW) == "2026-01-01 12:30:45"
 
 
-def test_one_timestamp_reaches_all_three_places() -> None:
+def test_one_timestamp_reaches_all_four_places() -> None:
     timestamp = escrow_timestamp(NOW)
     inner = build_inner_message(
         dsid=DSID,
@@ -466,8 +493,9 @@ def test_one_timestamp_reaches_all_three_places() -> None:
     )
 
     assert sections[5].decode() == timestamp
-    assert metadata["timestamp"] == timestamp
-    assert metadata["clientMetadata"]["SecureBackupMetadataTimestamp"] == timestamp
+    assert plistlib.loads(RECORD)["com.apple.securebackup.timestamp"] == timestamp
+    assert metadata["com.apple.securebackup.timestamp"] == timestamp
+    assert metadata["ClientMetadata"]["SecureBackupMetadataTimestamp"] == timestamp
 
 
 def _device() -> DeviceDescription:
@@ -507,6 +535,33 @@ def test_the_metadata_is_a_binary_plist_the_listing_can_describe() -> None:
     assert record.peer_id == PEER_ID
 
 
+def test_the_metadata_keys_are_the_irregular_spellings_and_not_the_tidy_ones() -> None:
+    # Three of these were once written as an implementation's internal field names, and a
+    # record under those spellings is one §5.1's listing cannot describe. None of the six
+    # is derivable from its neighbours -- camelCase, reverse-DNS, PascalCase and a
+    # lower-case `i` in `iCSCs`, all in one dictionary -- so they are checked literally.
+    metadata = plistlib.loads(
+        build_metadata(
+            _device(),
+            timestamp=escrow_timestamp(NOW),
+            bottle_id="4A1E5B9C-0000-4000-8000-000000000000",
+            escrowed_spki=b"\x04" * 65,
+            password=PASSCODE,
+        ),
+    )
+
+    assert sorted(metadata) == [
+        "ClientMetadata",
+        "SecureBackupUsesMultipleiCSCs",
+        "bottleID",
+        "build",
+        "com.apple.securebackup.timestamp",
+        "escrowedSPKI",
+        "passcodeGeneration",
+        "serial",
+    ]
+
+
 @pytest.mark.parametrize(
     ("password", "numeric", "length"),
     [("123456", True, 6), ("hunter2", False, 0), ("0000", True, 4)],
@@ -525,7 +580,7 @@ def test_the_passphrase_shape_is_described_honestly(
             password=password,
         ),
     )
-    client = metadata["clientMetadata"]
+    client = metadata["ClientMetadata"]
 
     assert client["SecureBackupUsesNumericPassphrase"] is numeric
     assert client["SecureBackupNumericPassphraseLength"] == length

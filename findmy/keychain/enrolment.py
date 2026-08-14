@@ -354,30 +354,49 @@ TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 """
 A space rather than a `T`, and no zone.
 
-The same string goes in three places -- the blob's sixth section, the metadata's
-`timestamp`, and its `SecureBackupMetadataTimestamp` -- which is why it is computed once
-and passed around rather than formatted at each site.
+The same string goes in **four** places -- the blob's sixth section, the record's
+`com.apple.securebackup.timestamp`, the metadata's, and the metadata's nested
+`SecureBackupMetadataTimestamp` -- which is why it is computed once and passed around
+rather than formatted at each site.
 """
 
 SRP_MODULUS_BYTES = 256
 """
 The width the SRP verifier is padded to.
 
-**[unverified]** §4.5.1 does not say how the verifier is encoded, and the natural
-big-endian encoding of an integer is one byte shorter about one time in 256. Apple's own
-values are padded to the group size -- the server's `B` arrives as exactly 256 bytes -- so
-that is what is done here. The consequence of guessing wrong is not a failure now: it is a
-record that enrols fine and fails to recover later, for one user in 256, in a way
-indistinguishable from a wrong passcode.
+§4.5.1 does not say how the verifier is encoded, and the natural big-endian encoding of an
+integer is one byte shorter about one time in 256. Padding is right under both readings of
+what the service does with the section: if it reads by the section's length prefix and
+converts to an integer, leading zeros change nothing; if it reads a fixed 256-byte field,
+an unpadded value is misparsed. Omitting the padding is wrong under the second.
+
+Getting it wrong would not fail now. It would enrol fine and fail to recover later, for one
+user in 256, in a way indistinguishable from a wrong passcode.
 """
 
 ENTROPY_FIELD = "BottledPeerEntropy"
-"""The field a recovered record must carry for anything downstream to be able to use it."""
+"""The field the whole record exists to carry. §6.7's recovery reads exactly this back."""
+
+ENTROPY_LENGTH = 72
+"""How much randomness a bottle's keys are derived from."""
+
+TIMESTAMP_FIELD = "com.apple.securebackup.timestamp"
+"""
+Reverse-DNS, in a three-key dictionary whose other keys are PascalCase.
+
+None of the key names in an escrow record's structures is derivable from its neighbours --
+`ClientMetadata`, `SecureBackupUsesMultipleiCSCs` and this one sit beside ordinary
+camelCase in the same plist -- so every one of them is copied exactly rather than spelled
+by convention.
+"""
+
+BACKUP_VERSION = "1"
+"""The string `1`, not the integer."""
 
 
 def escrow_timestamp(when: datetime | None = None) -> str:
     """
-    Format the one timestamp an enrolment uses, in all three of the places it appears.
+    Format the one timestamp an enrolment uses, in all four of the places it appears.
 
     :param when: Defaults to now, in UTC.
     """
@@ -431,10 +450,8 @@ def build_inner_message(  # noqa: PLR0913 -- the six inputs the inner message fr
     :param label: This record's full label, from :func:`record_label`.
     :param timestamp: From :func:`escrow_timestamp`. The same value the metadata carries.
     :param password: The passcode the record will be recoverable with. Not retained.
-    :param record: The material to escrow. §4.5 does not say what it must contain;
-        **[observed]** what recovery expects is a property list carrying
-        :data:`ENTROPY_FIELD`, and a record without it recovers successfully and yields
-        nothing usable -- so this warns rather than accepting silently.
+    :param record: The material to escrow, from :func:`build_record`. §4.5.3 says what it
+        must be, and a record that is not that is refused -- see :func:`require_usable`.
     :param salt: The 64-byte salt. Generated if not supplied; a parameter so that a test
         can produce the same bytes twice.
     """
@@ -442,7 +459,7 @@ def build_inner_message(  # noqa: PLR0913 -- the six inputs the inner message fr
         msg = "A record enrolled under an empty passcode could be recovered by anyone"
         raise EnrolmentError(msg)
 
-    _warn_if_record_is_unusable(record)
+    require_usable(record)
 
     salt = salt if salt is not None else secrets.token_bytes(SALT_LENGTH)
     if len(salt) != SALT_LENGTH:
@@ -478,21 +495,58 @@ def build_inner_message(  # noqa: PLR0913 -- the six inputs the inner message fr
     )
 
 
-def _warn_if_record_is_unusable(record: bytes) -> None:
-    """Say so if the material being escrowed is not what a recovery would look for."""
+def build_record(timestamp: str, entropy: bytes | None = None) -> bytes:
+    """
+    Build §4.5.3's record: the three-key plist that is what an escrow record is *for*.
+
+    The entropy is **generated, not derived**. It is fresh randomness that exists nowhere
+    else, everything the bottle later yields comes from it, and enrolling is what makes it
+    recoverable at all -- so a caller keeps whatever this generated, or supplies its own.
+
+    :param timestamp: From :func:`escrow_timestamp`. The same string the blob and the
+        metadata carry.
+    :param entropy: 72 bytes. Generated if not supplied.
+    """
+    material = entropy if entropy is not None else secrets.token_bytes(ENTROPY_LENGTH)
+    if len(material) != ENTROPY_LENGTH:
+        msg = f"A bottle's entropy is {ENTROPY_LENGTH} bytes, not {len(material)}"
+        raise EnrolmentError(msg)
+
+    return plistlib.dumps(
+        {
+            ENTROPY_FIELD: material,
+            TIMESTAMP_FIELD: timestamp,
+            "BackupVersion": BACKUP_VERSION,
+        },
+        fmt=plistlib.FMT_BINARY,
+    )
+
+
+def require_usable(record: bytes) -> None:
+    """
+    Refuse to escrow material a recovery would find nothing in.
+
+    **A record with no entropy is worse than a failed enrolment**, which is why this
+    refuses rather than warning: it recovers *successfully*, yields nothing, and the escrow
+    proxy goes on reporting it as a usable record for as long as the account exists.
+    Nothing corrects an escrow record afterwards -- it can only be deleted and replaced.
+
+    :raises EnrolmentError: If the record is not a property list carrying
+        :data:`ENTROPY_FIELD`.
+    """
     try:
         fields = plistlib.loads(record)
     except (plistlib.InvalidFileException, ValueError, EOFError):
-        logger.debug("The material being escrowed is not a property list; enrolling it as-is")
-        return
+        fields = None
 
-    if isinstance(fields, dict) and ENTROPY_FIELD not in fields:
-        logger.warning(
-            "The material being escrowed carries no %s, so recovering this record would"
-            " succeed and yield nothing usable. An escrow record cannot be corrected"
-            " afterwards -- it can only be deleted and replaced.",
-            ENTROPY_FIELD,
+    if not isinstance(fields, dict) or ENTROPY_FIELD not in fields:
+        msg = (
+            f"The material being escrowed is not a property list carrying {ENTROPY_FIELD},"
+            " so recovering this record would succeed and yield nothing. Refusing:"
+            " the proxy would report it as usable for as long as the account exists."
+            " build_record() makes the right thing."
         )
+        raise EnrolmentError(msg)
 
 
 def seal_to_club(inner: bytes, certificate: x509.Certificate) -> bytes:
@@ -681,14 +735,18 @@ def build_metadata(
 
     return plistlib.dumps(
         {
+            # Three ordinary camelCase keys, a reverse-DNS one, a PascalCase one, and one
+            # with a lower-case `i` in `iCSCs`. None of them is derivable from its
+            # neighbours; they are copied exactly. See §4.5.2's correction, which is what
+            # settled these against an earlier set of internal-looking spellings.
             "serial": device.serial,
             "build": device.build,
-            "timestamp": timestamp,
             "bottleID": bottle_id,
             "passcodeGeneration": PASSCODE_GENERATION,
             "escrowedSPKI": escrowed_spki,
-            "multipleICSC": True,
-            "clientMetadata": client,
+            TIMESTAMP_FIELD: timestamp,
+            "ClientMetadata": client,
+            "SecureBackupUsesMultipleiCSCs": True,
         },
         fmt=plistlib.FMT_BINARY,
     )
@@ -752,7 +810,7 @@ async def enrol_record(  # noqa: PLR0913 -- everything an escrow record is made 
     peer_id: str,
     dsid: str,
     password: str,
-    record: bytes,
+    entropy: bytes,
     device: DeviceDescription,
     bottle_id: str,
     escrowed_spki: bytes,
@@ -774,7 +832,10 @@ async def enrol_record(  # noqa: PLR0913 -- everything an escrow record is made 
     :param dsid: The numeric account id -- also the SRP identity of a future recovery.
     :param password: The passcode this record will be recoverable with. Used inside this
         call and not retained; callers should hold it no longer.
-    :param record: The material to escrow. See :func:`build_inner_message`.
+    :param entropy: The bottle's 72 bytes. **The caller's, not generated here** -- the same
+        bytes have to seal the bottle that `joinWithVoucher` sends, and a record escrowing
+        different entropy from the bottle it accompanies recovers to a peer that does not
+        exist. :func:`build_record` generates a set for a caller that has none yet.
     :param bottle_id: The bottle's UUID.
     :param escrowed_spki: The escrowed signing public key.
     :param when: The moment to stamp. Defaults to now.
@@ -785,13 +846,15 @@ async def enrol_record(  # noqa: PLR0913 -- everything an escrow record is made 
 
     certificate = await fetch_club_certificate(proxy, roots, transaction_id, now=when)
 
+    # One timestamp, four places: the record, the blob's sixth section, and both of the
+    # metadata's. Built here rather than passed in so they cannot drift apart.
     timestamp = escrow_timestamp(when)
     blob = build_escrow_blob(
         dsid=dsid,
         label=label,
         timestamp=timestamp,
         password=password,
-        record=record,
+        record=build_record(timestamp, entropy),
         certificate=certificate,
     )
     metadata = build_metadata(
@@ -832,10 +895,12 @@ __all__ = [
     "build_escrow_blob",
     "build_inner_message",
     "build_metadata",
+    "build_record",
     "enrol_record",
     "escrow_timestamp",
     "fetch_club_certificate",
     "record_label",
+    "require_usable",
     "seal_to_club",
     "srp_verifier",
     "verify_club_certificate",

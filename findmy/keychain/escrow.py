@@ -438,12 +438,12 @@ def _parse_metadata(label: str, encoded: bytes | str) -> EscrowRecord:
     raw = base64.b64decode(encoded) if isinstance(encoded, str) else encoded
     metadata: dict[str, Any] = plistlib.loads(raw)
 
-    # Two spellings, because the reading and writing halves of the specification disagree:
-    # §5.1 observed `ClientMetadata` and `com.apple.securebackup.timestamp` on real
-    # records, while §4.5.2 writes `clientMetadata` and `timestamp`. Since the service
-    # stores this plist verbatim and hands it back, a record enrolled by this library would
-    # otherwise be one this reader could not describe -- so the reader is tolerant and the
-    # writer follows §4.5.2 exactly. See GAPS S1.
+    # Two spellings each, because §4.5.2 once described these keys by an implementation's
+    # internal field names -- `clientMetadata` and `timestamp` -- and was corrected to the
+    # reverse-DNS and PascalCase forms §5.1 observed on real records. Records written by
+    # anything that followed the earlier text still exist, and a record this reader cannot
+    # describe is a record nobody can safely delete, so it stays tolerant. The writer sends
+    # only the correct spellings.
     client = metadata.get("ClientMetadata") or metadata.get("clientMetadata") or {}
     escrowed_at = metadata.get("com.apple.securebackup.timestamp") or metadata.get("timestamp")
     if isinstance(escrowed_at, str):
@@ -643,12 +643,11 @@ class AsyncEscrowProxy(Closable):
                 logger.warning("Could not decode escrow metadata for %s", label or "<unlabelled>")
                 unreadable.append(label)
 
-        # Which spelling real records use, both ways round. §4.5.2 writes `clientMetadata`
-        # and `timestamp`; §5.1 observed `ClientMetadata` and
-        # `com.apple.securebackup.timestamp` on records Apple's own clients wrote. The
-        # service stores this plist verbatim, so a listing settles which is which -- and
-        # reporting only the spellings that appeared would leave the absent case silent,
-        # hence the counts.
+        # Which spelling real records use, both ways round. This is what settled §4.5.2's
+        # key names against §5.1's: the service stores the plist verbatim, so a listing is
+        # direct evidence of what a working client writes. Kept because it costs one line
+        # and would catch the same drift again -- and it counts the absent spellings too,
+        # since a diagnostic that only reports what it found leaves the absent case silent.
         if records:
             logger.debug(
                 "Metadata key spellings in this listing: %s",
@@ -797,11 +796,9 @@ class AsyncEscrowProxy(Closable):
                 "blobDigest": blob_digest,
                 "metadata": base64.b64encode(metadata).decode(),
                 "dsid": dsid,
-                # Not in §4.5's field table, which lists what is specific to `enroll`. Sent
-                # because the club handler is in play -- the blob is sealed to the club
-                # certificate -- and omitting these elsewhere leaves it with nothing to
-                # select and failing internally rather than saying what is missing.
-                **_cert_versions(),
+                # No certificate versions here, unlike every other club-handling command.
+                # They ask which roots the client will accept, and `get_club_cert` -- the
+                # first half of this same transaction -- already answered that.
             },
         )
 
