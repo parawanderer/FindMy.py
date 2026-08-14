@@ -38,6 +38,7 @@ import asyncio
 import getpass
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 
 from _login import get_account_async  # pyright: ignore [reportMissingImports]
 
@@ -182,6 +183,51 @@ async def unlock(reader: AsyncFindMyReader) -> bool:
     return True
 
 
+def scan_span(accessory) -> int:  # noqa: ANN001
+    """
+    How many key indices locating this accessory would search.
+
+    The same span `fetch_location` walks: the maximum index now, down to the minimum for
+    a week ago. An accessory carrying a key-alignment record spans a few hundred; one
+    without spans its whole history, because the lower bound collapses to its pairing
+    date. That number is the difference between a second and several minutes, so it is
+    worth showing before asking rather than explaining afterwards.
+    """
+    now = datetime.now(tz=timezone.utc)
+    return accessory.get_max_index(now) - accessory.get_min_index(now - timedelta(days=7))
+
+
+def choose_accessories(accessories: list) -> list:
+    """
+    Ask which accessories to locate.
+
+    Worth asking rather than always fetching all: an accessory the network has never seen
+    -- an iPad that was never really a tag, say -- costs a full-history search to learn
+    nothing, and that is the slowest thing in this script by a wide margin.
+    """
+    print("\nWhich to locate? Numbers separated by spaces, blank for all, or 'none'.\n")
+
+    for number, accessory in enumerate(accessories, start=1):
+        span = scan_span(accessory)
+        cost = f"~{span:,} indices" + (", a full-history search" if span > 5000 else "")
+        print(f"  {number}. {accessory.name or '<unnamed>'} ({accessory.model}) -- {cost}")
+
+    typed = input("\n> ").strip().lower()
+    if typed in ("none", "n", "skip"):
+        return []
+    if not typed:
+        return accessories
+
+    chosen = []
+    for part in typed.replace(",", " ").split():
+        if not part.isdigit() or not 1 <= int(part) <= len(accessories):
+            print(f"  Ignoring {part!r}: not one of the numbers above.")
+            continue
+        chosen.append(accessories[int(part) - 1])
+
+    return chosen
+
+
 async def locate(account, accessories: list) -> dict:  # noqa: ANN001
     """
     Locate each accessory in turn, saying whose search is running.
@@ -209,8 +255,11 @@ def report_accessories(accessories: list, located: dict) -> None:
         print(f"    serial:     {accessory.serial_number}")
         print(f"    paired:     {accessory.paired_at:%Y-%m-%d}")
 
-        location = located.get(accessory)
-        print(f"    location:   {location or 'not seen by the network'}")
+        if accessory not in located:
+            print("    location:   not asked for")
+        else:
+            location = located[accessory]
+            print(f"    location:   {location or 'not seen by the network'}")
 
 
 async def main() -> int:
@@ -243,8 +292,11 @@ async def main() -> int:
 
             # Nothing special about an accessory that came from iCloud: locating one is
             # `fetch_location`, the same call that locates an accessory read from a plist.
-            print("\nAsking the Find My network for their last known locations...")
-            report_accessories(accessories, await locate(account, accessories))
+            wanted = choose_accessories(accessories)
+            if wanted:
+                print("\nAsking the Find My network for their last known locations...")
+
+            report_accessories(accessories, await locate(account, wanted))
     except UnhandledProtocolError as e:
         print(f"\nFailed: {e}")
         return 1
