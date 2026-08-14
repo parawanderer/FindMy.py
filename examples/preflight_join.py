@@ -23,6 +23,13 @@ thirteen coincidences, it is the construction being right.
 It also reports what the account already holds, so that what a join adds is visible against
 what was there, and fetches the escrow club certificate to prove the pinned roots verify it
 *before* a join is the thing that finds out otherwise.
+
+**What a clean run does not establish.** Two derivations are checked here against data Apple
+produced -- the peer identifier, and the signing construction behind every `SignedInfo`.
+Everything a join then *composes* is checked only against itself: the permanent info's epoch
+and key encoding, its machine id and millisecond timestamp, the stable info's policy
+constants, the trust merge, the shares and the bottle. Those have no local oracle at all, so
+a clean verdict means two fewer ways to be irreversibly wrong, not none.
 """
 
 from __future__ import annotations
@@ -146,17 +153,9 @@ async def main() -> int:  # noqa: PLR0915 -- a report, and it reads as one
         print("  neither confirms nor denies it. Joining would be a guess.")
         return 1
 
-    print("  Two things are ruled out, and they are the two that could not be checked")
-    print("  any other way:")
-    print("    the identifier derivation, against identifiers Apple produced;")
-    print("    the signing construction, against signatures Apple's devices made.")
-    print()
-    print("  **That is not the same as a join being safe.** Everything this client")
-    print("  will put in its own blobs is checked only against itself: the permanent")
-    print("  info's epoch and key encoding, its machine id and millisecond timestamp,")
-    print("  the stable info's policy constants, the trust merge, the shares and the")
-    print("  bottle. A join remains an irreversible call with parts nothing local can")
-    print("  validate -- two fewer than before, and the two nothing else could reach.")
+    print("  Both derivations a join depends on are settled against data this project")
+    print("  did not produce. What it puts in its own blobs is still checked only")
+    print("  against itself -- see this script's docstring for what that leaves open.")
     return 0
 
 

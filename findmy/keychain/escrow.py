@@ -319,9 +319,19 @@ class RecoveryOptions:
         A record with no usable bottle cannot be recovered from, so removing it destroys
         nothing. This is the list a user should be offered.
 
-        Non-viability can be transient -- a service down, a peer briefly unreachable --
-        which is why the serial confirmation stays in place underneath rather than being
-        replaced by this.
+        **[observed] Removing a device from the Apple ID device list makes its bottle
+        non-viable**, and the record then appears here. That is the mechanism behind most
+        of what accumulates: the record itself is *not* removed -- an account was seen
+        holding eight records for one remaining device entry -- but it stops being
+        recoverable from, which is what turns it from a live recovery path into debris.
+
+        So a record here usually has an explicable history rather than a mysterious one,
+        and there is a deliberate route to putting a record in this list: remove its
+        device first, then delete the record.
+
+        Non-viability can still be transient -- a service down, a peer briefly unreachable
+        -- which is why the serial confirmation stays in place underneath rather than
+        being replaced by this.
         """
         if not self.viability_is_trustworthy:
             return []
