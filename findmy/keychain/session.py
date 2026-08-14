@@ -88,6 +88,11 @@ The field of a recovered record that everything else derives from.
 **[observed]** Recovered material also carries `SecureBackupIDMSData`, a
 `DoubleEnrollmentPassword` and version, a `BackupBagPassword`, a backup version and a
 timestamp. Only this one is needed here.
+
+**None of the others is required when writing one either** -- §4.5.3's record is three
+keys, and :func:`findmy.keychain.enrolment.build_record` sends exactly those. They are what
+an Apple client happens to include, and reproducing them would be inventing plausible
+values for fields nothing reads.
 """
 
 # A PET lasts about five minutes. Renewing a little early costs one authentication and

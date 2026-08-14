@@ -495,26 +495,46 @@ def build_inner_message(  # noqa: PLR0913 -- the six inputs the inner message fr
     )
 
 
-def build_record(timestamp: str, entropy: bytes | None = None) -> bytes:
+def new_bottle_entropy() -> bytes:
+    """
+    Generate the randomness a bottle and its escrow record are both built from.
+
+    **Call this once and give the same bytes to both.** The entropy is generated rather
+    than derived, and it is the single value the two halves of a join share: the record
+    escrows it, and the bottle `joinWithVoucher` carries is sealed under keys derived from
+    it. Generating it in two places produces an enrolment that succeeds, a join that
+    succeeds, and a recovery months later that yields a peer which does not exist -- with
+    no step in between that could notice.
+
+    That is why neither :func:`build_record` nor :func:`enrol_record` generates any: a
+    function that invents its own entropy is one a caller cannot make agree with the
+    bottle.
+    """
+    return secrets.token_bytes(ENTROPY_LENGTH)
+
+
+def build_record(timestamp: str, entropy: bytes) -> bytes:
     """
     Build §4.5.3's record: the three-key plist that is what an escrow record is *for*.
 
-    The entropy is **generated, not derived**. It is fresh randomness that exists nowhere
-    else, everything the bottle later yields comes from it, and enrolling is what makes it
-    recoverable at all -- so a caller keeps whatever this generated, or supplies its own.
+    **Three keys, and no more.** Recovered material from Apple's own clients also carries
+    `SecureBackupIDMSData`, a `DoubleEnrollmentPassword`, a `BackupBagPassword` and a
+    couple of versions; none of them is required, and a three-key record is recoverable and
+    yields its entropy. Synthesising the others would be inventing plausible values for
+    fields nothing reads.
 
     :param timestamp: From :func:`escrow_timestamp`. The same string the blob and the
         metadata carry.
-    :param entropy: 72 bytes. Generated if not supplied.
+    :param entropy: 72 bytes, from :func:`new_bottle_entropy` -- and the **same** bytes the
+        bottle is sealed from. Required rather than generated; see there.
     """
-    material = entropy if entropy is not None else secrets.token_bytes(ENTROPY_LENGTH)
-    if len(material) != ENTROPY_LENGTH:
-        msg = f"A bottle's entropy is {ENTROPY_LENGTH} bytes, not {len(material)}"
+    if len(entropy) != ENTROPY_LENGTH:
+        msg = f"A bottle's entropy is {ENTROPY_LENGTH} bytes, not {len(entropy)}"
         raise EnrolmentError(msg)
 
     return plistlib.dumps(
         {
-            ENTROPY_FIELD: material,
+            ENTROPY_FIELD: entropy,
             TIMESTAMP_FIELD: timestamp,
             "BackupVersion": BACKUP_VERSION,
         },
@@ -832,10 +852,11 @@ async def enrol_record(  # noqa: PLR0913 -- everything an escrow record is made 
     :param dsid: The numeric account id -- also the SRP identity of a future recovery.
     :param password: The passcode this record will be recoverable with. Used inside this
         call and not retained; callers should hold it no longer.
-    :param entropy: The bottle's 72 bytes. **The caller's, not generated here** -- the same
-        bytes have to seal the bottle that `joinWithVoucher` sends, and a record escrowing
-        different entropy from the bottle it accompanies recovers to a peer that does not
-        exist. :func:`build_record` generates a set for a caller that has none yet.
+    :param entropy: The bottle's 72 bytes, from :func:`new_bottle_entropy`. **The
+        caller's, and never generated here** -- the same bytes seal the bottle
+        `joinWithVoucher` carries. A record escrowing different entropy from its bottle
+        enrols cleanly, joins cleanly, and recovers months later to a peer that does not
+        exist, with no step in between that could notice.
     :param bottle_id: The bottle's UUID.
     :param escrowed_spki: The escrowed signing public key.
     :param when: The moment to stamp. Defaults to now.
@@ -899,6 +920,7 @@ __all__ = [
     "enrol_record",
     "escrow_timestamp",
     "fetch_club_certificate",
+    "new_bottle_entropy",
     "record_label",
     "require_usable",
     "seal_to_club",

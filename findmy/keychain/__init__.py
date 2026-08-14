@@ -20,6 +20,7 @@ from .enrolment import (
     build_record,
     enrol_record,
     escrow_timestamp,
+    new_bottle_entropy,
     record_label,
     verify_club_certificate,
 )
@@ -99,6 +100,7 @@ __all__ = (
     "make_join_request",
     "make_peer",
     "make_voucher",
+    "new_bottle_entropy",
     "parse_keyvault_message",
     "record_label",
     "recover_bottled_peer",

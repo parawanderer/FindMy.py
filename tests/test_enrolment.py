@@ -30,6 +30,7 @@ from findmy.keychain.enrolment import (
     build_metadata,
     build_record,
     escrow_timestamp,
+    new_bottle_entropy,
     record_label,
     seal_to_club,
     srp_verifier,
@@ -295,8 +296,11 @@ def test_escrowing_material_with_no_entropy_is_refused(material: bytes) -> None:
         )
 
 
-def test_the_record_is_three_keys_and_the_entropy_is_fresh() -> None:
-    fields = plistlib.loads(build_record("2026-01-01 12:30:45"))
+def test_the_record_is_three_keys_and_no_more() -> None:
+    # The other fields Apple's clients include -- SecureBackupIDMSData, the passwords, the
+    # versions -- are not required, and synthesising them would be inventing plausible
+    # values for fields nothing reads.
+    fields = plistlib.loads(build_record("2026-01-01 12:30:45", new_bottle_entropy()))
 
     assert sorted(fields) == [
         "BackupVersion",
@@ -307,9 +311,16 @@ def test_the_record_is_three_keys_and_the_entropy_is_fresh() -> None:
     assert fields["BackupVersion"] == "1"
     assert fields["com.apple.securebackup.timestamp"] == "2026-01-01 12:30:45"
 
-    # Generated, not derived: two records built the same way share nothing.
-    other = plistlib.loads(build_record("2026-01-01 12:30:45"))
-    assert other["BottledPeerEntropy"] != fields["BottledPeerEntropy"]
+
+def test_entropy_is_fresh_each_time_and_never_invented_by_a_builder() -> None:
+    # Generated once by the caller and given to both halves of a join. A builder that made
+    # its own would produce a record the bottle cannot agree with, and nothing between here
+    # and a recovery months later would notice.
+    assert len(new_bottle_entropy()) == 72
+    assert new_bottle_entropy() != new_bottle_entropy()
+
+    with pytest.raises(TypeError):
+        build_record("2026-01-01 12:30:45")  # pyright: ignore [reportCallIssue]
 
 
 def test_entropy_of_the_wrong_length_is_refused() -> None:
