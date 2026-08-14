@@ -724,3 +724,18 @@ async def test_the_undecodable_reply_says_the_same_thing(
 
     with pytest.raises(KeychainSessionError, match="Do not retry"):
         await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
+
+
+@pytest.mark.asyncio
+async def test_the_club_certificate_can_be_checked_without_joining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Read-only, and the point of it: the pinning either works on this account or it does
+    # not, and finding out here costs nothing -- while finding out mid-join happens after
+    # a passcode has been asked for.
+    session, _, calls, _ = _a_joinable_session(monkeypatch)
+
+    certificate = await session.club_certificate()
+
+    assert certificate.subject.rfc4514_string() == "CN=Escrow Club"
+    assert calls == ["get_club_cert"]

@@ -59,6 +59,7 @@ from .cuttlefish import ViableBottles, fetch_viable_bottles, make_cuttlefish_cli
 from .enrolment import (
     DeviceDescription,
     enrol_record,
+    fetch_club_certificate,
     new_bottle_entropy,
     record_label,
 )
@@ -107,6 +108,7 @@ from .shares import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from cryptography import x509
     from cryptography.hazmat.primitives.asymmetric import ec
 
     from findmy.reports.account import AsyncAppleAccount
@@ -677,6 +679,22 @@ class AsyncKeychainSession(Closable):
         # The service reports success for a deletion that addressed nothing, so the only
         # proof is asking again. Dropping the cache forces that on the next call.
         self._options = None
+
+    async def club_certificate(self) -> x509.Certificate:
+        """
+        Fetch the certificate an escrow blob would be sealed to, and verify it.
+
+        **Read-only, and worth running before a join rather than during one.** It is the
+        one part of enrolling that can fail for reasons outside this account -- a pinned
+        root that is not among the four bundled, an expired certificate -- and finding that
+        out here costs nothing, while finding it out mid-join happens after a passcode has
+        been asked for.
+
+        Verified against the bundled roots before it is returned; an unverifiable one
+        raises rather than being handed back with a warning.
+        """
+        await self._renew_token_if_stale()
+        return await fetch_club_certificate(self._proxy, None, str(uuid.uuid4()).upper())
 
     async def join(
         self,
