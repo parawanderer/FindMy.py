@@ -147,14 +147,49 @@ def service_keys_from_der(payload: bytes) -> ServiceKeys:
     return _from_v1(element)
 
 
-def _from_v2(element: der.DerElement) -> ServiceKeys:
-    """Read the `[APPLICATION 5]` form, whose octet string holds a protobuf."""
-    children = element.unwrap().children()
+DER_SEQUENCE = 0x10
+DER_OCTET_STRING = 0x04
+
+
+def _v2_payload(element: der.DerElement) -> bytes:
+    """
+    Find the octet string inside a v2 structure, whichever way its tag is written.
+
+    **`[APPLICATION 5]` is written without `EXPLICIT`**, alone among this protocol's
+    application tags, and that is deliberate rather than a typo -- **[observed]** on a real
+    account the tag *replaces* the SEQUENCE's own tag, so the octet string sits directly
+    inside it rather than one level further in.
+
+    Both nestings are read, because the difference is invisible until it fails and the
+    failure is "cannot read children of a primitive element", which names neither the
+    structure nor the ambiguity.
+    """
+    children = element.children()
     if not children:
         msg = "A v2 private key structure carries no data element"
         raise ServiceKeyError(msg)
 
-    payload = children[0].as_bytes()
+    # The explicit reading: the wrapper holds a SEQUENCE that holds the octet string.
+    if len(children) == 1 and children[0].constructed and children[0].is_universal(DER_SEQUENCE):
+        children = children[0].children()
+
+    payload = next(
+        (child for child in children if child.is_universal(DER_OCTET_STRING)),
+        None,
+    )
+    if payload is None:
+        shapes = ", ".join(f"tag {c.tag_number}" for c in children)
+        msg = (
+            f"A v2 private key structure holds no octet string. It holds: {shapes or 'nothing'}"
+        )
+        raise ServiceKeyError(msg)
+
+    return payload.as_bytes()
+
+
+def _from_v2(element: der.DerElement) -> ServiceKeys:
+    """Read the `[APPLICATION 5]` form, whose octet string holds a protobuf."""
+    payload = _v2_payload(element)
 
     # Try the declared shape first; fall back to reading the wire positionally, because the
     # field numbers below are assumed rather than specified.

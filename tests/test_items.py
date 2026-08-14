@@ -628,3 +628,47 @@ def test_a_p384_key_is_recognised_rather_than_rejected() -> None:
     keys = service_keys_from_der(a_v2_payload(scalar.to_bytes(48, "big")))
 
     assert keys.encryption_key.curve.name == "secp384r1"
+
+
+def an_implicit_v2_payload(encryption: bytes) -> bytes:
+    """
+    The `[APPLICATION 5]` form as a real account writes it.
+
+    Implicit tagging: the application tag **replaces** the SEQUENCE's own tag, so the
+    octet string sits directly inside the wrapper rather than one level further in.
+    """
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    keys = cf.PcsServiceKeys(encryption_key=cf.PcsPrivateKey(key=encryption))
+    return der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x04, keys.SerializeToString()))
+
+
+def test_the_implicit_tagging_a_real_account_uses_is_read() -> None:
+    # [observed] The tag replaces the SEQUENCE's tag rather than wrapping it, so the octet
+    # string is one level shallower. Assuming the explicit form fails with "cannot read
+    # children of a primitive element", which names neither the structure nor the choice.
+    scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+
+    keys = service_keys_from_der(an_implicit_v2_payload(scalar.to_bytes(32, "big")))
+
+    assert keys.encryption_key.private_numbers().private_value == scalar
+
+
+def test_both_nestings_yield_the_same_key() -> None:
+    # The difference is invisible until it fails, so both are read rather than one being
+    # chosen -- there is no cost to accepting the other and a whole round trip to guessing.
+    scalar = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+    raw = scalar.to_bytes(32, "big")
+
+    implicit = service_keys_from_der(an_implicit_v2_payload(raw))
+    explicit = service_keys_from_der(a_v2_payload(raw))
+
+    assert implicit.encryption_key.private_numbers().private_value == scalar
+    assert explicit.encryption_key.private_numbers().private_value == scalar
+
+
+def test_a_v2_structure_holding_no_octet_string_says_what_it_holds() -> None:
+    empty_sequence = der(0x60 | 0x20 | PRIVATE_KEY_V2_TAG, der(0x30, der(0x02, b"\x01")))
+
+    with pytest.raises(ServiceKeyError, match="holds no octet string"):
+        service_keys_from_der(empty_sequence)
