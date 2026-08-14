@@ -285,6 +285,25 @@ def test_discarded_beacons_are_named_rather_than_dropped_quietly(
     assert "no naming record" in caplog.text
 
 
+def test_a_discarded_beacon_reports_which_secondary_secret_it_carries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # §2.3's discriminator: an accessory carries sharedSecret2, an iPhone, iPad or Mac
+    # carries secureLocationsSharedSecret. If the unnamed ones all hold the latter they
+    # are the owner's own devices, and discarding them is right rather than convenient.
+    # Nothing else records it -- the discard happens before any secret is read.
+    import logging  # noqa: PLC0415
+
+    device = beacon_record("A-DEVICE", secondary_field="secureLocationsSharedSecret")
+    device.values["model"] = "iPad13,18"
+
+    with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
+        accessories_from_records([device])
+
+    assert "secondary=secureLocationsSharedSecret" in caplog.text
+    assert "iPad13,18" in caplog.text
+
+
 def test_one_bad_accessory_does_not_take_the_rest_of_the_export_with_it() -> None:
     broken = beacon_record("BROKEN")
     del broken.values["sharedSecret"]

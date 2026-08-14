@@ -362,9 +362,10 @@ def group_records(records: Iterable[DecryptedRecord]) -> list[RecordGroup]:
     optional here and neither is an error. What that absence *means* differs, though:
 
     - **No naming record** is how a master beacon that is not a tag presents. The zone
-      holds them for other things -- an account with no iPad produced an `iPad13,18`
-      entry, unnamed and serial-less. :func:`accessories_from_records` discards those;
-      this does not, because rendering them is a decision for the caller.
+      holds them for other things -- one account's records included an `iPad13,18` entry,
+      unnamed and serial-less. :func:`accessories_from_records` discards those; this does
+      not, because rendering them is a decision for the caller, and because a record
+      dropped here takes with it the evidence for *why* it had no naming record.
     - **No alignment record** is genuine optionality. Exports before format `0.0.2` carry
       none, and an accessory without one still works by probing, if slowly.
 
@@ -396,6 +397,31 @@ def group_records(records: Iterable[DecryptedRecord]) -> list[RecordGroup]:
     ]
 
 
+def _describe_unnamed(beacon: DecryptedRecord) -> str:
+    """
+    Describe a master beacon that resolved to no naming record, with the evidence why.
+
+    **Which secondary secret it carries is the discriminator**: an accessory carries
+    `sharedSecret2`, while an iPhone, iPad or Mac carries `secureLocationsSharedSecret`
+    instead. If every unnamed record turns out to hold the latter, then these are the
+    owner's own findable devices -- which have no naming record because their name comes
+    from the device -- and discarding them is right rather than merely convenient.
+
+    Logged rather than acted on. Nothing branches on it until it is established.
+    """
+    values = beacon.values
+    carried = [
+        name
+        for name in ("sharedSecret2", "secureLocationsSharedSecret")
+        if isinstance(values.get(name), bytes)
+    ]
+
+    return (
+        f"{beacon.name} (model={values.get('model', '<none>')!r},"
+        f" secondary={'+'.join(carried) or 'neither'})"
+    )
+
+
 def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyAccessory]:
     """
     Join decrypted records into accessories.
@@ -403,10 +429,15 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
     Joins on `associatedBeacon` and `beaconIdentifier`, via :func:`group_records`.
 
     **A master beacon with no naming record is not an accessory**, and is discarded rather
-    than exported unnamed. The zone holds master beacons for things that are not tags --
-    an account with no iPad produced an `iPad13,18` entry, unnamed and serial-less, dated
-    the day of the export -- and resolving to a naming record is what distinguishes a tag
-    from one of those. OpenTagViewer discards them for the same reason.
+    than exported unnamed. The zone holds master beacons for things that are not tags: one
+    account's records included an `iPad13,18` entry, unnamed and serial-less, dated the
+    day of the export. Resolving to a naming record is what distinguishes a tag from one
+    of those, and OpenTagViewer discards them for the same reason.
+
+    **Why they have no naming record is not yet established.** The likely answer is that
+    they are the owner's own findable devices, which take their name from the device --
+    see :func:`_describe_unnamed` for the discriminator that would settle it, which is
+    logged on every discard.
 
     Key alignment is genuinely optional and its absence is tolerated: exports before
     format `0.0.2` carry none, and an accessory without one still works by probing.
@@ -423,10 +454,15 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
     if unnamed:
         # Counted and named, never dropped quietly: "fewer accessories than expected" and
         # "some of those records were never accessories" look identical from the outside.
+        #
+        # The model and the secondary secret come too, because they are the evidence for
+        # *why* these have no naming record -- see :func:`_describe_unnamed`. Discarding
+        # happens before anything reads a secret, so nothing else records which one they
+        # carry, and it is the one field that would settle it.
         logger.info(
             "Discarding %d master beacon(s) with no naming record, so not accessories: %s",
             len(unnamed),
-            ", ".join(sorted(b.name for b in unnamed)),
+            ", ".join(sorted(_describe_unnamed(b) for b in unnamed)),
         )
 
     # An accessory that gets no alignment record searches its whole history when located
