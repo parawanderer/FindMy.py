@@ -364,7 +364,17 @@ def _from_v2(element: der.DerElement) -> ServiceKeys:
 
 
 def _from_v1(element: der.DerElement) -> ServiceKeys:
-    """Read the v1 form: a sequence whose first member is the key octets."""
+    """
+    Read the v1 form: a sequence whose first member is the key octets.
+
+    **The key octets go through the same reader as v2's**, and that is the point of this
+    function rather than an implementation detail. A key blob here is not necessarily a
+    bare scalar -- Stage 5 §3.2 makes v1 and v2 two arms of one CHOICE, so whatever
+    encoding one arm carries the other may too. Reading v1's octets as a scalar directly,
+    which is what this did, rejects the 64-byte point-and-scalar form that v2 accepts, and
+    rejects it as "matches no curve" rather than as anything a reader would connect to the
+    other arm.
+    """
     children = element.children()
     if not children:
         msg = (
@@ -373,4 +383,19 @@ def _from_v1(element: der.DerElement) -> ServiceKeys:
         )
         raise ServiceKeyError(msg)
 
-    return ServiceKeys(encryption_key=private_key_from_scalar(children[0].as_bytes()))
+    candidates = [scalar_in(child.as_bytes()) for child in children if not child.constructed]
+    usable = _keys_from_candidates([c for c in candidates if c is not None])
+
+    if not usable:
+        sizes = [len(child.as_bytes()) for child in children if not child.constructed]
+        msg = (
+            f"A v1 private key structure carries no usable key. Its primitive members are"
+            f" {sizes} bytes, and a key is taken as a point beside its scalar when the two"
+            " check each other, or as a bare scalar by its length."
+        )
+        raise ServiceKeyError(msg)
+
+    return ServiceKeys(
+        encryption_key=usable[0],
+        signing_key=usable[1] if len(usable) > 1 else None,
+    )

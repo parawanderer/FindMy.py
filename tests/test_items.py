@@ -914,3 +914,42 @@ def test_items_are_indexed_by_the_key_their_account_names() -> None:
     found = readable_items(split_view_records([record]), keyring)
 
     assert list(found) == [key_bytes]
+
+
+def test_a_v1_structure_reads_a_compound_key_blob_as_v2_does() -> None:
+    # §3.2 makes v1 and v2 two arms of one CHOICE, so whatever encoding one arm carries
+    # the other may too. Reading v1's octets as a bare scalar rejects the 64-byte
+    # point-and-scalar form -- and rejects it as "matches no curve", which names nothing a
+    # reader would connect to the other arm.
+    real = ec.generate_private_key(ec.SECP256R1())
+    scalar = real.private_numbers().private_value.to_bytes(32, "big")
+    blob = public_form(real, "x") + scalar
+
+    v1 = der(0x30, der(0x04, blob))
+
+    keys = service_keys_from_der(v1)
+
+    assert keys.encryption_key.private_numbers().private_value == (
+        real.private_numbers().private_value
+    )
+
+
+def test_a_v1_structure_with_no_usable_key_says_what_sizes_it_held() -> None:
+    v1 = der(0x30, der(0x04, b"\x01" * 17))
+
+    with pytest.raises(ServiceKeyError, match=r"primitive members are \[17\] bytes"):
+        service_keys_from_der(v1)
+
+
+def test_the_describer_looks_inside_an_octet_string_holding_der() -> None:
+    # A nested keyset is an OCTET STRING holding DER, and a description that stops at
+    # "112B" hides exactly the level a reader is trying to find.
+    from findmy.cloudkit import der as der_module  # noqa: PLC0415
+
+    inner = der(0x30, der(0x02, b"\x01"))
+    outer = der(0x30, der(0x04, inner))
+
+    element, _ = der_module.parse_one(outer)
+    described = der_module.describe(element, depth=4)
+
+    assert "->" in described

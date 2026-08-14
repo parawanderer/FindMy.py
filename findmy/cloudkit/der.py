@@ -192,6 +192,18 @@ def describe(element: DerElement, depth: int = 2) -> str:
     label = f"{prefix}{element.tag_number}{suffix}"
 
     if not element.constructed:
+        # An OCTET STRING may hold DER rather than bytes -- the nested keyset of Stage 5
+        # §4 step 6 does -- and a description that stops at "112B" hides exactly the level
+        # a reader is trying to find.
+        if depth > 0 and element.content:
+            try:
+                inner, consumed = parse_one(element.content)
+            except DerError:
+                pass
+            else:
+                if consumed == len(element.content):
+                    return f"{label}({len(element.content)}B -> {describe(inner, depth - 1)})"
+
         return f"{label}({len(element.content)}B)"
 
     if depth <= 0:
