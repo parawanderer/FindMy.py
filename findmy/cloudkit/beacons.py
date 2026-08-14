@@ -329,24 +329,51 @@ def _require_bytes(values: dict[str, Any], name: str, record: DecryptedRecord) -
     return value
 
 
-def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyAccessory]:
+@dataclass(frozen=True)
+class RecordGroup:
     """
-    Join decrypted records into accessories.
+    One master beacon together with the records that describe it.
 
-    Joins on `associatedBeacon` and `beaconIdentifier`.
+    What :func:`group_records` produces. Either companion may be absent, and both
+    routinely are -- see there.
+    """
 
-    **A master beacon with no naming record is not an accessory**, and is discarded rather
-    than exported unnamed. The zone holds master beacons for things that are not tags --
-    an account with no iPad produced an `iPad13,18` entry, unnamed and serial-less, dated
-    the day of the export -- and resolving to a naming record is what distinguishes a tag
-    from one of those. OpenTagViewer discards them for the same reason.
+    beacon: DecryptedRecord
+    naming: DecryptedRecord | None = None
+    alignment: DecryptedRecord | None = None
 
-    Key alignment is genuinely optional and its absence is tolerated: exports before
-    format `0.0.2` carry none, and an accessory without one still works by probing.
+
+def group_records(records: Iterable[DecryptedRecord]) -> list[RecordGroup]:
+    """
+    Group decrypted records by the beacon each describes.
+
+    The join everything downstream needs, on its own rather than buried inside
+    :func:`accessories_from_records` -- which does exactly this and then throws the
+    records away in favour of assembled accessories. A caller rendering plists needs the
+    records themselves, and reimplementing the join is how the tolerate-absence rule gets
+    quietly dropped.
+
+    **The two join keys differ, and they look like they should not.** A naming record
+    names its accessory in `associatedBeacon`; an alignment record names it in
+    `beaconIdentifier`. Both point at a master beacon's own identifier.
+
+    **Absence is the normal case, not the edge one.** One real account returned six master
+    beacons, five naming records and four alignment records, so both companions are
+    optional here and neither is an error. What that absence *means* differs, though:
+
+    - **No naming record** is how a master beacon that is not a tag presents. The zone
+      holds them for other things -- an account with no iPad produced an `iPad13,18`
+      entry, unnamed and serial-less. :func:`accessories_from_records` discards those;
+      this does not, because rendering them is a decision for the caller.
+    - **No alignment record** is genuine optionality. Exports before format `0.0.2` carry
+      none, and an accessory without one still works by probing, if slowly.
+
+    :param records: Decrypted records of any type. Anything that is not one of the three
+        is ignored rather than rejected.
+    :returns: One group per master beacon, in the order the beacons arrived.
     """
     records = list(records)
 
-    beacons = [r for r in records if r.record_type == RecordType.MASTER_BEACON]
     naming = {
         r.values.get("associatedBeacon"): r
         for r in records
@@ -358,7 +385,41 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
         if r.record_type == RecordType.KEY_ALIGNMENT
     }
 
-    unnamed = [b for b in beacons if b.name not in naming]
+    return [
+        RecordGroup(
+            beacon=beacon,
+            naming=naming.get(beacon.name),
+            alignment=alignment.get(beacon.name),
+        )
+        for beacon in records
+        if beacon.record_type == RecordType.MASTER_BEACON
+    ]
+
+
+def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyAccessory]:
+    """
+    Join decrypted records into accessories.
+
+    Joins on `associatedBeacon` and `beaconIdentifier`, via :func:`group_records`.
+
+    **A master beacon with no naming record is not an accessory**, and is discarded rather
+    than exported unnamed. The zone holds master beacons for things that are not tags --
+    an account with no iPad produced an `iPad13,18` entry, unnamed and serial-less, dated
+    the day of the export -- and resolving to a naming record is what distinguishes a tag
+    from one of those. OpenTagViewer discards them for the same reason.
+
+    Key alignment is genuinely optional and its absence is tolerated: exports before
+    format `0.0.2` carry none, and an accessory without one still works by probing.
+    """
+    records = list(records)
+    groups = group_records(records)
+
+    # Counted from the records rather than the groups: "how many were fetched" and "how
+    # many joined" are different numbers, and their difference is the diagnostic below.
+    naming = [r for r in records if r.record_type == RecordType.BEACON_NAMING]
+    alignment = [r for r in records if r.record_type == RecordType.KEY_ALIGNMENT]
+
+    unnamed = [group.beacon for group in groups if group.naming is None]
     if unnamed:
         # Counted and named, never dropped quietly: "fewer accessories than expected" and
         # "some of those records were never accessories" look identical from the outside.
@@ -373,39 +434,38 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
     # and until now that happened with nothing said. A record that is *present but
     # unreadable* warns; one that simply did not join was silent, which is the worse of
     # the two because it looks like an accessory that never had one.
-    unaligned = [b.name for b in beacons if b.name in naming and b.name not in alignment]
+    named = [group for group in groups if group.naming is not None]
+    unaligned = [group.beacon.name for group in named if group.alignment is None]
     if unaligned:
         logger.warning(
             "%d of %d accessor(ies) have no key-alignment record and will search their"
             " whole history when located: %s. %d alignment record(s) were fetched, so if"
             " that number is not zero these did not join.",
             len(unaligned),
-            len(naming),
+            len(named),
             ", ".join(sorted(unaligned)),
             len(alignment),
         )
 
     accessories: list[FindMyAccessory] = []
-    for beacon in beacons:
-        if beacon.name not in naming:
-            continue
+    for group in named:
         try:
             accessories.append(
                 accessory_from_record(
-                    beacon,
-                    naming=naming.get(beacon.name),
-                    alignment=alignment.get(beacon.name),
+                    group.beacon,
+                    naming=group.naming,
+                    alignment=group.alignment,
                 ),
             )
-        except BeaconExportError:
+        except BeaconExportError:  # noqa: PERF203 -- per accessory, deliberately
             # take the rest of the export with it
-            logger.exception("Skipping accessory %s", beacon.name)
+            logger.exception("Skipping accessory %s", group.beacon.name)
 
     logger.info(
         "Assembled %d accessor%s from %d beacon, %d naming and %d alignment record(s)",
         len(accessories),
         "y" if len(accessories) == 1 else "ies",
-        len(beacons),
+        len(groups),
         len(naming),
         len(alignment),
     )
@@ -452,6 +512,64 @@ def to_owned_beacon_plist(beacon: DecryptedRecord) -> dict[str, Any]:
 
     # Real CloudKit system fields are not synthesised. A placeholder is preferred to
     # omitting the key, which is what the fixtures that read this format expect.
+    plist["cloudKitMetadata"] = b""
+
+    return plist
+
+
+def to_beacon_naming_plist(naming: DecryptedRecord) -> dict[str, Any]:
+    """
+    Render a decrypted naming record in the layout a Mac's own cache uses.
+
+    Nearly a pass-through: the fields map exactly, same names and same camelCase, with no
+    renames and no type changes. What it adds is the record's own `identifier`, which is
+    the record's name rather than one of its fields, and the `cloudKitMetadata`
+    placeholder -- the same two additions :func:`to_owned_beacon_plist` makes.
+
+    Every field is optional. `emoji` is genuinely absent on some real records, and a
+    record missing one is not a broken record.
+
+    **This names its accessory in `associatedBeacon`** -- not `beaconIdentifier`, which is
+    what the alignment record uses for the same association. :func:`group_records` does
+    the join if you would rather not.
+    """
+    values = naming.values
+    plist: dict[str, Any] = {"identifier": naming.name}
+
+    for name in ("name", "associatedBeacon", "roleId", "emoji"):
+        if name in values:
+            plist[name] = values[name]
+
+    plist["cloudKitMetadata"] = b""
+
+    return plist
+
+
+def to_key_alignment_plist(alignment: DecryptedRecord) -> dict[str, Any]:
+    """
+    Render a decrypted key-alignment record in the layout a Mac's own cache uses.
+
+    A pass-through on the same terms as :func:`to_beacon_naming_plist`, with `identifier`
+    and `cloudKitMetadata` added.
+
+    **`beaconIdentifier` is kept.** The plist layout drops it, carrying the association in
+    a directory name instead, but a writer that discards it forces its caller to re-derive
+    a grouping that was already in the data. Costing nothing to carry, and ignorable by a
+    reader that does not want it, it stays.
+
+    Worth exporting whenever one exists: an accessory imported without an alignment record
+    starts its key search at index zero from its pairing date, which for an
+    eighteen-month-old tag means deriving tens of thousands of keys and issuing hundreds
+    of requests. That is an account-flagging risk rather than merely slow. Not every
+    accessory has one, though, and absence is normal.
+    """
+    values = alignment.values
+    plist: dict[str, Any] = {"identifier": alignment.name}
+
+    for name in ("beaconIdentifier", "lastIndexObserved", "lastIndexObservationDate"):
+        if name in values:
+            plist[name] = values[name]
+
     plist["cloudKitMetadata"] = b""
 
     return plist

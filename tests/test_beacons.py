@@ -18,7 +18,10 @@ from findmy.cloudkit.beacons import (
     accessory_from_record,
     decrypt_record,
     decrypt_records,
+    group_records,
     interpret_plaintext,
+    to_beacon_naming_plist,
+    to_key_alignment_plist,
     to_owned_beacon_plist,
 )
 from findmy.cloudkit.constants import RecordType, ValueType
@@ -332,6 +335,127 @@ def test_plist_turns_is_zeus_into_a_boolean_and_stable_id_into_a_list() -> None:
 
 def test_plist_carries_a_cloudkit_metadata_placeholder_rather_than_omitting_the_key() -> None:
     assert "cloudKitMetadata" in to_owned_beacon_plist(beacon_record())
+
+
+def test_a_naming_record_maps_across_unchanged() -> None:
+    # No renames and no type changes -- the one plist mapping that really is a
+    # pass-through, which is worth pinning precisely because it looks too dull to test.
+    naming = DecryptedRecord(
+        name="NAMING-1",
+        record_type=RecordType.BEACON_NAMING,
+        values={
+            "name": "Keys",
+            "associatedBeacon": "BEACON-1",
+            "roleId": 999,
+            "emoji": "\U0001f511",
+        },
+    )
+
+    assert to_beacon_naming_plist(naming) == {
+        "identifier": "NAMING-1",
+        "name": "Keys",
+        "associatedBeacon": "BEACON-1",
+        "roleId": 999,
+        "emoji": "\U0001f511",
+        "cloudKitMetadata": b"",
+    }
+
+
+def test_a_naming_records_identifier_is_the_records_own_name() -> None:
+    # Not one of its fields. `associatedBeacon` names the accessory; `identifier` names
+    # the naming record itself, and confusing the two makes every record claim to be its
+    # own accessory.
+    plist = to_beacon_naming_plist(naming_record("BEACON-1"))
+
+    assert plist["identifier"] == "NAMING-BEACON-1"
+    assert plist["associatedBeacon"] == "BEACON-1"
+
+
+def test_a_naming_record_without_an_emoji_is_still_written() -> None:
+    # [observed] Genuinely absent on real records. A missing field is not a broken record.
+    plist = to_beacon_naming_plist(naming_record())
+
+    assert "emoji" not in plist
+    assert plist["name"] == "Keys"
+
+
+def test_an_alignment_record_keeps_the_identifier_it_joins_on() -> None:
+    # The plist layout drops it and carries the association in a directory name instead.
+    # Keeping it costs nothing and saves the caller re-deriving a grouping it had.
+    plist = to_key_alignment_plist(alignment_record())
+
+    assert plist["beaconIdentifier"] == "BEACON-1"
+    assert plist["identifier"] == "ALIGN-BEACON-1"
+    assert plist["lastIndexObserved"] == 50_000
+
+
+def test_an_alignment_record_missing_its_index_is_still_written() -> None:
+    partial = DecryptedRecord(
+        name="ALIGN-1",
+        record_type=RecordType.KEY_ALIGNMENT,
+        values={"beaconIdentifier": "BEACON-1"},
+    )
+
+    assert to_key_alignment_plist(partial) == {
+        "identifier": "ALIGN-1",
+        "beaconIdentifier": "BEACON-1",
+        "cloudKitMetadata": b"",
+    }
+
+
+def test_both_new_writers_carry_the_metadata_placeholder() -> None:
+    assert to_beacon_naming_plist(naming_record())["cloudKitMetadata"] == b""
+    assert to_key_alignment_plist(alignment_record())["cloudKitMetadata"] == b""
+
+
+# --------------------------------------------------------------------------------------
+# Grouping, for a caller that wants the records rather than accessories
+# --------------------------------------------------------------------------------------
+
+
+def test_grouping_joins_on_two_differently_named_keys() -> None:
+    # They look symmetrical and are not: a naming record says `associatedBeacon`, an
+    # alignment record says `beaconIdentifier`, and both mean the master beacon's name.
+    (group,) = group_records([beacon_record(), naming_record(), alignment_record()])
+
+    assert group.naming is not None
+    assert group.alignment is not None
+    assert group.beacon.name == "BEACON-1"
+
+
+def test_grouping_keeps_a_beacon_that_has_no_naming_record() -> None:
+    # Where accessories_from_records discards it as not-a-tag. Rendering it is a decision
+    # for the caller, so the join does not make it for them.
+    (group,) = group_records([beacon_record("NOT-A-TAG")])
+
+    assert group.beacon.name == "NOT-A-TAG"
+    assert group.naming is None
+    assert group.alignment is None
+
+
+def test_grouping_pairs_each_beacon_with_its_own_records() -> None:
+    groups = {
+        g.beacon.name: g
+        for g in group_records(
+            [
+                beacon_record("BEACON-1"),
+                beacon_record("BEACON-2"),
+                naming_record("BEACON-2", "Second"),
+                alignment_record("BEACON-1"),
+            ],
+        )
+    }
+
+    assert groups["BEACON-1"].naming is None
+    assert groups["BEACON-1"].alignment is not None
+    assert groups["BEACON-2"].naming is not None
+    assert groups["BEACON-2"].alignment is None
+
+
+def test_grouping_ignores_record_types_it_knows_nothing_about() -> None:
+    other = DecryptedRecord(name="X", record_type="SomethingElse", values={})
+
+    assert len(group_records([beacon_record(), other])) == 1
 
 
 # --------------------------------------------------------------------------------------
