@@ -461,15 +461,19 @@ def build_protection(
         share_keys.append(der_sequence(*parts))
 
     keyset = der_sequence(der_int(0), der_set(*share_keys))
-    inner = signature_data if signature_data is not None else der_octet(b"sigdata")
-    signature_data = der_sequence(der_int(version), der_octet(inner))
+
+    # The object signature: what the SignatureData's `data` OCTET STRING holds. The HMAC
+    # covers *this*, not the SEQUENCE wrapping it -- so the fixture must sign it directly,
+    # or it encodes the reader's bug instead of the format.
+    object_signature = signature_data if signature_data is not None else der_octet(b"sigdata")
+    signature_data = der_sequence(der_int(version), der_octet(object_signature))
 
     if hmac_master_key is None:
         mac = b"\xaa" * 32
     else:
         mac = hmac.new(
             pcs.derive_hmac_key(hmac_master_key),
-            keyset + meta + signature_data,
+            keyset + meta + object_signature,
             hashlib.sha256,
         ).digest()
 
@@ -1165,3 +1169,80 @@ def test_an_identity_holding_no_key_yields_none_rather_than_a_wrong_one() -> Non
     element, _ = der.parse_one(bytes([0x30, 0x06, 0x04, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]))
 
     assert _identity_keys(element) == []
+
+
+def test_a_set_of_keys_yields_all_of_them_not_a_pair() -> None:
+    # Both levels inside meta are SET OF. Handing a whole SET to the key reader half-works
+    # -- it returns a pair, because that is what a ServiceKeys holds -- so a set of five
+    # keys yields two and the short list looks complete.
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import _identity_keys  # noqa: PLC0415
+
+    def length(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(body)]) + body
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + length(len(body)) + body
+
+    scalars = [
+        ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+        for _ in range(5)
+    ]
+    entries = b"".join(
+        tlv(0x65, tlv(0x04, _pcs_key_message(v.to_bytes(32, "big")))) for v in scalars
+    )
+    identity = tlv(0x30, tlv(0x0C, b"x") + tlv(0x31, entries))
+
+    element, _ = der.parse_one(identity)
+    keys = _identity_keys(element)
+
+    assert len(keys) == 5
+    assert {k.private_numbers().private_value for k in keys} == set(scalars)
+
+
+def test_one_unreadable_entry_does_not_end_the_set() -> None:
+    # The other shape that produces a short list that looks complete.
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import _identity_keys  # noqa: PLC0415
+
+    def length(n: int) -> bytes:
+        return bytes([n]) if n < 0x80 else bytes([0x81, n])
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + length(len(body)) + body
+
+    good = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value
+    entries = (
+        tlv(0x04, b"\xde\xad\xbe\xef")
+        + tlv(0x65, tlv(0x04, _pcs_key_message(good.to_bytes(32, "big"))))
+    )
+    identity = tlv(0x30, tlv(0x31, entries))
+
+    element, _ = der.parse_one(identity)
+    keys = _identity_keys(element)
+
+    assert [k.private_numbers().private_value for k in keys] == [good]
+
+
+def test_the_hmac_covers_the_object_signature_not_its_wrapper() -> None:
+    # SignatureData is SEQUENCE { version, data }, and the HMAC covers what `data` holds.
+    # Encoding the wrapper adds the version and the octet string's header, and then the
+    # HMAC fails on every structure while the key id still matches -- a wrong key fails
+    # both checks, so failing only one is the signature of this mistake.
+    master = bytes(range(16))
+    key = ec.generate_private_key(ec.SECP256R1())
+
+    der_bytes = build_protection(
+        entries=[(pcs.compress_public_key(key.public_key()), b"ct", None)],
+        truncated_key_id=b"\x00\x00\x00\x00",
+        hmac_master_key=master,
+    )
+    protection = pcs.ShareProtection.from_der(der_bytes)
+
+    assert pcs.verify_protection_hmac(protection, master) is True
+
+    # The wrapper's DER is strictly longer, so signing it cannot coincide.
+    assert len(protection.signature_data_der) > len(protection.signature_data.data)

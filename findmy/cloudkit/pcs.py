@@ -798,15 +798,25 @@ def verify_protection_hmac(protection: ShareProtection, master_key: bytes) -> bo
     Check the protection structure's HMAC under a candidate master key.
 
     It covers three things in order and nothing else: the DER of `keyset`, the raw bytes
-    of `meta`, and the DER of `signatureData`. Note that two of the three are re-encoded
-    sub-structures rather than a span of the original bytes -- DER is canonical, so
-    retaining the original encoding is equivalent, which is what :mod:`findmy.cloudkit.der`
-    does.
+    of `meta`, and the DER of the **`ObjectSignature`**.
+
+    Note that `keyset` is used as the bytes that arrived rather than re-encoded. DER sorts
+    a `SET OF` by encoded value and `keyset` is one, so an encoder preserving parse order
+    would produce different bytes for entries that arrived unsorted -- retaining the
+    original span sidesteps that question entirely rather than answering it correctly.
+
+    **The third part is the inner structure, not the `SignatureData` wrapper around it.**
+    `SignatureData` is `SEQUENCE { version, data }`, and what the HMAC covers is what
+    `data` *holds* -- which is simply that OCTET STRING's contents, taken as bytes rather
+    than re-encoded at all. Encoding the wrapper instead adds the version and the octet
+    string's own header, and the HMAC then fails on **every** structure while the key id
+    still matches. That asymmetry is the signature of this mistake: a wrong key fails both
+    checks, and only a wrong construction fails one.
     """
     if not protection.hmac:
         return False
 
-    signed = protection.keyset_der + protection.meta + protection.signature_data_der
+    signed = protection.keyset_der + protection.meta + protection.signature_data.data
     expected = hmac.new(derive_hmac_key(master_key), signed, hashlib.sha256).digest()
 
     return hmac.compare_digest(expected[: len(protection.hmac)], protection.hmac)
@@ -1134,12 +1144,17 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
     keys: list[ec.EllipticCurvePrivateKey] = []
 
     for member in _members_of(identity):
-        # A member may be a key structure itself...
-        try:
-            keys.extend(service_keys_from_der(member.raw).for_pcs())
-            continue
-        except (ServiceKeyError, der.DerError):
-            pass
+        # **A SET is a container of keys, never a key.** Handing a whole SET to the key
+        # reader is not merely wrong, it half-works: the reader returns a pair, so a set of
+        # five keys yields two and the list looks complete. Both levels inside `meta` are
+        # SET OF -- the identities and each keyset's keys -- so this is the shape that
+        # silently produces a short answer, and it is the shape N1 already had once.
+        if not member.is_universal(der.TAG_SET):
+            try:
+                keys.extend(service_keys_from_der(member.raw).for_pcs())
+                continue
+            except (ServiceKeyError, der.DerError):
+                pass
 
         # ...or hold one deeper, either inline or inside an octet string of DER.
         if member.constructed:
