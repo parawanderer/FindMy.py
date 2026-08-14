@@ -1,23 +1,25 @@
 """
-Listing the escrow records on an Apple account.
+The escrow proxy: listing, recovering from, creating and deleting escrow records.
 
-Implements the read-only half of Stage 3 of the Find My key-export protocol specification.
-"Escrow record" is Apple's *secure backup*: a copy of a device's keychain material, sealed
-under that device's screen-lock passcode, which anyone knowing the passcode can recover.
+Implements Stage 3 §4 and §5 of the Find My key-export protocol specification. "Escrow
+record" is Apple's *secure backup*: a copy of a device's keychain material, sealed under
+that device's screen-lock passcode, which anyone knowing the passcode can recover.
 
-**Recovery itself is not implemented, and cannot be from the specification as it stands.**
-The passcode-authenticated SRP exchange is sketched, but what to do with the recovered
-material -- reconstituting a peer in the trust circle, joining by voucher, syncing trust
-changes -- is named and not specified. So this module lists and describes; it does not
-recover, does not enroll, and does not delete.
+Listing is the part with a use of its own. Escrow records outlive the devices that made
+them: an account observed while the specification was written held eight records for iMac
+Pros whose device entries had been removed years earlier. Nothing in any Apple interface
+enumerates them, so an account can accumulate them invisibly, and this is the only way for
+a user to see what is there.
 
-That is less of a limitation than it sounds, because listing is the part with a use of its
-own. Escrow records outlive the devices that made them: an account observed while the
-specification was written held eight records for iMac Pros whose device entries had been
-removed years earlier. Nothing in any Apple interface enumerates them, so an account can
-accumulate them invisibly, and this is the only way for a user to see what is there.
+This module carries the transport and the commands. The two that are not merely reads have
+their construction elsewhere, because in both cases the difficult part is what to send
+rather than how:
 
-Deletion **is** implemented, and :meth:`AsyncEscrowProxy.delete_record` documents the four
+* :mod:`findmy.keychain.recovery` builds the SRP proof `recover` takes.
+* :mod:`findmy.keychain.enrolment` builds the blob and metadata `enroll` takes, and gets
+  the club certificate verified against pinned roots before sealing anything to it.
+
+Deletion is here in full, and :meth:`AsyncEscrowProxy.delete_record` documents the four
 rules that make it safe to offer. The short version: only records with no usable bottle
 are offered by default, deletion is impossible without a listing to judge that from, the
 serial must be typed back, and none of it stops new records being created.
@@ -436,8 +438,14 @@ def _parse_metadata(label: str, encoded: bytes | str) -> EscrowRecord:
     raw = base64.b64decode(encoded) if isinstance(encoded, str) else encoded
     metadata: dict[str, Any] = plistlib.loads(raw)
 
-    client = metadata.get("ClientMetadata") or {}
-    escrowed_at = metadata.get("com.apple.securebackup.timestamp")
+    # Two spellings, because the reading and writing halves of the specification disagree:
+    # §5.1 observed `ClientMetadata` and `com.apple.securebackup.timestamp` on real
+    # records, while §4.5.2 writes `clientMetadata` and `timestamp`. Since the service
+    # stores this plist verbatim and hands it back, a record enrolled by this library would
+    # otherwise be one this reader could not describe -- so the reader is tolerant and the
+    # writer follows §4.5.2 exactly. See GAPS S1.
+    client = metadata.get("ClientMetadata") or metadata.get("clientMetadata") or {}
+    escrowed_at = metadata.get("com.apple.securebackup.timestamp") or metadata.get("timestamp")
     if isinstance(escrowed_at, str):
         try:
             escrowed_at = datetime.fromisoformat(escrowed_at.replace("Z", "+00:00"))
@@ -635,6 +643,26 @@ class AsyncEscrowProxy(Closable):
                 logger.warning("Could not decode escrow metadata for %s", label or "<unlabelled>")
                 unreadable.append(label)
 
+        # Which spelling real records use, both ways round. §4.5.2 writes `clientMetadata`
+        # and `timestamp`; §5.1 observed `ClientMetadata` and
+        # `com.apple.securebackup.timestamp` on records Apple's own clients wrote. The
+        # service stores this plist verbatim, so a listing settles which is which -- and
+        # reporting only the spellings that appeared would leave the absent case silent,
+        # hence the counts.
+        if records:
+            logger.debug(
+                "Metadata key spellings in this listing: %s",
+                ", ".join(
+                    f"{key} {sum(1 for r in records if key in r.metadata)}/{len(records)}"
+                    for key in (
+                        "ClientMetadata",
+                        "clientMetadata",
+                        "com.apple.securebackup.timestamp",
+                        "timestamp",
+                    )
+                ),
+            )
+
         logger.info(
             "Account holds %d escrow record(s), %d of them recoverable",
             len(records),
@@ -706,6 +734,75 @@ class AsyncEscrowProxy(Closable):
             user_action_label=user_action_label,
             transaction_id=transaction_id,
             extra=extra,
+        )
+
+    async def get_club_cert(
+        self,
+        transaction_id: str,
+        *,
+        user_action_label: str = "FindMy.py fetching the escrow club certificate",
+    ) -> dict[str, Any]:
+        """
+        Fetch the certificate an escrow blob is encrypted to.
+
+        Read-only, and the first half of an enrolment: it shares its transaction id with
+        the `enroll` that follows. The label is the record **class**, not a specific
+        record, because no record exists yet.
+
+        **What comes back must be verified against pinned roots before anything is
+        encrypted to it** -- see :func:`findmy.keychain.enrolment.verify_club_certificate`,
+        which is why this returns the raw response rather than a certificate.
+
+        :param transaction_id: Shared with the `enroll` request.
+        """
+        return await self._command(
+            "get_club_cert",
+            label=ESCROW_LABEL_ICDP,
+            user_action_label=user_action_label,
+            transaction_id=transaction_id,
+            extra=_cert_versions(),
+        )
+
+    async def enroll(  # noqa: PLR0913 -- the fields an enrolment sends, and it is six
+        self,
+        label: str,
+        *,
+        blob: bytes,
+        blob_digest: str,
+        metadata: bytes,
+        dsid: str,
+        transaction_id: str,
+        user_action_label: str = "FindMy.py enrolling an escrow record",
+    ) -> dict[str, Any]:
+        """
+        Create an escrow record.
+
+        **This is a write, and nothing removes what it leaves except a deliberate
+        deletion.** Prefer :func:`findmy.keychain.enrolment.enrol_record`, which builds
+        every field of this and gets the certificate verified before the blob is sealed.
+
+        :param label: The new record's own label, `com.apple.icdp.record.<peerId>`.
+        :param blob: The escrow blob.
+        :param blob_digest: Base64 of that blob's **SHA-1**, not SHA-256.
+        :param metadata: The binary property list describing the record.
+        :param transaction_id: The **same** id `get_club_cert` used.
+        """
+        return await self._command(
+            "enroll",
+            label=label,
+            user_action_label=user_action_label,
+            transaction_id=transaction_id,
+            extra={
+                "blob": base64.b64encode(blob).decode(),
+                "blobDigest": blob_digest,
+                "metadata": base64.b64encode(metadata).decode(),
+                "dsid": dsid,
+                # Not in §4.5's field table, which lists what is specific to `enroll`. Sent
+                # because the club handler is in play -- the blob is sealed to the club
+                # certificate -- and omitting these elsewhere leaves it with nothing to
+                # select and failing internally rather than saying what is missing.
+                **_cert_versions(),
+            },
         )
 
     async def delete_record(
