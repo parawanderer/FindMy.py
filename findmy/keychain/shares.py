@@ -665,12 +665,13 @@ async def fetch_recoverable_shares(
         )
         raise ShareError(msg) from None
 
-    logger.info(
-        "Peer %s is entitled to %d share(s); response fields: %s",
-        peer_id,
-        len(response.shares),
-        describe_wire(serialized),
-    )
+    logger.info("Peer %s is entitled to %d share(s)", peer_id, len(response.shares))
+
+    # The wire shape is several kilobytes of field numbers and sizes. It settled this
+    # message's schema once and is worth keeping for the next response that does not
+    # decode -- but at DEBUG, because a working run does not need it and printing it
+    # every time buries the line above that a working run does need.
+    logger.debug("Share response fields: %s", describe_wire(serialized))
 
     entries: list[ShareEntry] = []
     for index, raw in enumerate(response.shares):

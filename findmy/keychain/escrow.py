@@ -387,12 +387,29 @@ def join_recovery_options(
 
     undescribed = sorted(viable - {record.label for record in listing.records})
 
-    if not_viable or undescribed:
-        logger.warning(
-            "Escrow and Cuttlefish disagree: %d record(s) described but not viable,"
-            " %d bottle(s) viable but undescribed",
+    # The two directions are not equally interesting, and warning about both in one line
+    # made the ordinary one look like a fault on every run.
+    #
+    # A record the escrow proxy describes and Cuttlefish will not accept is **residue**:
+    # escrow records outlive the devices that wrote them, Apple shows them in no
+    # interface, and an account accumulates them. Expected, and only actionable through
+    # delete_escrow_records.py.
+    if not_viable:
+        logger.info(
+            "%d escrow record(s) are described but not recoverable from, which is ordinary"
+            " residue rather than a fault. delete_escrow_records.py removes them.",
             len(not_viable),
+        )
+
+    # This direction is the surprising one: Cuttlefish will accept a bottle the escrow
+    # proxy did not describe, so the listing is incomplete and something recoverable is
+    # invisible to the user.
+    if undescribed:
+        logger.warning(
+            "%d bottle(s) are viable but appear in no escrow record: %s. The escrow"
+            " listing is therefore incomplete, and a recovery option is being hidden.",
             len(undescribed),
+            ", ".join(undescribed),
         )
 
     if partial_count is not None and partial_count != len(not_viable):

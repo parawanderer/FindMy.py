@@ -266,13 +266,13 @@ class AsyncFindMyClient(Closable):
         `associatedBeacon` is the accessory's identifier.
         :func:`~findmy.cloudkit.beacons.group_records` does that join.
 
-        .. warning::
-            **A success is not proof, and reading it back is barely better.** The value
-            returned is the server echoing what it was sent, and the field layout is one
-            this implementation could get wrong in a way only Apple would notice -- the
-            GCM tag precedes the ciphertext, so a value written the natural way round-
-            trips through this library perfectly and is unreadable to an Apple device.
-            Until an untouched device has shown a new name once, treat this as unverified.
+        .. note::
+            **[observed] Confirmed against Apple's own Find My**, on a Mac, which showed a
+            name written here and kept the accessory's emoji and association intact.
+
+            Worth remembering why that was the check: a success response is the server
+            echoing what it was sent, and reading the value back only proves this library
+            agrees with itself. Nothing on this side could have caught a wrong layout.
 
         :param naming: The naming record as fetched, from :meth:`records`.
         :param name: The new name, if it is changing.

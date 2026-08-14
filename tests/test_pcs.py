@@ -1110,6 +1110,10 @@ def test_a_meta_that_holds_neither_member_names_its_tags(
     # It decoded and held nothing, which means the reader is looking in the wrong place
     # rather than anything being malformed. That is the hardest failure to diagnose from a
     # message, and naming the tags is what settles it.
+    #
+    # At DEBUG, not WARNING: at the record level an empty meta is the normal case, and
+    # this fired once per record for nothing. The zone level, where it is fatal, raises
+    # from unwrap_zone with a message of its own.
     import logging  # noqa: PLC0415
 
     from findmy.cloudkit.pcs import parse_meta  # noqa: PLC0415
@@ -1117,7 +1121,7 @@ def test_a_meta_that_holds_neither_member_names_its_tags(
     # A SEQUENCE holding [7] rather than [0] or [2].
     plaintext = bytes([0x30, 0x04, 0xA7, 0x02, 0x04, 0x00])
 
-    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.pcs"):
+    with caplog.at_level(logging.DEBUG, logger="findmy.cloudkit.pcs"):
         contents = parse_meta(plaintext)
 
     assert not contents.symmetric_keys

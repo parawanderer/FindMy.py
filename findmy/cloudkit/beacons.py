@@ -933,13 +933,15 @@ class AsyncBeaconStore:
             from an export is not a right to modify someone else's records, and nothing
             here can tell the two apart -- that judgement belongs to the caller.
 
-        .. warning::
-            **A success is not proof.** The response is the server echoing what it was
-            sent, and re-fetching only proves this implementation agrees with itself: the
-            field layout puts the GCM tag before the ciphertext, so a value written the
-            natural way round-trips through :func:`~findmy.cloudkit.pcs.decrypt_field`
-            perfectly and is unreadable to Apple. The check that means something is an
-            untouched Apple device showing the new name.
+        .. note::
+            **[observed] This works.** A name written here displayed correctly in Apple's
+            own Find My on a Mac, and the accessory kept its emoji and its association --
+            so the merge, the whole-record send and the field layout are all confirmed.
+
+            The caveat that got it there is still worth keeping: a success response is the
+            server echoing what it was sent, and re-fetching only proves this
+            implementation agrees with itself. An Apple device was the only thing that
+            could settle it, and remains the check to repeat if this path changes.
 
         **Only a naming record may be written.** A `MasterBeaconRecord` holds the
         accessory's key material and a botched write costs the accessory; a

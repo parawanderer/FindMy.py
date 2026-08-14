@@ -15,14 +15,12 @@ already need.
 **Your own account only.** Holding an accessory's keys from an export is not a right to
 modify someone else's iCloud records, and nothing in this can tell the two apart.
 
-.. warning::
-    **Nobody has confirmed this works.** The value written round-trips through this
-    library, but the field layout puts the GCM tag before the ciphertext -- and a writer
-    and a reader that both got that wrong would agree with each other perfectly while
-    producing something no Apple device can read. So the check that means anything is the
-    last step here: **look at the tag on an iPhone, iPad or Mac.** If the old name is
-    still there, or the new one is blank or garbled, say so -- that is the finding this
-    script exists to produce, and it is worth more than a clean run.
+**[observed] This works.** A name written by this script showed up correctly in Apple's
+own Find My on a Mac, with the accessory's emoji and its association intact. That check
+mattered more than it sounds: the field layout puts the GCM tag *before* the ciphertext,
+and a writer and a reader that both got that wrong would agree with each other perfectly
+while producing something no Apple device could read. Nothing on this side could have
+caught it, which is why the script still ends by asking you to go and look.
 
 Renaming back is a rename like any other, so a wrong name is not a trap.
 """
@@ -155,12 +153,12 @@ async def main() -> int:  # noqa: PLR0911
                 print("Which is not what was written, so the write did not take effect.")
                 return 1
 
-            print("\nThat only proves this library can read what this library wrote.")
-            print("**Now look at the accessory on an iPhone, iPad or Mac.** If the name")
-            print("there is the new one, this path is confirmed for the first time. If it")
-            print("is blank, garbled or unchanged, that is the more valuable result --")
-            print("please report it, because it means the field layout is wrong in a way")
-            print("nothing on this side can detect.")
+            print("\nThat only proves this library can read what this library wrote, so")
+            print("it is worth looking at the accessory on an iPhone, iPad or Mac too.")
+            print("This path has been confirmed that way once -- a name written here")
+            print("showed up correctly in Find My on a Mac -- but nothing on this side")
+            print("can detect a layout Apple would reject, so a blank or garbled name")
+            print("there is still the more valuable result and worth reporting.")
     except UnhandledProtocolError as e:
         print(f"\nFailed: {e}")
         return 1

@@ -4,10 +4,11 @@ Protected Cloud Storage: turning an encrypted CloudKit record field into plainte
 Implements Stage 5 of the Find My key-export protocol specification. This is where the
 keys recovered from the iCloud Keychain are finally spent.
 
-**Nothing in this module has been exercised against a real record.** Every construction
-here is implemented exactly as specified rather than guessed at, and the specification is
-now precise throughout -- but precise is not the same as verified, and the first real
-record is what will say so.
+**[observed] The read and write paths both work against a real account**: every record in
+a live accessory zone unwrapped and decrypted, and a field written by :func:`encrypt_field`
+displayed correctly in Apple's own Find My. One branch remains unexercised and says so
+where it is -- :func:`unwrap_zone_record_defaults`, for records carrying no protection
+structure of their own, which no record on the account examined did.
 
 Three details are worth knowing before reading, because each fails in a way that does not
 point at its own cause:
@@ -1005,7 +1006,8 @@ def unwrap_zone(
             " so there is nothing for its records to be protected under. Its meta is where"
             " those keys live, and it held"
             f" {len(unwrapped.meta.symmetric_keys)} symmetric key(s) and none of the other"
-            " kind."
+            " kind. Its DER shape is logged at DEBUG, and that is what tells a meta this"
+            " reader looked in the wrong place from one that is genuinely empty."
         )
         raise PCSError(msg)
 
@@ -1215,10 +1217,17 @@ def parse_meta(plaintext: bytes) -> MetaContents:
                 private.extend(found)
 
     if not symmetric and not private:
-        # It decoded and held neither member, which means the reader is looking in the
-        # wrong place rather than anything being malformed -- the hardest failure to
-        # diagnose from a message, and the one where naming the tags settles it.
-        logger.warning(
+        # DEBUG, not WARNING, because whether this matters depends entirely on the level
+        # and this function cannot see it. At the RECORD level it is the normal case: the
+        # master key comes from steps 1-5 and `meta` only supplies extra keys, so a record
+        # with none carries a meta holding just `[1]` -- every record on a real account
+        # did, which made this fifteen identical warnings per run for nothing. At the ZONE
+        # level it IS fatal, and `unwrap_zone` raises for it with a message that can say
+        # so, because up there the keys are the whole point.
+        #
+        # Still logged: the shape is what settles "looking in the wrong place" against
+        # "genuinely empty", and that took three rounds to establish once already.
+        logger.debug(
             "A decrypted meta carries neither symmKeys nor identities. Its shape is: %s",
             der.describe(element, depth=4),
         )
@@ -1274,10 +1283,18 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
         # A keyset carries its own checksum, and checking it here is what tells a
         # structure that *holds* keys from one that *is* a key -- the distinction this
         # walk got wrong by returning a 32-byte digest.
+        #
+        # DEBUG, and phrased as a doubt about the check rather than about the data,
+        # because [observed] it does not match on any real keyset. Everything downstream
+        # of these keys works -- the zone unwraps, records decrypt, a write reached an
+        # Apple device -- so the keys are right and it is this digest's construction that
+        # is not established. Warning per record that correct data looks wrong is worse
+        # than not checking, and nothing here acts on the result.
         checked = verify_keyset_hash(member)
         if checked is False:
-            logger.warning(
-                "A keyset's checksum does not match its contents. Its shape is: %s",
+            logger.debug(
+                "A keyset's checksum did not match the digest computed for it, which is"
+                " expected until the construction is established. Its shape is: %s",
                 der.describe(member, depth=3),
             )
 
@@ -1316,6 +1333,17 @@ def verify_keyset_hash(keyset: der.DerElement) -> bool | None:
     being returned *as* a key, because it is thirty-two bytes and so is a P-256 scalar.
     Checking it names that mistake immediately, where otherwise it surfaces as a valid key
     that matches nothing, five levels away.
+
+    .. warning::
+        **[observed] This returns False on every real keyset, and the keys are fine.** The
+        zone unwraps, records decrypt, and a field written under these keys reached an
+        Apple device -- so what is unestablished is this digest's construction, not the
+        data. Most likely the re-encoding is not byte-identical to what Apple hashed, or
+        the digest covers something other than the structure with `hash` removed.
+
+        So **nothing acts on the result**, and a False is logged at DEBUG rather than
+        warned about. Do not turn this into a check that rejects anything until a real
+        keyset has been seen to pass it.
 
     :returns: Whether it matched, or None if the structure carries no checksum to check.
     """
@@ -1555,13 +1583,16 @@ def encrypt_field(
     change a value -- which is what makes renaming an accessory possible at all, and also
     what makes it easy to write something Apple's own devices cannot read.
 
-    .. warning::
+    .. note::
         **The tag precedes the ciphertext**, and almost every AEAD interface in every
-        language returns it appended. The natural way to write this produces a value that
+        language returns it appended. Written the natural way this produces a value that
         fails authentication -- and :func:`decrypt_field`, written to the same layout,
-        round-trips it happily. **A field this library wrote and can read back is not
-        evidence that Apple can read it.** The check that means something is an untouched
-        Apple device showing the new value.
+        round-trips it happily, so a round trip through this library proves nothing about
+        the layout at all.
+
+        **[observed] The layout is right.** A name written by this function displayed
+        correctly in Apple's own Find My on a Mac, which is the only check that could
+        establish it. Before that, this docstring said not to believe a round trip.
 
     :param plaintext: What to encrypt. For everything but a bytes field this is the
         wrapper message, not the bare value -- see
