@@ -259,7 +259,15 @@ class PinnedRoots:
         return bool(self.by_version)
 
     def issuers_of(self, certificate: x509.Certificate) -> list[x509.Certificate]:
-        """Every pinned root whose subject matches this certificate's issuer."""
+        """
+        Every pinned root whose subject matches this certificate's issuer.
+
+        **The whole DN, and that is load-bearing.** All four roots share `CN=Escrow Service
+        Root CA, OU=Apple Certification Authority, O=Apple Inc., C=US`; the only thing
+        telling them apart is the X.520 `serialNumber` attribute (OID 2.5.4.5) carrying the
+        version. A matcher that compared common names, or that dropped an attribute it did
+        not recognise, would find four candidates and no way to choose between them.
+        """
         return [
             root for root in self.by_version.values() if root.subject == certificate.issuer
         ]
@@ -350,10 +358,17 @@ def verify_club_certificate(
 
     candidates = roots.issuers_of(certificate)
     if not candidates:
+        # Read this as **rotation**, not as a broken account. The pinned set is fixed and
+        # Apple's is not: 101 to 103 run to 2049 and are not what is being issued against,
+        # and **[observed]** 500 is -- with a 2032 expiry. A certificate issued under a
+        # root outside this set is the expected end of that arrangement, and what it needs
+        # is a newer root shipped here rather than anything done to the account.
         msg = (
             f"The club certificate names {certificate.issuer.rfc4514_string()} as its"
-            " issuer, which is not among the pinned escrow roots. Refusing, rather than"
-            " falling back to the system trust store."
+            " issuer, which is none of the pinned escrow roots. The most likely reason is"
+            " that Apple has rotated to a root newer than the four this library carries,"
+            " in which case this library needs updating and the account is fine. Refusing"
+            " either way, rather than falling back to the system trust store."
         )
         raise EnrolmentError(msg)
 

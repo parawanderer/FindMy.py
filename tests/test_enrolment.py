@@ -234,7 +234,9 @@ def test_a_club_certificate_from_another_issuer_is_refused_rather_than_chained(p
     _, club = _make_club(other_key, other)
     roots = PinnedRoots.load([root.public_bytes(serialization.Encoding.DER)])
 
-    with pytest.raises(EnrolmentError, match="not among the pinned"):
+    # And it reads as rotation rather than as a broken account: the pinned set is fixed
+    # and Apple's is not, so an unrecognised issuer means a newer root has to ship here.
+    with pytest.raises(EnrolmentError, match="rotated to a root newer"):
         verify_club_certificate(club.public_bytes(serialization.Encoding.DER), roots, now=NOW)
 
 
@@ -685,3 +687,30 @@ def test_a_root_with_years_left_says_nothing(pinned, caplog: pytest.LogCaptureFi
         verify_club_certificate(club.public_bytes(serialization.Encoding.DER), roots, now=NOW)
 
     assert caplog.text == ""
+
+
+def test_the_four_roots_are_told_apart_only_by_their_serial_number_attribute() -> None:
+    # All four share a common name, an organisation and an OU. The X.520 serialNumber
+    # attribute is the whole difference, so a matcher comparing common names -- or one
+    # dropping an attribute it did not recognise -- would have four candidates and no way
+    # to choose. This is why the issuer match compares the whole DN.
+    from cryptography.x509.oid import NameOID  # noqa: PLC0415
+
+    roots = PinnedRoots.bundled()
+
+    without_serial = set()
+    for version, certificate in roots.by_version.items():
+        attributes = {
+            attribute.oid.dotted_string: attribute.value
+            for attribute in certificate.subject
+        }
+        assert attributes["2.5.4.5"] == str(version)  # X.520 serialNumber
+        assert certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[
+            0
+        ].value == "Escrow Service Root CA"
+
+        without_serial.add(
+            tuple(sorted((k, v) for k, v in attributes.items() if k != "2.5.4.5")),
+        )
+
+    assert len(without_serial) == 1
