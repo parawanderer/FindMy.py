@@ -19,6 +19,7 @@ from urllib.parse import quote
 from typing_extensions import override
 
 from findmy.errors import UnauthorizedError, UnhandledProtocolError
+from findmy.reports.anisette import CLIENT_SERIAL
 from findmy.util.abc import Closable
 from findmy.util.http import HttpSession
 
@@ -275,7 +276,7 @@ class AsyncCloudKitClient(Closable):
         environment: str = "Production",
         database_scope: str = "PRIVATE",
         device_name: str = "FindMy.py",
-        device_serial: str = "0",
+        device_serial: str = CLIENT_SERIAL,
     ) -> None:
         """
         Initialize the client.

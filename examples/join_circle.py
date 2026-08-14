@@ -46,6 +46,7 @@ from _login import get_account_async  # pyright: ignore [reportMissingImports]
 from findmy.errors import UnhandledProtocolError
 from findmy.keychain import AsyncKeychainSession, DeviceDescription, RecoveryOptions
 from findmy.keychain.peers import check_peer_identifiers
+from findmy.reports.anisette import CLIENT_SERIAL
 
 ANISETTE_SERVER = None
 ANISETTE_LIBS_PATH = "ani_libs.bin"
@@ -68,7 +69,9 @@ ACCOUNT_STORE = "account.json"
 DEVICE = DeviceDescription(
     name="FindMy.py",
     model="MacBookPro18,3",
-    serial="FINDMYPY0001",
+    # The same serial the login presents, so the escrow listing and the account's device
+    # list name this client identically rather than as two synthetic devices.
+    serial=CLIENT_SERIAL,
     # The build that goes with the OS version below. They were inconsistent here at first,
     # which nothing checks today and which would be wrong the moment something does.
     build="22F82",

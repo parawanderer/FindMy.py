@@ -80,3 +80,39 @@ async def test_a_pet_cannot_be_requested_before_logging_in() -> None:
 
     with pytest.raises(InvalidStateError):
         await account.request_pet()
+
+
+def test_the_client_serial_reaches_the_header_that_names_it_in_the_device_list() -> None:
+    # `X-Apple-I-SRL-NO` is what the account's device list shows as the serial, and the
+    # entry is otherwise indistinguishable from a real Mac -- the model and OS strings
+    # claim to be one. A recognisable serial is the difference between a device somebody
+    # can identify as software they installed and one they are invited to remove.
+    import asyncio  # noqa: PLC0415
+
+    from findmy.reports.anisette import CLIENT_SERIAL, BaseAnisetteProvider  # noqa: PLC0415
+
+    class Provider(BaseAnisetteProvider):
+        @property
+        def otp(self) -> str:
+            return "otp"
+
+        @property
+        def machine(self) -> str:
+            return "machine"
+
+        async def close(self) -> None:
+            return
+
+        def to_json(self, dst=None):  # noqa: ANN001, ANN202, ARG002
+            return {}
+
+        @classmethod
+        def from_json(cls, val):  # noqa: ANN001, ANN206, ARG003
+            raise NotImplementedError
+
+    headers = asyncio.run(Provider().get_headers("user", "device"))
+
+    assert headers["X-Apple-I-SRL-NO"] == CLIENT_SERIAL
+    assert CLIENT_SERIAL == "0FINDMYPY001"
+    # Deliberately not mistakable for hardware.
+    assert not CLIENT_SERIAL.isalnum() or CLIENT_SERIAL.startswith("0FINDMYPY")

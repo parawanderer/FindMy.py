@@ -21,6 +21,25 @@ from findmy import util
 
 logger = logging.getLogger(__name__)
 
+CLIENT_SERIAL = "0FINDMYPY001"
+"""
+The serial this client presents as, in `X-Apple-I-SRL-NO`.
+
+**It is what names this client in the account's device list**, which is the one place a
+person ever sees it -- and the entry is otherwise indistinguishable from a real Mac, since
+the model and OS strings above claim to be one. A recognisable serial is the difference
+between a device somebody can identify as software they installed and one they are invited
+to remove because they do not recognise it.
+
+Deliberately implausible as a real serial: nothing should mistake it for hardware.
+
+> **Changing this changes the login identity.** It is part of what Apple binds a session
+> to, so an account stored under a different serial may need signing in again, and the old
+> device-list entry stays until it is removed by hand -- a new serial adds an entry rather
+> than renaming one.
+"""
+
+
 
 class RemoteAnisetteMapping(TypedDict, total=False):
     """JSON mapping representing state of a remote Anisette provider."""
@@ -138,7 +157,7 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         self,
         user_id: str,
         device_id: str,
-        serial: str = "0",
+        serial: str = CLIENT_SERIAL,
         with_client_info: bool = False,
     ) -> dict[str, str]:
         """
@@ -178,7 +197,7 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         self,
         user_id: str,
         device_id: str,
-        serial: str = "0",
+        serial: str = CLIENT_SERIAL,
     ) -> dict[str, str]:
         """
         Generate a complete dictionary of CPD data.
@@ -282,7 +301,7 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
         self,
         user_id: str,
         device_id: str,
-        serial: str = "0",
+        serial: str = CLIENT_SERIAL,
         with_client_info: bool = False,
     ) -> dict[str, str]:
         """See :meth::meth:`BaseAnisetteProvider.get_headers`."""
@@ -429,7 +448,7 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
         self,
         user_id: str,
         device_id: str,
-        serial: str = "0",
+        serial: str = CLIENT_SERIAL,
         with_client_info: bool = False,
     ) -> dict[str, str]:
         """See :meth:`BaseAnisetteProvider.get_headers`."""
