@@ -12,13 +12,17 @@ Four parts, in increasing order of what they need:
   2. **Ask what the account could be recovered from** -- the escrow records Apple shows
      nowhere in its own interfaces, joined against the bottles the trust-circle service
      considers usable. Needs a fresh PET, which means one extra authentication.
-  3. **Decrypt**, if MANATEE_KEYS_PATH points at PEM keys from the `Manatee` keychain
-     view. Obtaining those is the part of Stage 3 that is not implemented, so this is for
-     someone who has extracted them by other means.
+  3. **Decrypt.** The keys come from the `Manatee` keychain view, and this can recover
+     them itself -- which needs the screen-lock passcode of one of the account's devices.
+     Set MANATEE_KEYS_PATH to a file of PEM keys to skip that and use those instead.
 
-**Nothing here writes to the account.** No escrow record is created, no peer joins the
-trust circle, no passcode is asked for. Signing in registers a device, but that has
-already happened by the time this runs.
+**Nothing here writes to the account.** No escrow record is created and no peer joins the
+trust circle. Recovering the keys is entirely read-only: a share is wrapped to the
+receiving peer's encryption key, and escrow recovery yields exactly that key.
+
+The passcode is read with `getpass`, used inside one call, and not stored, logged or
+retained. **No key material is written to disk** -- the keys live in memory for this run
+only, which is why this asks each time rather than caching.
 
 Logging is turned up deliberately, because the interesting output is usually a warning
 rather than a result: an unmodelled protobuf field, a mismatch between the escrow proxy
@@ -28,6 +32,7 @@ and the trust-circle service, or a signature that did not verify.
 from __future__ import annotations
 
 import asyncio
+import getpass
 import logging
 import os
 import sys
@@ -72,6 +77,45 @@ def load_keys() -> list[ec.EllipticCurvePrivateKey]:
     return keys
 
 
+async def recover_keys(account) -> list[ec.EllipticCurvePrivateKey]:  # noqa: ANN001
+    """
+    Recover the `Manatee` service keys, asking for a device passcode.
+
+    Read-only from end to end: the shares are wrapped to a key escrow recovery yields, so
+    nothing is created, signed or enrolled. See `recover_escrow_material.py` for the same
+    flow reported step by step.
+    """
+    async with await AsyncKeychainSession.open(account) as session:
+        options = await session.recovery_options()
+        if not options.recoverable:
+            print("No record on this account is currently recoverable.")
+            return []
+
+        print(f"\n{len(options.recoverable)} record(s) can be recovered from:\n")
+        for record in options.recoverable:
+            print(f"  {record.describe()}")
+
+        print("\nEnter the SERIAL of the one to recover from, or nothing to skip.")
+        print("You will need that device's screen-lock passcode.\n")
+
+        typed = input("serial> ").strip()
+        if not typed:
+            return []
+
+        chosen = next((r for r in options.recoverable if r.serial == typed), None)
+        if chosen is None:
+            print("No recoverable record has that serial.")
+            return []
+
+        passcode = getpass.getpass("passcode (not echoed)> ")
+        try:
+            peer = await session.recover(chosen, passcode)
+        finally:
+            del passcode
+
+        return (await session.service_keys(peer)).for_pcs()
+
+
 async def report_recovery_options(account) -> None:  # noqa: ANN001
     """
     Report what this account could be recovered from, if anything.
@@ -108,7 +152,7 @@ async def report_recovery_options(account) -> None:  # noqa: ANN001
         print(f"  undescribed: {bottle_id}")
 
 
-async def main() -> int:  # noqa: C901, PLR0915 -- a probe; linear reads better
+async def main() -> int:  # noqa: C901, PLR0912, PLR0915 -- a probe; linear reads better
     """Fetch, and decrypt if keys were supplied."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(name)s: %(message)s")
     logging.getLogger("findmy.cloudkit").setLevel(logging.DEBUG)
@@ -167,8 +211,11 @@ async def main() -> int:  # noqa: C901, PLR0915 -- a probe; linear reads better
 
         keys = load_keys()
         if not keys:
-            print("\nSet MANATEE_KEYS_PATH to a file of PEM private keys to decrypt these.")
-            print("Obtaining them is Stage 3, which is not implemented.")
+            print("\n--- Recovering the keys to decrypt with ---")
+            keys = await recover_keys(account)
+        if not keys:
+            print("\nNo keys, so nothing above can be decrypted. Set MANATEE_KEYS_PATH to")
+            print("a file of PEM private keys to supply them another way.")
             return 0
 
         print(f"\nDecrypting with {len(keys)} key(s)...")
