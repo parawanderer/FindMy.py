@@ -1200,6 +1200,16 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
             except (ServiceKeyError, der.DerError):
                 pass
 
+        # A keyset carries its own checksum, and checking it here is what tells a
+        # structure that *holds* keys from one that *is* a key -- the distinction this
+        # walk got wrong by returning a 32-byte digest.
+        checked = verify_keyset_hash(member)
+        if checked is False:
+            logger.warning(
+                "A keyset's checksum does not match its contents. Its shape is: %s",
+                der.describe(member, depth=3),
+            )
+
         # **Descend even when the member already yielded a key.** A `ShareProtectionKeySet`
         # is `{ name, keys, set, hash }`, and reading it *as* a key succeeds -- its 32-byte
         # `hash` is exactly a scalar's length, and nothing about an unverifiable 32-byte
@@ -1217,6 +1227,41 @@ def _identity_keys(identity: der.DerElement, depth: int = 6) -> list[ec.Elliptic
             keys.extend(_identity_keys(nested, depth - 1))
 
     return keys
+
+
+# A keyset's checksum is a SHA-256 digest, and so is exactly the length of a P-256 scalar.
+# That coincidence is why a reader can return the checksum where the key was meant.
+_KEYSET_HASH_LENGTH = 32
+
+
+def verify_keyset_hash(keyset: der.DerElement) -> bool | None:
+    """
+    Check a nested keyset's own checksum.
+
+    SHA-256 over the structure's DER **with `hash` itself removed** -- so the structure is
+    re-encoded without that member and hashed, the same shape as §4 step 5's HMAC.
+
+    Worth doing for a reason beyond correctness: this digest is the very thing that was
+    being returned *as* a key, because it is thirty-two bytes and so is a P-256 scalar.
+    Checking it names that mistake immediately, where otherwise it surfaces as a valid key
+    that matches nothing, five levels away.
+
+    :returns: Whether it matched, or None if the structure carries no checksum to check.
+    """
+    members = _members_of(keyset)
+    if not members:
+        return None
+
+    last = members[-1]
+    if not last.is_universal(der.TAG_OCTET_STRING) or len(last.as_bytes()) != _KEYSET_HASH_LENGTH:
+        return None
+
+    try:
+        rebuilt = der.rebuild_without(keyset, len(members) - 1)
+    except der.DerError:
+        return None
+
+    return hashlib.sha256(rebuilt).digest() == last.as_bytes()
 
 
 def _members_of(element: der.DerElement) -> list[der.DerElement]:

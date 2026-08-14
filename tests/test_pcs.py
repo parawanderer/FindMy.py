@@ -1340,3 +1340,71 @@ def test_a_keyset_without_its_application_wrapper_is_read_too() -> None:
 
     assert real.private_numbers().private_value in found
     assert int.from_bytes(digest, "big") not in found
+
+
+def a_keyset(blob: bytes, *, digest: bytes | None = None, wrapped: bool = True) -> bytes:
+    """A ShareProtectionKeySet: name, keys, set, and its own SHA-256."""
+
+    def length(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(body)]) + body
+
+    def tlv(tag: int, body: bytes) -> bytes:
+        return bytes([tag]) + length(len(body)) + body
+
+    members = tlv(0x0C, b"") + tlv(0x31, tlv(0x30, tlv(0x04, blob))) + tlv(0x31, b"")
+
+    # The digest covers the structure with `hash` absent, so it is computed over exactly
+    # what this would encode to without that member.
+    without = tlv(0x30, members)
+    if wrapped:
+        without = tlv(0x62, without)
+
+    real = hashlib.sha256(without).digest()
+    inner = tlv(0x30, members + tlv(0x04, digest if digest is not None else real))
+
+    return tlv(0x62, inner) if wrapped else inner
+
+
+def test_a_keysets_checksum_verifies_over_itself_without_its_hash() -> None:
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import verify_keyset_hash  # noqa: PLC0415
+
+    element, _ = der.parse_one(a_keyset(bytes(range(64)), wrapped=False))
+
+    assert verify_keyset_hash(element) is True
+
+
+def test_a_keyset_whose_checksum_is_wrong_says_so() -> None:
+    # This digest is what was being returned as a key. Checking it names the mistake where
+    # it happens, rather than five levels later as a key that matches nothing.
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import verify_keyset_hash  # noqa: PLC0415
+
+    element, _ = der.parse_one(a_keyset(bytes(range(64)), digest=bytes(32), wrapped=False))
+
+    assert verify_keyset_hash(element) is False
+
+
+def test_a_structure_with_no_checksum_is_not_reported_as_failing() -> None:
+    from findmy.cloudkit import der  # noqa: PLC0415
+    from findmy.cloudkit.pcs import verify_keyset_hash  # noqa: PLC0415
+
+    element, _ = der.parse_one(bytes([0x30, 0x03, 0x02, 0x01, 0x01]))
+
+    assert verify_keyset_hash(element) is None
+
+
+def test_rebuilding_reuses_the_members_that_arrived() -> None:
+    # DER orders a SET OF by encoded value, so re-encoding from parsed values can differ
+    # from the input. Emitting the original spans sidesteps that rather than answering it.
+    from findmy.cloudkit import der  # noqa: PLC0415
+
+    raw = bytes([0x30, 0x06, 0x02, 0x01, 0x09, 0x04, 0x01, 0xFF])
+    element, _ = der.parse_one(raw)
+
+    rebuilt = der.rebuild_without(element, 1)
+
+    assert rebuilt == bytes([0x30, 0x03, 0x02, 0x01, 0x09])

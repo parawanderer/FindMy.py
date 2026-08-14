@@ -178,6 +178,38 @@ def iter_elements(data: bytes) -> Iterator[DerElement]:
         yield element
 
 
+def encode_length(length: int) -> bytes:
+    """Encode a DER length, short form under 128 and long form above."""
+    if length < 0x80:
+        return bytes([length])
+    body = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(body)]) + body
+
+
+def rebuild_without(element: DerElement, index: int) -> bytes:
+    """
+    Re-encode a constructed element with one of its members left out.
+
+    For a checksum computed "over this structure's own DER with `hash` absent". The
+    members that remain are re-emitted **as they arrived** rather than re-encoded from
+    parsed values, which sidesteps the two ways a re-encoding can differ from its input:
+    DER orders a `SET OF` by encoded value, and a decoder that discards its input cannot
+    reproduce what it did not keep.
+
+    :param element: The structure to rebuild.
+    :param index: Which member to leave out. By position rather than by identity, because
+        parsing yields fresh objects each time and an identity test would silently omit
+        nothing at all.
+    """
+    if element.raw[0] & 0x1F == 0x1F:
+        msg = "Cannot rebuild an element with a multi-byte tag"
+        raise DerError(msg)
+
+    members = element.children()
+    body = b"".join(child.raw for i, child in enumerate(members) if i != index)
+    return element.raw[:1] + encode_length(len(body)) + body
+
+
 def describe(element: DerElement, depth: int = 2) -> str:
     """
     Describe an element's shape by tag, for a structure that parsed but held nothing.
