@@ -50,9 +50,11 @@ from _login import get_account_async  # pyright: ignore [reportMissingImports]
 
 from findmy.errors import UnhandledProtocolError
 from findmy.keychain import AsyncKeychainSession, RecoveredPeer
+from findmy.keychain.peers import check_peer_identifiers
 from findmy.keychain.shares import summarise
 
 if TYPE_CHECKING:
+    from findmy.keychain.peers import PeerDirectory
     from findmy.keychain.servicekey import ServiceKeys
 
 ANISETTE_SERVER = None
@@ -95,6 +97,29 @@ def report_shares(shares: list) -> bool:
             print(f"      {name}: {len(key)} bytes")
 
     return any(share.plaintext for share in shares)
+
+
+def report_peer_identifiers(directory: PeerDirectory) -> None:
+    """
+    Recompute every peer's identifier and say whether the derivation reproduces it.
+
+    Read-only, and the only chance to check this before it matters. A join names its
+    beneficiary by an identifier derived for an identity that does not exist yet, so
+    nothing about the join itself can validate it -- but every peer already in the circle
+    was named by the same rule, and reproducing a SHA-256 digest by accident does not
+    happen. If these match, joining is an ordinary call rather than an irreversible guess.
+    """
+    check = check_peer_identifiers(directory)
+
+    print(f"  Peer identifiers: {check.describe()}")
+    if check.confirmed:
+        print("  The derivation reproduces every peer in this circle, so a voucher built")
+        print("  on it will name a beneficiary that exists.")
+    elif check.mismatched:
+        print("  It does NOT reproduce them, so joining would name a beneficiary that")
+        print("  does not exist -- and that failure only surfaces after the join is sent.")
+        for peer_hash in check.mismatched[:3]:
+            print(f"    reported {peer_hash}")
 
 
 def report_service_keys(keys: ServiceKeys) -> None:
@@ -150,6 +175,10 @@ async def main() -> int:
 
             directory = await session.peer_directory()
             print(f"The trust circle holds {len(directory)} peer(s).")
+
+            # Free, read-only, and it settles the one derivation that would otherwise be
+            # a guess made inside an irreversible call. See report_peer_identifiers.
+            report_peer_identifiers(directory)
 
             shares = await session.key_shares(peer)
             if not shares:

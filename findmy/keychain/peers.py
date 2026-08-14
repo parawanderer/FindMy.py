@@ -17,7 +17,9 @@ nothing can identify is not a small thing to wave through.
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -78,6 +80,36 @@ def load_public_key(data: bytes) -> ec.EllipticCurvePublicKey | None:
     return None
 
 
+PEER_ID_PREFIX = "SHA256:"
+"""
+Part of the identifier, not decoration on it.
+
+`CuttlefishPeer.hash` carries it, and §5.1's escrow labels embed the whole thing.
+"""
+
+
+def peer_identifier(permanent_info: bytes, signature: bytes) -> str:
+    """
+    Derive a peer's identifier from its signed permanent info.
+
+    `SHA256:` followed by base64 of a SHA-256 over the serialised `PeerPermanentInfo`
+    concatenated with its signature -- the payload bytes then the signature bytes, in that
+    order, with nothing between them.
+
+    **This is what makes joining checkable before it is irreversible.** A voucher names its
+    beneficiary by this identifier, and a wrong one produces a voucher for a peer that does
+    not exist -- a failure that lands *after* `joinWithVoucher`, the one call in this
+    project that cannot be taken back. :func:`check_peer_identifiers` recomputes it for
+    every peer already in the circle, which settles the derivation while still read-only.
+
+    :param permanent_info: The serialised `PeerPermanentInfo`, **as it arrived**. Not a
+        re-encoding of a parsed one: protobuf does not promise those are the same bytes.
+    :param signature: The signature over it, from the same `SignedInfo`.
+    """
+    digest = hashlib.sha256(permanent_info + signature).digest()
+    return PEER_ID_PREFIX + base64.b64encode(digest).decode()
+
+
 @dataclass(frozen=True)
 class Peer:
     """One peer of the trust circle, as far as verifying against it requires."""
@@ -92,9 +124,31 @@ class Peer:
     machine_id: str
     model_id: str
 
+    permanent_info: bytes = b""
+    """
+    The serialised `PeerPermanentInfo`, exactly as it arrived.
+
+    Kept because :func:`peer_identifier` is a digest over these bytes, and protobuf gives
+    no guarantee that re-encoding a parsed message reproduces its input -- so a peer id
+    recomputed from :attr:`signing_key` and friends would be a different peer id.
+    """
+
+    permanent_signature: bytes = b""
+    """The signature over the above. The other half of what the identifier digests."""
+
     def signing_public_key(self) -> ec.EllipticCurvePublicKey | None:
         """Load the signing key, or None if it is not in a shape this understands."""
         return load_public_key(self.signing_key)
+
+    @property
+    def derived_hash(self) -> str:
+        """What :func:`peer_identifier` makes of this peer's own permanent info."""
+        return peer_identifier(self.permanent_info, self.permanent_signature)
+
+    @property
+    def hash_is_derivable(self) -> bool:
+        """Whether the hash this peer reports is the one its permanent info produces."""
+        return bool(self.permanent_info) and self.derived_hash == self.hash
 
 
 @dataclass(frozen=True)
@@ -146,7 +200,75 @@ def _peer_from_proto(peer: cf.CuttlefishPeer) -> Peer | None:
         encryption_key=info.encryption_key,
         machine_id=info.machine_id,
         model_id=info.model_id,
+        # As they arrived. The identifier is a digest over exactly these bytes, so a
+        # re-encoding of `info` above would produce a different peer id for the same peer.
+        permanent_info=peer.permanent_info.info,
+        permanent_signature=peer.permanent_info.signature,
     )
+
+
+@dataclass(frozen=True)
+class IdentifierCheck:
+    """What recomputing every peer's identifier found."""
+
+    matched: list[str] = field(default_factory=list)
+    mismatched: list[str] = field(default_factory=list)
+    uncheckable: list[str] = field(default_factory=list)
+    """Peers carrying no permanent info to digest, so neither confirming nor denying."""
+
+    @property
+    def confirmed(self) -> bool:
+        """Whether the derivation reproduced every identifier it could be tested against."""
+        return bool(self.matched) and not self.mismatched
+
+    def describe(self) -> str:
+        """One line, for a caller deciding whether it is safe to build a voucher."""
+        parts = [f"{len(self.matched)} matched", f"{len(self.mismatched)} did not"]
+        if self.uncheckable:
+            parts.append(f"{len(self.uncheckable)} carried nothing to check")
+        return ", ".join(parts)
+
+
+def check_peer_identifiers(directory: PeerDirectory) -> IdentifierCheck:
+    """
+    Recompute every known peer's identifier and compare it against the one it reports.
+
+    **Do this before building a voucher.** A voucher names its beneficiary by an
+    identifier this client derives for an identity it just generated, and a wrong
+    derivation produces a voucher for a peer that does not exist -- a failure that lands
+    after `joinWithVoucher`, which cannot be taken back. Every peer already in the circle
+    is a worked example of the same derivation, free to check and read-only.
+
+    A match is decisive: reproducing a SHA-256 digest by accident is not a thing that
+    happens. So this is a search whose oracle is exact, unlike one over plausible-looking
+    outputs.
+
+    :param directory: The circle, from :func:`fetch_peer_directory`.
+    """
+    check = IdentifierCheck()
+    for peer in directory.peers.values():
+        if not peer.permanent_info:
+            check.uncheckable.append(peer.hash)
+        elif peer.hash_is_derivable:
+            check.matched.append(peer.hash)
+        else:
+            check.mismatched.append(peer.hash)
+
+    if check.mismatched:
+        logger.warning(
+            "The peer identifier derivation does not reproduce %d of %d known peer(s)."
+            " Building a voucher on it would name a beneficiary that does not exist, and"
+            " that failure only surfaces after the join has been sent.",
+            len(check.mismatched),
+            len(directory.peers),
+        )
+    elif check.matched:
+        logger.info(
+            "The peer identifier derivation reproduces all %d checkable peer(s)",
+            len(check.matched),
+        )
+
+    return check
 
 
 async def fetch_peer_directory(

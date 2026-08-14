@@ -10,6 +10,9 @@ identified, which points at the shares rather than at this.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -18,10 +21,14 @@ from findmy.cloudkit.client import CloudKitError
 from findmy.cloudkit.proto import cloudkit_pb2 as ck
 from findmy.cloudkit.proto import cuttlefish_pb2 as cf
 from findmy.keychain.peers import (
+    Peer,
     PeerDirectory,
     PeerDirectoryError,
+    _peer_from_proto,
+    check_peer_identifiers,
     fetch_peer_directory,
     load_public_key,
+    peer_identifier,
 )
 
 
@@ -271,3 +278,85 @@ def test_something_that_is_not_a_key_reads_as_nothing() -> None:
 def test_an_empty_directory_holds_nobody() -> None:
     assert len(PeerDirectory()) == 0
     assert "anyone" not in PeerDirectory()
+
+
+# --------------------------------------------------------------------------------------
+# Peer identifiers (§6.9, and what makes a join checkable before it is irreversible)
+# --------------------------------------------------------------------------------------
+
+
+def a_real_peer(signature: bytes = b"sig") -> cf.CuttlefishPeer:
+    """A peer whose hash is the one its own permanent info derives, as a real one's is."""
+    peer = a_peer("placeholder")
+    peer.hash = peer_identifier(peer.permanent_info.info, signature)
+    peer.permanent_info.signature = signature
+    return peer
+
+
+def test_a_peer_identifier_digests_the_info_then_the_signature() -> None:
+    info, signature = b"the-info", b"the-signature"
+    expected = base64.b64encode(hashlib.sha256(info + signature).digest()).decode()
+
+    assert peer_identifier(info, signature) == f"SHA256:{expected}"
+
+
+def test_the_prefix_is_part_of_the_identifier_not_decoration_on_a_label() -> None:
+    assert peer_identifier(b"a", b"b").startswith("SHA256:")
+
+
+def test_the_two_halves_are_not_interchangeable() -> None:
+    assert peer_identifier(b"aa", b"bb") != peer_identifier(b"bb", b"aa")
+
+
+def test_a_peer_keeps_the_bytes_its_identifier_is_computed_over() -> None:
+    # Not a re-encoding of the parsed message: protobuf does not promise those match, and
+    # a re-encoded permanent info would produce a different peer id for the same peer.
+    proto = a_real_peer()
+
+    peer = _peer_from_proto(proto)
+
+    assert peer is not None
+    assert peer.permanent_info == proto.permanent_info.info
+    assert peer.permanent_signature == proto.permanent_info.signature
+
+
+def test_the_derivation_is_confirmed_against_peers_already_in_the_circle() -> None:
+    # The whole point: every existing peer is a worked example, checking costs nothing and
+    # writes nothing, and reproducing a SHA-256 digest by accident does not happen. This
+    # is what turns joinWithVoucher from an irreversible guess into an ordinary call.
+    peer = _peer_from_proto(a_real_peer())
+    assert peer is not None
+
+    check = check_peer_identifiers(PeerDirectory(peers={peer.hash: peer}))
+
+    assert check.confirmed
+    assert check.matched == [peer.hash]
+
+
+def test_a_derivation_that_misses_is_reported_rather_than_averaged_away() -> None:
+    proto = a_real_peer()
+    proto.hash = "SHA256:not-what-it-derives-to"
+    peer = _peer_from_proto(proto)
+    assert peer is not None
+
+    check = check_peer_identifiers(PeerDirectory(peers={peer.hash: peer}))
+
+    assert not check.confirmed
+    assert check.mismatched == ["SHA256:not-what-it-derives-to"]
+
+
+def test_a_peer_with_nothing_to_digest_neither_confirms_nor_denies() -> None:
+    # Counted separately, because "checked and wrong" and "could not be checked" say
+    # opposite things about whether a voucher is safe to build.
+    peer = Peer(
+        hash="SHA256:whatever",
+        signing_key=a_public_key(),
+        encryption_key=b"",
+        machine_id="m",
+        model_id="",
+    )
+
+    check = check_peer_identifiers(PeerDirectory(peers={peer.hash: peer}))
+
+    assert check.uncheckable == ["SHA256:whatever"]
+    assert not check.confirmed
