@@ -1128,6 +1128,10 @@ def parse_meta(plaintext: bytes) -> MetaContents:
             symmetric.extend(entry.as_bytes() for entry in child.unwrap().children())
         elif child.is_context(_META_IDENTITIES):
             for identity in child.unwrap().children():
+                # Always, not only on failure. Which member a key came out of is the
+                # difference between reading a keyset and reading its checksum, and a
+                # 32-byte value is exactly the size of both a P-256 scalar and a SHA-256.
+                logger.debug("Identity shape: %s", der.describe(identity, depth=6))
                 found = _identity_keys(identity)
                 if not found:
                     # The member is present and the reader got nothing out of it, so what
