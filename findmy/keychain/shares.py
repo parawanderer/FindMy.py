@@ -686,11 +686,17 @@ async def fetch_recoverable_shares(
 
     logger.info("Peer %s is entitled to %d share(s)", peer_id, len(response.shares))
 
-    # The wire shape is several kilobytes of field numbers and sizes. It settled this
-    # message's schema once and is worth keeping for the next response that does not
-    # decode -- but at DEBUG, because a working run does not need it and printing it
-    # every time buries the line above that a working run does need.
-    logger.debug("Share response fields: %s", describe_wire(serialized))
+    # The wire shape settled this message's schema once, and is worth keeping for the next
+    # response that does not decode. Two things keep it from being a wall:
+    #
+    # DEBUG, because a working run does not need it and printing it every time buries the
+    # count above, which a working run does need.
+    #
+    # Top level only. At depth 2 this is five kilobytes of the same nested shape repeated
+    # once per share -- and when an individual entry really is the problem,
+    # `decode_share_entry` describes that one entry on the way to raising. So the depth is
+    # duplicated where it is useful and noise where it is not.
+    logger.debug("Share response fields: %s", describe_wire(serialized, depth=0))
 
     entries: list[ShareEntry] = []
     for index, raw in enumerate(response.shares):
