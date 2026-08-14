@@ -30,14 +30,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from typing import TYPE_CHECKING
 
 from _login import get_account_async  # pyright: ignore [reportMissingImports]
 
 from findmy.cloudkit.beacons import decrypt_records
 from findmy.cloudkit.constants import RecordType
-from findmy.cloudkit.records import CloudKitRecord
 from findmy.errors import UnhandledProtocolError
 from findmy.icloud import AsyncFindMyClient
+
+if TYPE_CHECKING:
+    from findmy.cloudkit.records import CloudKitRecord
 
 ANISETTE_SERVER = None
 ANISETTE_LIBS_PATH = "ani_libs.bin"
