@@ -568,8 +568,9 @@ def to_beacon_naming_plist(naming: DecryptedRecord) -> dict[str, Any]:
     the record's name rather than one of its fields, and the `cloudKitMetadata`
     placeholder -- the same two additions :func:`to_owned_beacon_plist` makes.
 
-    Every field is optional. `emoji` is genuinely absent on some real records, and a
-    record missing one is not a broken record.
+    Every field is optional, and treating them that way is not defensive coding: `emoji`
+    was present on one account's records and absent from another's, so a record without
+    one is not a broken record and a reader assuming either way is wrong on some account.
 
     **This names its accessory in `associatedBeacon`** -- not `beaconIdentifier`, which is
     what the alignment record uses for the same association. :func:`group_records` does
