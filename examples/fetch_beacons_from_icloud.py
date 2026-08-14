@@ -14,8 +14,9 @@ Four parts, in increasing order of what they need:
      considers usable. Needs a fresh PET, which means one extra authentication.
   3. **Decrypt.** The keys come from the `Manatee` keychain view, and this recovers them
      itself -- which needs the screen-lock passcode of one of the account's devices.
-  4. **Locate.** Ask the Find My network where each accessory was last seen. A different
-     service from all of the above, and the only part that needs no keychain material.
+  4. **Locate.** Ask the Find My network where each accessory was last seen -- with
+     `fetch_location`, exactly as `airtag.py` does for an accessory read from a plist.
+     What this produces is an ordinary accessory, so nothing new is needed to use one.
 
 **Nothing here writes to the account.** No escrow record is created and no peer joins the
 trust circle. Recovering the keys is entirely read-only: a share is wrapped to the
@@ -190,13 +191,8 @@ def report_accessories(accessories: list, located: dict) -> None:
         print(f"    serial:     {accessory.serial_number}")
         print(f"    paired:     {accessory.paired_at:%Y-%m-%d}")
 
-        report = located.get(accessory)
-        if report is None:
-            print("    location:   not seen by the network")
-        else:
-            seen = f"{report.timestamp:%Y-%m-%d %H:%M}"
-            print(f"    location:   {report.latitude:.5f}, {report.longitude:.5f}")
-            print(f"                {seen}, within {report.horizontal_accuracy}m")
+        location = located.get(accessory)
+        print(f"    location:   {location or 'not seen by the network'}")
 
 
 async def main() -> int:
@@ -227,12 +223,10 @@ async def main() -> int:
 
             accessories = await reader.accessories()
 
-            # A different service: the records say what an accessory *is*, and this asks
-            # the Find My network where it has been seen. Slow for an accessory with no
-            # key-alignment record, which searches its whole history -- see
-            # AsyncFindMyReader.locations.
+            # Nothing special about an accessory that came from iCloud: locating one is
+            # `fetch_location`, the same call that locates an accessory read from a plist.
             print("\nAsking the Find My network for their last known locations...")
-            report_accessories(accessories, await reader.locations(accessories))
+            report_accessories(accessories, await account.fetch_location(accessories))
     except UnhandledProtocolError as e:
         print(f"\nFailed: {e}")
         return 1

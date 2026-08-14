@@ -51,15 +51,7 @@ class FakeSession:
 
 
 class FakeAccount:
-    """An account that records which accessories it was asked to locate."""
-
-    def __init__(self) -> None:
-        self.asked: list[list[Any]] = []
-        self.reports: dict[Any, Any] = {}
-
-    async def fetch_location(self, keys):  # noqa: ANN001, ANN202
-        self.asked.append(list(keys))
-        return dict(self.reports)
+    """The account. Held only so the reader can hand it back; nothing here calls it."""
 
 
 class FakeStore:
@@ -271,49 +263,3 @@ async def test_the_held_keys_are_handed_out_as_a_copy() -> None:
     reader.keychain_keys.clear()
 
     assert reader.unlocked is True
-
-
-# --------------------------------------------------------------------------------------
-# Locations, which are a different service from everything above
-# --------------------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_locating_asks_the_network_about_the_accessories_it_was_given() -> None:
-    reader = a_reader()
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
-
-    await reader.locations(["tag-a", "tag-b"])  # type: ignore[list-item]
-
-    assert reader._account.asked == [["tag-a", "tag-b"]]  # type: ignore[attr-defined]  # noqa: SLF001
-
-
-@pytest.mark.asyncio
-async def test_locating_with_no_argument_fetches_the_accessories_first() -> None:
-    reader = a_reader()
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
-
-    await reader.locations()
-
-    assert reader._account.asked == [["an-accessory"]]  # type: ignore[attr-defined]  # noqa: SLF001
-
-
-@pytest.mark.asyncio
-async def test_an_accessory_the_network_has_not_seen_is_present_and_none() -> None:
-    # Omitting it would make "never seen" indistinguishable from "not asked about".
-    reader = a_reader()
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
-    reader._account.reports = {"tag-a": "a-report"}  # type: ignore[attr-defined]  # noqa: SLF001
-
-    located = await reader.locations(["tag-a", "tag-b"])  # type: ignore[list-item]
-
-    assert located == {"tag-a": "a-report", "tag-b": None}
-
-
-@pytest.mark.asyncio
-async def test_locating_nothing_asks_nothing() -> None:
-    reader = a_reader()
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
-
-    assert await reader.locations([]) == {}
-    assert reader._account.asked == []  # type: ignore[attr-defined]  # noqa: SLF001
