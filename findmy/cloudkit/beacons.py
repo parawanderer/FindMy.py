@@ -333,10 +333,16 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
     """
     Join decrypted records into accessories.
 
-    The three record types are **not** one-to-one -- six accessories with five naming
-    records and four alignment records is an ordinary account -- so this joins on
-    `associatedBeacon` and `beaconIdentifier` and tolerates absence. An accessory with no
-    name is normal and is still exported.
+    Joins on `associatedBeacon` and `beaconIdentifier`.
+
+    **A master beacon with no naming record is not an accessory**, and is discarded rather
+    than exported unnamed. The zone holds master beacons for things that are not tags --
+    an account with no iPad produced an `iPad13,18` entry, unnamed and serial-less, dated
+    the day of the export -- and resolving to a naming record is what distinguishes a tag
+    from one of those. OpenTagViewer discards them for the same reason.
+
+    Key alignment is genuinely optional and its absence is tolerated: exports before
+    format `0.0.2` carry none, and an accessory without one still works by probing.
     """
     records = list(records)
 
@@ -352,8 +358,20 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
         if r.record_type == RecordType.KEY_ALIGNMENT
     }
 
+    unnamed = [b for b in beacons if b.name not in naming]
+    if unnamed:
+        # Counted and named, never dropped quietly: "fewer accessories than expected" and
+        # "some of those records were never accessories" look identical from the outside.
+        logger.info(
+            "Discarding %d master beacon(s) with no naming record, so not accessories: %s",
+            len(unnamed),
+            ", ".join(sorted(b.name for b in unnamed)),
+        )
+
     accessories: list[FindMyAccessory] = []
     for beacon in beacons:
+        if beacon.name not in naming:
+            continue
         try:
             accessories.append(
                 accessory_from_record(
@@ -362,7 +380,7 @@ def accessories_from_records(records: Iterable[DecryptedRecord]) -> list[FindMyA
                     alignment=alignment.get(beacon.name),
                 ),
             )
-        except BeaconExportError:  # noqa: PERF203 -- one accessory failing must not
+        except BeaconExportError:
             # take the rest of the export with it
             logger.exception("Skipping accessory %s", beacon.name)
 

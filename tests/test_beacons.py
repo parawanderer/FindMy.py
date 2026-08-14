@@ -141,6 +141,15 @@ def beacon_record(
     return DecryptedRecord(name=name, record_type=RecordType.MASTER_BEACON, values=values)
 
 
+def naming_record(beacon: str = "BEACON-1", label: str = "Keys") -> DecryptedRecord:
+    """The record that makes a master beacon an accessory rather than a device."""
+    return DecryptedRecord(
+        name=f"NAMING-{beacon}",
+        record_type=RecordType.BEACON_NAMING,
+        values={"associatedBeacon": beacon, "name": label},
+    )
+
+
 def test_accessory_takes_the_master_key_from_the_tail_of_the_private_key() -> None:
     record = beacon_record()
     accessory = accessory_from_record(record)
@@ -237,41 +246,55 @@ def test_an_unreadable_alignment_record_degrades_rather_than_failing() -> None:
 
 
 def test_records_are_joined_by_identifier_not_by_position() -> None:
-    # Six accessories, five naming records and four alignment records is ordinary.
+    # The naming record for BEACON-2 arrives before the one for BEACON-1, so a join by
+    # position would name them the wrong way round.
     records = [
         beacon_record("BEACON-1"),
         beacon_record("BEACON-2"),
-        DecryptedRecord(
-            name="NAME-A",
-            record_type=RecordType.BEACON_NAMING,
-            values={"name": "Second", "associatedBeacon": "BEACON-2"},
-        ),
+        naming_record("BEACON-2", "Second"),
+        naming_record("BEACON-1", "First"),
     ]
 
     accessories = {a.identifier: a for a in accessories_from_records(records)}
 
-    assert accessories["BEACON-1"].name is None
+    assert accessories["BEACON-1"].name == "First"
     assert accessories["BEACON-2"].name == "Second"
 
 
-def test_an_accessory_with_no_naming_record_is_still_exported() -> None:
-    accessories = accessories_from_records([beacon_record()])
+def test_a_master_beacon_with_no_naming_record_is_not_an_accessory() -> None:
+    # [observed] The zone holds master beacons for things that are not tags: an account
+    # with no iPad produced an `iPad13,18` entry, unnamed and serial-less, dated the day
+    # of the export. Resolving to a naming record is what tells a tag from one of those.
+    assert accessories_from_records([beacon_record()]) == []
 
-    assert len(accessories) == 1
-    assert accessories[0].name is None
+
+def test_discarded_beacons_are_named_rather_than_dropped_quietly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # "Fewer accessories than expected" and "some of those were never accessories" look
+    # identical from the outside, so the difference has to be said.
+    import logging  # noqa: PLC0415
+
+    with caplog.at_level(logging.INFO, logger="findmy.cloudkit.beacons"):
+        accessories_from_records([beacon_record("NOT-A-TAG")])
+
+    assert "NOT-A-TAG" in caplog.text
+    assert "no naming record" in caplog.text
 
 
 def test_one_bad_accessory_does_not_take_the_rest_of_the_export_with_it() -> None:
     broken = beacon_record("BROKEN")
     del broken.values["sharedSecret"]
 
-    accessories = accessories_from_records([broken, beacon_record("FINE")])
+    accessories = accessories_from_records(
+        [broken, beacon_record("FINE"), naming_record("BROKEN"), naming_record("FINE")],
+    )
 
     assert [a.identifier for a in accessories] == ["FINE"]
 
 
 def test_accessories_serialise_to_findmy_own_format() -> None:
-    (accessory,) = accessories_from_records([beacon_record()])
+    (accessory,) = accessories_from_records([beacon_record(), naming_record()])
     payload = accessory.to_json()
 
     assert payload["type"] == "accessory"
