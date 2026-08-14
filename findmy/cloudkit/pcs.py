@@ -28,6 +28,7 @@ import contextlib
 import hashlib
 import hmac
 import logging
+import secrets
 import struct
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -1475,20 +1476,38 @@ def encrypt_field(
     context: FieldContext,
     *,
     key_id_split: tuple[int, int] = (2, 2),
-    iv: bytes,
+    iv: bytes | None = None,
 ) -> bytes:
     """
     Encrypt a field the way :func:`decrypt_field` expects to find it.
 
-    Provided so that the field format can be exercised end to end without a real record.
-    Nothing in the read path uses it.
+    The same key that reads a field writes one, so nothing further has to be recovered to
+    change a value -- which is what makes renaming an accessory possible at all, and also
+    what makes it easy to write something Apple's own devices cannot read.
 
-    :param plaintext: What to encrypt.
+    .. warning::
+        **The tag precedes the ciphertext**, and almost every AEAD interface in every
+        language returns it appended. The natural way to write this produces a value that
+        fails authentication -- and :func:`decrypt_field`, written to the same layout,
+        round-trips it happily. **A field this library wrote and can read back is not
+        evidence that Apple can read it.** The check that means something is an untouched
+        Apple device showing the new value.
+
+    :param plaintext: What to encrypt. For everything but a bytes field this is the
+        wrapper message, not the bare value -- see
+        :func:`findmy.cloudkit.beacons.build_plaintext`.
     :param unwrapped: The master key to encrypt under.
-    :param context: Which field this is, authenticated alongside the header.
+    :param context: Which field this is, authenticated alongside the header. A wrong one
+        writes a value that will never decrypt where it was put.
     :param key_id_split: How many key-id bytes go before and after the length byte.
-    :param iv: The nonce. Must be 12 bytes and must never be reused under one key.
+    :param iv: The nonce, generated fresh if not supplied. **Twelve bytes, and never
+        reused under one key** -- GCM under a repeated nonce leaks the plaintexts, and a
+        record with several encrypted fields is exactly where one gets reused by accident.
+        Pass one only to reproduce a known value in a test.
     """
+    if iv is None:
+        iv = secrets.token_bytes(GCM_IV_LENGTH)
+
     if len(iv) != GCM_IV_LENGTH:
         msg = f"IV must be {GCM_IV_LENGTH} bytes"
         raise PCSError(msg)

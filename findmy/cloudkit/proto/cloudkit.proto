@@ -153,6 +153,7 @@ message RequestOperation {
   // 1101 functionInvoke exist and are not implemented here.
   optional ZoneRetrieveRequest zone_retrieve_request = 201;
   optional RetrieveZoneChangesRequest retrieve_zone_changes_request = 203;
+  optional RecordSaveRequest record_save_request = 210;
   optional RetrieveChangesRequest retrieve_changes_request = 213;
   optional FunctionInvokeRequest function_invoke_request = 1101;
 }
@@ -174,6 +175,37 @@ message FunctionInvokeResponse {
   optional bytes serialized_result = 1;
 }
 
+// ---------------------------------------------------------------------------
+// Writing a record (S4 ss4)
+// ---------------------------------------------------------------------------
+
+// The only write this project has a use for: saving a BeaconNamingRecord to rename an
+// accessory on the owner's own account.
+//
+// `merge` is not a convenience. With it false the server drops every field the request
+// does not carry, so a rename that sends only `name` deletes `associatedBeacon` -- the
+// join key that makes the record findable at all. Send the whole record and set merge
+// anyway; the flag is the safety net, not the plan.
+message RecordSaveRequest {
+  optional Record record = 1;
+  optional bool merge = 2;
+
+  // 2 creates, 3 updates.
+  optional int32 save_semantics = 6;
+
+  optional string zone_protection_info_tag = 7;
+
+  // The tag the record CURRENTLY carries. The save checks it and replaces it, so this
+  // serialises concurrent writes: a stale tag is a lost update rather than an error to
+  // retry with the same value. Re-fetch, take the new tag, rebuild the write.
+  optional string record_protection_info_tag = 8;
+}
+
+message RecordSaveResponse {
+  // The record as the server now holds it.
+  optional Record server_fields = 4;
+}
+
 message ResponseOperation {
   // ASSUMED int64. The specification names the field but not its type; a wire-type
   // mismatch decodes as an unknown field rather than failing, so a wrong guess here is
@@ -190,6 +222,7 @@ message ResponseOperation {
   // At the same field number as the request.
   optional ZoneRetrieveResponse zone_retrieve_response = 201;
   optional RetrieveZoneChangesResponse retrieve_zone_changes_response = 203;
+  optional RecordSaveResponse record_save_response = 210;
   optional RetrieveChangesResponse retrieve_changes_response = 213;
   optional FunctionInvokeResponse function_invoke_response = 1101;
 }

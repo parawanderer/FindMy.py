@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -16,6 +17,7 @@ from findmy.cloudkit.beacons import (
     DecryptedRecord,
     accessories_from_records,
     accessory_from_record,
+    build_plaintext,
     decrypt_record,
     decrypt_records,
     group_records,
@@ -809,3 +811,190 @@ def test_the_warning_says_how_many_alignment_records_were_fetched(
         accessories_from_records(records)
 
     assert "1 alignment record(s) were fetched" in caplog.text
+
+
+# --------------------------------------------------------------------------------------
+# Writing: renaming an accessory (S4 §4, S5 §6.1)
+# --------------------------------------------------------------------------------------
+
+
+def test_a_string_plaintext_is_wrapped_and_a_bytes_one_is_not() -> None:
+    # The asymmetry interpret_plaintext reads back. Writing a bare string where the
+    # wrapper belongs produces a field that decrypts cleanly and then fails to parse.
+    wrapped = build_plaintext(ValueType.STRING_TYPE, "Keys")
+
+    assert interpret_plaintext(ValueType.STRING_TYPE, wrapped) == "Keys"
+    assert build_plaintext(ValueType.ENCRYPTED_BYTES_TYPE, b"raw") == b"raw"
+
+
+def test_an_integer_plaintext_round_trips() -> None:
+    wrapped = build_plaintext(ValueType.INT64_TYPE, 999)
+
+    assert interpret_plaintext(ValueType.INT64_TYPE, wrapped) == 999
+
+
+def test_a_value_of_the_wrong_python_type_is_refused() -> None:
+    with pytest.raises(BeaconExportError, match="needs a string"):
+        build_plaintext(ValueType.STRING_TYPE, 7)
+
+    with pytest.raises(BeaconExportError, match="needs bytes"):
+        build_plaintext(ValueType.ENCRYPTED_BYTES_TYPE, "not bytes")
+
+
+def test_a_type_this_library_cannot_write_is_refused_rather_than_approximated() -> None:
+    # A field written in a form Apple cannot read is worse than one this declines to
+    # write, because only the second says so.
+    with pytest.raises(BeaconExportError, match="does not build plaintext"):
+        build_plaintext(ValueType.DATE_TYPE, PAIRED_AT)
+
+
+def test_the_tag_precedes_the_ciphertext_as_the_layout_says() -> None:
+    # Checked by slicing at the offsets the specification gives and decrypting with a
+    # bare cipher, NOT by round-tripping through parse_encrypted_field. A writer and a
+    # reader that both put the tag last agree with each other perfectly and produce
+    # something no Apple device can read, so a round trip cannot detect this at all.
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # noqa: PLC0415
+
+    master_key = bytes(range(16))
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    _, unwrapped = make_encrypted_record(private_key, master_key, {})
+
+    context = pcs.FieldContext(zone_name="BeaconStore", record_name="R", field_name="name")
+    sealed = pcs.encrypt_field(b"the plaintext", unwrapped, context, iv=b"\x00" * 12)
+
+    header_length = 4 + sealed[3]
+    header = sealed[:header_length]
+    body = sealed[header_length:]
+    iv, tag, ciphertext = body[:12], body[12:24], body[24:]
+
+    decryptor = Cipher(
+        algorithms.AES(pcs.derive_encryption_key(master_key)),
+        modes.GCM(iv, tag, min_tag_length=12),
+    ).decryptor()
+    decryptor.authenticate_additional_data(header + context.as_bytes())
+
+    assert decryptor.update(ciphertext) + decryptor.finalize() == b"the plaintext"
+
+
+def test_each_encryption_uses_a_fresh_nonce() -> None:
+    # GCM under a repeated nonce and the same key leaks the plaintexts, and a record with
+    # several encrypted fields is exactly where one gets reused by accident.
+    master_key = bytes(range(16))
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    _, unwrapped = make_encrypted_record(private_key, master_key, {})
+
+    context = pcs.FieldContext(zone_name="Z", record_name="R", field_name="name")
+    first = pcs.encrypt_field(b"same", unwrapped, context)
+    second = pcs.encrypt_field(b"same", unwrapped, context)
+
+    assert first != second
+
+
+class FakeClient:
+    """A CloudKit client that records what it was asked to save."""
+
+    def __init__(self) -> None:
+        self.saved: list[dict] = []
+
+    async def zone_retrieve(self) -> list:
+        return []
+
+    async def record_save(self, record, **kwargs) -> object:  # noqa: ANN001, ANN003
+        self.saved.append({"record": record, **kwargs})
+        return record
+
+
+def a_naming_record(
+    master_key: bytes = bytes(range(16)),
+) -> tuple[CloudKitRecord, ec.EllipticCurvePrivateKey]:
+    """A fetched naming record, encrypted the way a real one is."""
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    record, _ = make_encrypted_record(
+        private_key,
+        master_key,
+        {
+            "name": (ValueType.STRING_TYPE, build_plaintext(ValueType.STRING_TYPE, "Old")),
+            "associatedBeacon": (
+                ValueType.STRING_TYPE,
+                build_plaintext(ValueType.STRING_TYPE, "BEACON-1"),
+            ),
+        },
+        record_type=RecordType.BEACON_NAMING,
+        name="NAMING-1",
+    )
+    return record, private_key
+
+
+def a_store(client: FakeClient) -> beacons.AsyncBeaconStore:
+    store = object.__new__(beacons.AsyncBeaconStore)
+    store._client = client  # noqa: SLF001
+    return store
+
+
+@pytest.mark.asyncio
+async def test_only_a_naming_record_may_be_written() -> None:
+    # A master beacon holds the accessory's key material and a botched write costs the
+    # accessory; an alignment record is Apple's observation, not this client's to assert.
+    store = a_store(FakeClient())
+    record, private_key = a_naming_record()
+
+    for record_type in (RecordType.MASTER_BEACON, RecordType.KEY_ALIGNMENT):
+        wrong = replace(record, record_type=record_type)
+        with pytest.raises(BeaconExportError, match="Only BeaconNamingRecord"):
+            await store.save_naming_record(wrong, [private_key], name="New")
+
+
+@pytest.mark.asyncio
+async def test_a_field_the_record_does_not_carry_is_refused() -> None:
+    # A field's declared type is what says how to encode its plaintext, and a field that
+    # is not there has none to read.
+    store = a_store(FakeClient())
+    record, private_key = a_naming_record()
+
+    with pytest.raises(BeaconExportError, match="carries no field"):
+        await store.save_naming_record(record, [private_key], nickname="New")
+
+
+@pytest.mark.asyncio
+async def test_the_whole_record_is_sent_with_untouched_fields_unchanged() -> None:
+    # Merging is the safety net, not the plan. associatedBeacon is the join key that makes
+    # a naming record findable at all, and a rename must not disturb it.
+    client = FakeClient()
+    store = a_store(client)
+    record, private_key = a_naming_record()
+    before = record.fields["associatedBeacon"].raw
+
+    await store.save_naming_record(record, [private_key], name="New")
+
+    (call,) = client.saved
+    sent = {f.identifier.name: f.value.bytes_value for f in call["record"].record_field}
+    assert sent["associatedBeacon"] == before
+    assert sent["name"] != record.fields["name"].raw
+
+
+@pytest.mark.asyncio
+async def test_the_new_value_is_encrypted_under_this_field_s_own_context() -> None:
+    master_key = bytes(range(16))
+    client = FakeClient()
+    store = a_store(client)
+    record, private_key = a_naming_record(master_key)
+
+    await store.save_naming_record(record, [private_key], name="New")
+
+    saved = CloudKitRecord.from_proto(client.saved[0]["record"], "BeaconStore")
+    decrypted = decrypt_record(saved, [private_key])
+    assert decrypted.values["name"] == "New"
+    assert decrypted.values["associatedBeacon"] == "BEACON-1"
+
+
+@pytest.mark.asyncio
+async def test_the_save_presents_the_tag_the_record_currently_carries() -> None:
+    # It is a lock. Presenting a stale one is a lost update rather than an error to retry.
+    client = FakeClient()
+    store = a_store(client)
+    record, private_key = a_naming_record()
+    record = replace(record, protection_info_tag="the-current-tag")
+
+    await store.save_naming_record(record, [private_key], name="New")
+
+    assert client.saved[0]["record_protection_info_tag"] == "the-current-tag"

@@ -32,6 +32,7 @@ from .pcs import (
     PCSError,
     ShareProtection,
     decrypt_field,
+    encrypt_field,
     unwrap_protection,
     unwrap_zone,
 )
@@ -397,6 +398,47 @@ def group_records(records: Iterable[DecryptedRecord]) -> list[RecordGroup]:
     ]
 
 
+def build_plaintext(value_type: int, value: object) -> bytes:
+    """
+    Build the plaintext a field of this type expects, ready to encrypt.
+
+    The inverse of :func:`interpret_plaintext`, and it has the same asymmetry: a bytes
+    field's plaintext is the bare value, while everything else is wrapped in an
+    `EncryptedValue` message. Writing a bare string where the wrapper belongs produces a
+    field that decrypts cleanly and then fails to parse.
+
+    :param value_type: The field's declared type, which describes its plaintext.
+    :param value: The value to carry.
+    :raises BeaconExportError: If this library cannot build a plaintext of that type.
+    """
+    if value_type in (ValueType.BYTES_TYPE, ValueType.ENCRYPTED_BYTES_TYPE):
+        if not isinstance(value, bytes):
+            msg = f"A bytes field needs bytes, not {type(value).__name__}"
+            raise BeaconExportError(msg)
+        return value
+
+    if value_type == ValueType.STRING_TYPE:
+        if not isinstance(value, str):
+            msg = f"A string field needs a string, not {type(value).__name__}"
+            raise BeaconExportError(msg)
+        return ck.EncryptedValue(string_value=value).SerializeToString()
+
+    if value_type == ValueType.INT64_TYPE:
+        if not isinstance(value, int) or isinstance(value, bool):
+            msg = f"An integer field needs an integer, not {type(value).__name__}"
+            raise BeaconExportError(msg)
+        return ck.EncryptedValue(signed_value=value).SerializeToString()
+
+    # Dates and the rest are readable but not writable here. Refused rather than
+    # approximated: a field written in a form Apple cannot read is worse than one this
+    # library declines to write, because only the second says so.
+    msg = (
+        f"This library does not build plaintext for value type {value_type}. Only strings,"
+        " integers and bytes can be written."
+    )
+    raise BeaconExportError(msg)
+
+
 def _describe_unnamed(beacon: DecryptedRecord) -> str:
     """
     Describe a master beacon that resolved to no naming record, with the evidence why.
@@ -739,6 +781,119 @@ class AsyncBeaconStore:
         keys = await self.zone_keys(service_keys)
         records = await self.fetch_records(continuation_token=continuation_token)
         return accessories_from_records(decrypt_records(records, keys))
+
+    async def save_naming_record(
+        self,
+        naming: CloudKitRecord,
+        zone_keys: Sequence[ec.EllipticCurvePrivateKey],
+        **changes: object,
+    ) -> CloudKitRecord:
+        """
+        Change fields of a naming record and save it.
+
+        **The one write in this library.**
+
+        Renaming an accessory means saving its `BeaconNamingRecord`, and this is the whole
+        of that feature. It re-encrypts only the fields named in `changes`, sends the
+        record otherwise untouched, and merges -- so a field this does not mention keeps
+        the value it had.
+
+        .. warning::
+            **This writes to the owner's own iCloud account.** Holding an accessory's keys
+            from an export is not a right to modify someone else's records, and nothing
+            here can tell the two apart -- that judgement belongs to the caller.
+
+        .. warning::
+            **A success is not proof.** The response is the server echoing what it was
+            sent, and re-fetching only proves this implementation agrees with itself: the
+            field layout puts the GCM tag before the ciphertext, so a value written the
+            natural way round-trips through :func:`~findmy.cloudkit.pcs.decrypt_field`
+            perfectly and is unreadable to Apple. The check that means something is an
+            untouched Apple device showing the new name.
+
+        **Only a naming record may be written.** A `MasterBeaconRecord` holds the
+        accessory's key material and a botched write costs the accessory; a
+        `KeyAlignmentRecord` is Apple's observation rather than this client's to assert.
+        Both are refused.
+
+        :param naming: The naming record as fetched, carrying the protection tag its
+            replacement must present.
+        :param zone_keys: What :meth:`zone_keys` returned.
+        :param changes: Field name to new value, e.g. `name="Keys"`. A field the record
+            does not already carry is refused: its type is what says how to encode it.
+        :raises BeaconExportError: If the record is of the wrong type, or a change names a
+            field it does not carry.
+        :raises UnhandledProtocolError: If the save is rejected -- including on a stale
+            protection tag, which is a **lost update**: re-fetch the record and rebuild
+            the write rather than retrying with the tag that failed.
+        """
+        if naming.record_type != RecordType.BEACON_NAMING:
+            msg = (
+                f"Refusing to write a {naming.record_type or '<untyped>'} record. Only"
+                f" {RecordType.BEACON_NAMING} may be written: a master beacon holds the"
+                " accessory's key material, and an alignment record is Apple's"
+                " observation rather than this client's to assert."
+            )
+            raise BeaconExportError(msg)
+
+        if naming.source is None or naming.protection_info is None:
+            msg = f"Record {naming.name} did not arrive from a fetch and cannot be saved"
+            raise BeaconExportError(msg)
+
+        unknown = sorted(set(changes) - set(naming.fields))
+        if unknown:
+            # Refused rather than added: a field's declared type is what says how to
+            # encode its plaintext, and a field the record does not carry has none.
+            msg = (
+                f"Record {naming.name} carries no field(s) {', '.join(unknown)}. Only"
+                " fields already present can be changed, because a field's declared type"
+                " is what says how to encode it."
+            )
+            raise BeaconExportError(msg)
+
+        unwrapped = unwrap_protection(ShareProtection.from_der(naming.protection_info), zone_keys)
+
+        # The whole record as it arrived, with only the named fields replaced. Rebuilding
+        # it from the parts this library models would drop everything it does not.
+        record = ck.Record()
+        record.CopyFrom(naming.source)
+
+        for wire_field in record.record_field:
+            name = wire_field.identifier.name
+            if name not in changes:
+                continue
+
+            wire_field.value.bytes_value = encrypt_field(
+                build_plaintext(wire_field.value.type, changes[name]),
+                unwrapped,
+                FieldContext(
+                    zone_name=naming.zone_name,
+                    record_name=naming.name,
+                    field_name=name,
+                ),
+            )
+
+        logger.info(
+            "Renaming: saving %s field(s) of %s (%s)",
+            len(changes),
+            naming.name,
+            ", ".join(sorted(changes)),
+        )
+
+        saved = await self._client.record_save(
+            record,
+            record_protection_info_tag=naming.protection_info_tag,
+            zone_protection_info_tag=await self._zone_protection_tag(),
+        )
+
+        return CloudKitRecord.from_proto(saved, naming.zone_name)
+
+    async def _zone_protection_tag(self) -> str:
+        """Read the accessory zone's protection tag, or empty if it carries none."""
+        for zone in await self._client.zone_retrieve():
+            if zone.target_zone.zone_identifier.value.name == BEACON_STORE_ZONE:
+                return zone.target_zone.protection_info.protection_info_tag
+        return ""
 
 
 def decrypt_records(

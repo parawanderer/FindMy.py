@@ -2,9 +2,9 @@
 Tests for the assembly: that the pieces are connected correctly.
 
 **This is not protocol validation, and cannot be.** Every fixture here is built from this
-implementation's own understanding of the format, so a test that agrees with the reader
+implementation's own understanding of the format, so a test that agrees with the client
 proves only that the two agree. That failure mode is not hypothetical -- the HMAC fixture
-in `test_pcs.py` built its digest the same wrong way as the reader and could never have
+in `test_pcs.py` built its digest the same wrong way as the client and could never have
 caught the bug it was written around, and several key-blob tests asserted a *search* for a
 layout that the specification later stated outright.
 
@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from findmy.icloud import AsyncFindMyReader
+from findmy.icloud import AsyncFindMyClient
 from findmy.keychain.session import KeychainSessionError
 
 
@@ -51,7 +51,7 @@ class FakeSession:
 
 
 class FakeAccount:
-    """The account. Held only so the reader can hand it back; nothing here calls it."""
+    """The account. Held only so the client can hand it back; nothing here calls it."""
 
 
 class FakeStore:
@@ -78,9 +78,9 @@ class FakeStore:
         self.closed = True
 
 
-def a_reader(keys: list[ec.EllipticCurvePrivateKey] | None = None) -> AsyncFindMyReader:
+def a_client(keys: list[ec.EllipticCurvePrivateKey] | None = None) -> AsyncFindMyClient:
     supplied = keys if keys is not None else [ec.generate_private_key(ec.SECP256R1())]
-    return AsyncFindMyReader(  # type: ignore[arg-type]
+    return AsyncFindMyClient(  # type: ignore[arg-type]
         FakeAccount(),
         FakeSession(supplied),
         FakeStore(),
@@ -96,51 +96,51 @@ def a_reader(keys: list[ec.EllipticCurvePrivateKey] | None = None) -> AsyncFindM
 async def test_records_can_be_fetched_with_no_keys_at_all() -> None:
     # Fetching and decrypting are cleanly separable, and this is the half a later run
     # repeats without a passcode, a keychain or a trust circle.
-    reader = a_reader()
+    client = a_client()
 
-    assert await reader.records() == ["a-record"]
-    assert reader.unlocked is False
+    assert await client.records() == ["a-record"]
+    assert client.unlocked is False
 
 
 @pytest.mark.asyncio
 async def test_decrypting_without_keys_says_both_ways_to_get_them() -> None:
-    reader = a_reader()
+    client = a_client()
 
     with pytest.raises(KeychainSessionError, match="unlock"):
-        await reader.accessories()
+        await client.accessories()
 
     with pytest.raises(KeychainSessionError, match="use_keys"):
-        await reader.zone_keys()
+        await client.zone_keys()
 
 
 @pytest.mark.asyncio
 async def test_unlocking_recovers_then_reads_the_views_in_that_order() -> None:
-    reader = a_reader()
+    client = a_client()
 
-    await reader.unlock("a-record", "1234")  # type: ignore[arg-type]
+    await client.unlock("a-record", "1234")  # type: ignore[arg-type]
 
-    names = [name for name, _ in reader.session.calls]  # type: ignore[attr-defined]
+    names = [name for name, _ in client.session.calls]  # type: ignore[attr-defined]
     assert names == ["recover", "pcs_keys"]
 
 
 @pytest.mark.asyncio
 async def test_unlocking_reads_both_views_by_default() -> None:
     # Stage 5 §2 says both must be synced before decryption can begin.
-    reader = a_reader()
+    client = a_client()
 
-    await reader.unlock("a-record", "1234")  # type: ignore[arg-type]
+    await client.unlock("a-record", "1234")  # type: ignore[arg-type]
 
-    _, (_, views) = reader.session.calls[1]  # type: ignore[attr-defined]
+    _, (_, views) = client.session.calls[1]  # type: ignore[attr-defined]
     assert views == ("Manatee", "ProtectedCloudStorage")
 
 
 @pytest.mark.asyncio
 async def test_the_passcode_reaches_recovery_and_nothing_else() -> None:
-    reader = a_reader()
+    client = a_client()
 
-    await reader.unlock("a-record", "the-passcode")  # type: ignore[arg-type]
+    await client.unlock("a-record", "the-passcode")  # type: ignore[arg-type]
 
-    carrying = [call for call in reader.session.calls if "the-passcode" in repr(call)]  # type: ignore[attr-defined]
+    carrying = [call for call in client.session.calls if "the-passcode" in repr(call)]  # type: ignore[attr-defined]
     assert [name for name, _ in carrying] == ["recover"]
 
 
@@ -148,13 +148,13 @@ async def test_the_passcode_reaches_recovery_and_nothing_else() -> None:
 async def test_keys_kept_from_an_earlier_run_skip_the_passcode_entirely() -> None:
     # The whole point of returning them: the passcode is a one-time cost.
     keys = [ec.generate_private_key(ec.SECP256R1())]
-    reader = a_reader()
+    client = a_client()
 
-    reader.use_keys(keys)
+    client.use_keys(keys)
 
-    assert reader.unlocked is True
-    assert await reader.accessories() == ["an-accessory"]
-    assert reader.session.calls == []  # type: ignore[attr-defined]
+    assert client.unlocked is True
+    assert await client.accessories() == ["an-accessory"]
+    assert client.session.calls == []  # type: ignore[attr-defined]
 
 
 # --------------------------------------------------------------------------------------
@@ -167,12 +167,12 @@ async def test_the_zone_is_unwrapped_with_the_keychain_keys() -> None:
     # Not with a record's, and not with what the zone itself yields. Handing the wrong
     # level presents as every record being protected for somebody else.
     keys = [ec.generate_private_key(ec.SECP256R1())]
-    reader = a_reader()
-    reader.use_keys(keys)
+    client = a_client()
+    client.use_keys(keys)
 
-    await reader.zone_keys()
+    await client.zone_keys()
 
-    (name, handed), = reader.store.calls  # type: ignore[attr-defined]
+    (name, handed), = client.store.calls  # type: ignore[attr-defined]
     assert name == "zone_keys"
     assert handed == keys
 
@@ -180,35 +180,35 @@ async def test_the_zone_is_unwrapped_with_the_keychain_keys() -> None:
 @pytest.mark.asyncio
 async def test_the_zone_keys_are_what_the_zone_yields_not_what_opened_it() -> None:
     keys = [ec.generate_private_key(ec.SECP256R1())]
-    reader = a_reader()
-    reader.use_keys(keys)
+    client = a_client()
+    client.use_keys(keys)
 
-    assert await reader.zone_keys() == reader.store.zone  # type: ignore[attr-defined]
+    assert await client.zone_keys() == client.store.zone  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
 async def test_the_zone_is_unwrapped_once_and_then_remembered() -> None:
-    reader = a_reader()
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
+    client = a_client()
+    client.use_keys([ec.generate_private_key(ec.SECP256R1())])
 
-    await reader.zone_keys()
-    await reader.zone_keys()
+    await client.zone_keys()
+    await client.zone_keys()
 
-    assert [name for name, _ in reader.store.calls] == ["zone_keys"]  # type: ignore[attr-defined]
+    assert [name for name, _ in client.store.calls] == ["zone_keys"]  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
 async def test_new_keys_discard_the_zone_read_under_the_old_ones() -> None:
     # Otherwise a caller that re-unlocks keeps decrypting with keys from a zone it no
     # longer holds the opener for, and nothing says so.
-    reader = a_reader()
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
-    await reader.zone_keys()
+    client = a_client()
+    client.use_keys([ec.generate_private_key(ec.SECP256R1())])
+    await client.zone_keys()
 
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
-    await reader.zone_keys()
+    client.use_keys([ec.generate_private_key(ec.SECP256R1())])
+    await client.zone_keys()
 
-    assert [name for name, _ in reader.store.calls] == ["zone_keys", "zone_keys"]  # type: ignore[attr-defined]
+    assert [name for name, _ in client.store.calls] == ["zone_keys", "zone_keys"]  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -216,12 +216,12 @@ async def test_accessories_are_fetched_with_the_keychain_keys_not_the_zone_ones(
     # The store does both levels itself, so it takes the keychain keys. Handing it the
     # zone's would unwrap the zone with keys the zone produced.
     keys = [ec.generate_private_key(ec.SECP256R1())]
-    reader = a_reader()
-    reader.use_keys(keys)
+    client = a_client()
+    client.use_keys(keys)
 
-    await reader.accessories()
+    await client.accessories()
 
-    (name, (handed, _)), = reader.store.calls  # type: ignore[attr-defined]
+    (name, (handed, _)), = client.store.calls  # type: ignore[attr-defined]
     assert name == "fetch_accessories"
     assert handed == keys
 
@@ -233,33 +233,33 @@ async def test_accessories_are_fetched_with_the_keychain_keys_not_the_zone_ones(
 
 @pytest.mark.asyncio
 async def test_a_continuation_token_reaches_the_store() -> None:
-    reader = a_reader()
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
+    client = a_client()
+    client.use_keys([ec.generate_private_key(ec.SECP256R1())])
 
-    await reader.records(continuation_token=b"tok")
-    await reader.accessories(continuation_token=b"tok")
+    await client.records(continuation_token=b"tok")
+    await client.accessories(continuation_token=b"tok")
 
-    assert reader.store.calls[0] == ("fetch_records", b"tok")  # type: ignore[attr-defined]
-    assert reader.store.calls[1][1][1] == b"tok"  # type: ignore[attr-defined]
+    assert client.store.calls[0] == ("fetch_records", b"tok")  # type: ignore[attr-defined]
+    assert client.store.calls[1][1][1] == b"tok"  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
 async def test_closing_closes_both_halves() -> None:
-    reader = a_reader()
+    client = a_client()
 
-    async with reader:
+    async with client:
         pass
 
-    assert reader.session.closed is True  # type: ignore[attr-defined]
-    assert reader.store.closed is True  # type: ignore[attr-defined]
+    assert client.session.closed is True  # type: ignore[attr-defined]
+    assert client.store.closed is True  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
 async def test_the_held_keys_are_handed_out_as_a_copy() -> None:
-    # A caller mutating what it was given must not empty the reader.
-    reader = a_reader()
-    reader.use_keys([ec.generate_private_key(ec.SECP256R1())])
+    # A caller mutating what it was given must not empty the client.
+    client = a_client()
+    client.use_keys([ec.generate_private_key(ec.SECP256R1())])
 
-    reader.keychain_keys.clear()
+    client.keychain_keys.clear()
 
-    assert reader.unlocked is True
+    assert client.unlocked is True

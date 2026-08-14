@@ -9,7 +9,7 @@ at the point where a key is needed. Decryption is :mod:`findmy.cloudkit.pcs`.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from google.protobuf.message import DecodeError
@@ -263,6 +263,24 @@ class CloudKitRecord:
     etag: str
     """Version tag, as CloudKit reports it."""
 
+    protection_info_tag: str = ""
+    """
+    The tag of the protection structure this record currently carries.
+
+    **What a write has to present, and what serialises concurrent writes.** A save checks
+    it and replaces it, so a stale one is a lost update rather than an error worth
+    retrying with the same value -- see :meth:`AsyncCloudKitClient.record_save`.
+    """
+
+    source: ck.Record | None = None
+    """
+    The record exactly as it arrived.
+
+    Kept because a save sends the *whole* record: everything this class does not model,
+    and every field the write does not touch, has to go back unchanged, and rebuilding a
+    record from the parts modelled here would silently drop the rest.
+    """
+
     @classmethod
     def from_proto(cls, record: ck.Record, zone_name: str) -> CloudKitRecord:
         """Build from a fetched record."""
@@ -298,6 +316,8 @@ class CloudKitRecord:
             fields=fields,
             protection_info=protection,
             etag=record.etag,
+            protection_info_tag=record.protection_info.protection_info_tag,
+            source=record,
         )
 
 
@@ -327,14 +347,10 @@ def records_from_changes(
         record = CloudKitRecord.from_proto(change.record, zone_name)
         if not record.record_type and change.HasField("record_type"):
             # The record itself did not name its type, but the change did.
-            record = CloudKitRecord(
-                name=record.name,
-                zone_name=record.zone_name,
-                record_type=change.record_type.name,
-                fields=record.fields,
-                protection_info=record.protection_info,
-                etag=record.etag,
-            )
+            # `replace` rather than a fresh construction: listing the fields to carry
+            # over means every field added later is dropped here until someone notices,
+            # and the ones a write needs are exactly the ones nothing reads back.
+            record = replace(record, record_type=change.record_type.name)
         records.append(record)
 
     return records

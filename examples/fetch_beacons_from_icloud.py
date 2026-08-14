@@ -30,7 +30,7 @@ Step 3 is really four -- escrow recovery, a bottle, key shares, a keychain item 
 from out here they fail alike. **If it fails, run `trace_key_recovery.py`**, which walks
 the same four and reports each separately.
 
-The flow itself is :class:`findmy.icloud.AsyncFindMyReader`; what is here is the reporting
+The flow itself is :class:`findmy.icloud.AsyncFindMyClient`; what is here is the reporting
 around it. Logging is turned up deliberately, because the interesting output is usually a
 warning rather than a result: an unmodelled protobuf field, a mismatch between the escrow
 proxy and the trust-circle service, or a signature that did not verify.
@@ -48,20 +48,20 @@ from _login import get_account_async  # pyright: ignore [reportMissingImports]
 
 from findmy.cloudkit.pcs import ShareProtection, bare_x
 from findmy.errors import UnhandledProtocolError
-from findmy.icloud import AsyncFindMyReader
+from findmy.icloud import AsyncFindMyClient
 
 ANISETTE_SERVER = None
 ANISETTE_LIBS_PATH = "ani_libs.bin"
 ACCOUNT_STORE = "account.json"
 
 
-async def report_zones(reader: AsyncFindMyReader) -> None:
+async def report_zones(client: AsyncFindMyClient) -> None:
     """Report the container and its zones, before anything needs a key."""
-    info = await reader.store.client.open_container()
+    info = await client.store.client.open_container()
     print(f"\nContainer open. CloudKit user {info.user_id}, partition {info.partition}")
     print(f"  database gateway: {info.database_gateway_url}")
 
-    zones = await reader.store.client.zone_retrieve()
+    zones = await client.store.client.zone_retrieve()
     print(f"\n{len(zones)} zone(s):")
     for zone in zones:
         name = zone.target_zone.zone_identifier.value.name or "<unnamed>"
@@ -141,7 +141,7 @@ def report_key_sources(records: list, *, keychain_keys: list, zone_keys: list) -
         print(f"  {key[:8].hex()} -> {where}   ({', '.join(sorted(types))})")
 
 
-async def unlock(reader: AsyncFindMyReader) -> bool:
+async def unlock(client: AsyncFindMyClient) -> bool:
     """
     Recover the keys, asking for a device passcode. Returns whether it worked.
 
@@ -150,7 +150,7 @@ async def unlock(reader: AsyncFindMyReader) -> bool:
     """
     print("\n--- What this account could be recovered from ---")
 
-    options = await reader.recovery_options()
+    options = await client.recovery_options()
     for record in options.recoverable:
         print(f"  {record.describe()}")
 
@@ -179,7 +179,7 @@ async def unlock(reader: AsyncFindMyReader) -> bool:
 
     passcode = getpass.getpass("passcode (not echoed)> ")
     try:
-        keys = await reader.unlock(chosen, passcode)
+        keys = await client.unlock(chosen, passcode)
     finally:
         del passcode  # used inside the call above and wanted no longer
 
@@ -275,24 +275,24 @@ async def main() -> int:
     account = await get_account_async(ACCOUNT_STORE, ANISETTE_SERVER, ANISETTE_LIBS_PATH)
 
     try:
-        async with await AsyncFindMyReader.open(account) as reader:
-            await report_zones(reader)
+        async with await AsyncFindMyClient.open(account) as client:
+            await report_zones(client)
 
-            records = await reader.records()
+            records = await client.records()
             if not report_records(records):
                 return 1
 
-            if not await unlock(reader):
+            if not await unlock(client):
                 print("\nNo keys, so nothing above can be decrypted.")
                 return 0
 
             report_key_sources(
                 records,
-                keychain_keys=reader.keychain_keys,
-                zone_keys=await reader.zone_keys(),
+                keychain_keys=client.keychain_keys,
+                zone_keys=await client.zone_keys(),
             )
 
-            accessories = await reader.accessories()
+            accessories = await client.accessories()
 
             # Nothing special about an accessory that came from iCloud: locating one is
             # `fetch_location`, the same call that locates an accessory read from a plist.

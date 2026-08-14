@@ -84,7 +84,7 @@ class Operation(_message.Message):
     def __init__(self, operation_uuid: _Optional[str] = ..., type: _Optional[int] = ..., synchronous_mode: bool = ..., last: bool = ...) -> None: ...
 
 class RequestOperation(_message.Message):
-    __slots__ = ("header", "request", "zone_retrieve_request", "retrieve_zone_changes_request", "retrieve_changes_request", "function_invoke_request")
+    __slots__ = ("header", "request", "zone_retrieve_request", "retrieve_zone_changes_request", "record_save_request", "retrieve_changes_request", "function_invoke_request")
     class Header(_message.Message):
         __slots__ = ("user_token", "application_container", "application_bundle", "application_version", "device_identifier", "device_software_version", "device_hardware_version", "device_library_name", "device_library_version", "device_protocol_version", "mmcs_protocol_version", "application_container_environment", "device_assigned_name", "device_hardware_id", "target_database", "isolation_level", "group", "device_serial", "unknown_29", "unknown_34", "unknown_35")
         USER_TOKEN_FIELD_NUMBER: _ClassVar[int]
@@ -134,15 +134,17 @@ class RequestOperation(_message.Message):
     REQUEST_FIELD_NUMBER: _ClassVar[int]
     ZONE_RETRIEVE_REQUEST_FIELD_NUMBER: _ClassVar[int]
     RETRIEVE_ZONE_CHANGES_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    RECORD_SAVE_REQUEST_FIELD_NUMBER: _ClassVar[int]
     RETRIEVE_CHANGES_REQUEST_FIELD_NUMBER: _ClassVar[int]
     FUNCTION_INVOKE_REQUEST_FIELD_NUMBER: _ClassVar[int]
     header: RequestOperation.Header
     request: Operation
     zone_retrieve_request: ZoneRetrieveRequest
     retrieve_zone_changes_request: RetrieveZoneChangesRequest
+    record_save_request: RecordSaveRequest
     retrieve_changes_request: RetrieveChangesRequest
     function_invoke_request: FunctionInvokeRequest
-    def __init__(self, header: _Optional[_Union[RequestOperation.Header, _Mapping]] = ..., request: _Optional[_Union[Operation, _Mapping]] = ..., zone_retrieve_request: _Optional[_Union[ZoneRetrieveRequest, _Mapping]] = ..., retrieve_zone_changes_request: _Optional[_Union[RetrieveZoneChangesRequest, _Mapping]] = ..., retrieve_changes_request: _Optional[_Union[RetrieveChangesRequest, _Mapping]] = ..., function_invoke_request: _Optional[_Union[FunctionInvokeRequest, _Mapping]] = ...) -> None: ...
+    def __init__(self, header: _Optional[_Union[RequestOperation.Header, _Mapping]] = ..., request: _Optional[_Union[Operation, _Mapping]] = ..., zone_retrieve_request: _Optional[_Union[ZoneRetrieveRequest, _Mapping]] = ..., retrieve_zone_changes_request: _Optional[_Union[RetrieveZoneChangesRequest, _Mapping]] = ..., record_save_request: _Optional[_Union[RecordSaveRequest, _Mapping]] = ..., retrieve_changes_request: _Optional[_Union[RetrieveChangesRequest, _Mapping]] = ..., function_invoke_request: _Optional[_Union[FunctionInvokeRequest, _Mapping]] = ...) -> None: ...
 
 class FunctionInvokeRequest(_message.Message):
     __slots__ = ("service", "name", "parameters")
@@ -160,14 +162,35 @@ class FunctionInvokeResponse(_message.Message):
     serialized_result: bytes
     def __init__(self, serialized_result: _Optional[bytes] = ...) -> None: ...
 
+class RecordSaveRequest(_message.Message):
+    __slots__ = ("record", "merge", "save_semantics", "zone_protection_info_tag", "record_protection_info_tag")
+    RECORD_FIELD_NUMBER: _ClassVar[int]
+    MERGE_FIELD_NUMBER: _ClassVar[int]
+    SAVE_SEMANTICS_FIELD_NUMBER: _ClassVar[int]
+    ZONE_PROTECTION_INFO_TAG_FIELD_NUMBER: _ClassVar[int]
+    RECORD_PROTECTION_INFO_TAG_FIELD_NUMBER: _ClassVar[int]
+    record: Record
+    merge: bool
+    save_semantics: int
+    zone_protection_info_tag: str
+    record_protection_info_tag: str
+    def __init__(self, record: _Optional[_Union[Record, _Mapping]] = ..., merge: bool = ..., save_semantics: _Optional[int] = ..., zone_protection_info_tag: _Optional[str] = ..., record_protection_info_tag: _Optional[str] = ...) -> None: ...
+
+class RecordSaveResponse(_message.Message):
+    __slots__ = ("server_fields",)
+    SERVER_FIELDS_FIELD_NUMBER: _ClassVar[int]
+    server_fields: Record
+    def __init__(self, server_fields: _Optional[_Union[Record, _Mapping]] = ...) -> None: ...
+
 class ResponseOperation(_message.Message):
-    __slots__ = ("operation_cost", "response", "result", "bundled", "zone_retrieve_response", "retrieve_zone_changes_response", "retrieve_changes_response", "function_invoke_response")
+    __slots__ = ("operation_cost", "response", "result", "bundled", "zone_retrieve_response", "retrieve_zone_changes_response", "record_save_response", "retrieve_changes_response", "function_invoke_response")
     OPERATION_COST_FIELD_NUMBER: _ClassVar[int]
     RESPONSE_FIELD_NUMBER: _ClassVar[int]
     RESULT_FIELD_NUMBER: _ClassVar[int]
     BUNDLED_FIELD_NUMBER: _ClassVar[int]
     ZONE_RETRIEVE_RESPONSE_FIELD_NUMBER: _ClassVar[int]
     RETRIEVE_ZONE_CHANGES_RESPONSE_FIELD_NUMBER: _ClassVar[int]
+    RECORD_SAVE_RESPONSE_FIELD_NUMBER: _ClassVar[int]
     RETRIEVE_CHANGES_RESPONSE_FIELD_NUMBER: _ClassVar[int]
     FUNCTION_INVOKE_RESPONSE_FIELD_NUMBER: _ClassVar[int]
     operation_cost: int
@@ -176,9 +199,10 @@ class ResponseOperation(_message.Message):
     bundled: _containers.RepeatedScalarFieldContainer[bytes]
     zone_retrieve_response: ZoneRetrieveResponse
     retrieve_zone_changes_response: RetrieveZoneChangesResponse
+    record_save_response: RecordSaveResponse
     retrieve_changes_response: RetrieveChangesResponse
     function_invoke_response: FunctionInvokeResponse
-    def __init__(self, operation_cost: _Optional[int] = ..., response: _Optional[_Union[Operation, _Mapping]] = ..., result: _Optional[_Union[Result, _Mapping]] = ..., bundled: _Optional[_Iterable[bytes]] = ..., zone_retrieve_response: _Optional[_Union[ZoneRetrieveResponse, _Mapping]] = ..., retrieve_zone_changes_response: _Optional[_Union[RetrieveZoneChangesResponse, _Mapping]] = ..., retrieve_changes_response: _Optional[_Union[RetrieveChangesResponse, _Mapping]] = ..., function_invoke_response: _Optional[_Union[FunctionInvokeResponse, _Mapping]] = ...) -> None: ...
+    def __init__(self, operation_cost: _Optional[int] = ..., response: _Optional[_Union[Operation, _Mapping]] = ..., result: _Optional[_Union[Result, _Mapping]] = ..., bundled: _Optional[_Iterable[bytes]] = ..., zone_retrieve_response: _Optional[_Union[ZoneRetrieveResponse, _Mapping]] = ..., retrieve_zone_changes_response: _Optional[_Union[RetrieveZoneChangesResponse, _Mapping]] = ..., record_save_response: _Optional[_Union[RecordSaveResponse, _Mapping]] = ..., retrieve_changes_response: _Optional[_Union[RetrieveChangesResponse, _Mapping]] = ..., function_invoke_response: _Optional[_Union[FunctionInvokeResponse, _Mapping]] = ...) -> None: ...
 
 class Result(_message.Message):
     __slots__ = ("code", "error")

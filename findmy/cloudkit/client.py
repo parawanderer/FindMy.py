@@ -25,6 +25,7 @@ from findmy.util.http import HttpSession
 from .constants import (
     CK_APP_INIT_URL,
     PATH_CODE_INVOKE,
+    PATH_RECORD_SAVE,
     PATH_RECORD_SYNC,
     PATH_ZONE_RETRIEVE,
     PROTOBUF_CONTENT_TYPE,
@@ -34,6 +35,7 @@ from .constants import (
     ClientErrorCode,
     OperationType,
     ResultCode,
+    SaveSemantics,
 )
 from .proto import cloudkit_pb2 as ck
 
@@ -592,6 +594,74 @@ class AsyncCloudKitClient(Closable):
             continuation_token=token,
             status=status,
         )
+
+    async def record_save(
+        self,
+        record: ck.Record,
+        *,
+        record_protection_info_tag: str,
+        zone_protection_info_tag: str = "",
+        semantics: SaveSemantics = SaveSemantics.UPDATE,
+    ) -> ck.Record:
+        """
+        Save a record, and return it as the server now holds it.
+
+        **The one write in this library.** Everything else here reads, and the record
+        types it may be pointed at are deliberately restricted a level up -- see
+        :meth:`findmy.cloudkit.beacons.AsyncBeaconStore.save_naming_record`.
+
+        `merge` is always set, so fields the record does not carry are kept rather than
+        dropped. That is a safety net rather than a plan: send the whole record, because
+        a save that omits `associatedBeacon` and is not merged removes the join key that
+        makes a naming record findable at all.
+
+        .. warning::
+            **A success response is not proof the write took effect**, and this cannot
+            check it. Elsewhere in this protocol a service reports success for a deletion
+            that addressed nothing, and the value returned here is the server echoing what
+            it was sent. Re-fetch and decrypt to confirm -- and even that only proves this
+            implementation agrees with itself, never that Apple can read what was written.
+
+        :param record: The whole record, with any changed field already encrypted.
+        :param record_protection_info_tag: The tag the record **currently** carries. The
+            save checks it and replaces it, so this is what serialises concurrent writes.
+        :param zone_protection_info_tag: The zone's tag, where one is held.
+        :param semantics: Update by default. Creating is not something this library has a
+            use for, and the two are one integer apart.
+        :raises UnhandledProtocolError: If the save fails, including on a stale tag.
+        :returns: The record as the server now holds it.
+        """
+        await self.open_container()
+
+        request = self._build_request(OperationType.RECORD_SAVE_TYPE)
+        save = request.record_save_request
+        save.record.CopyFrom(record)
+        save.merge = True
+        save.save_semantics = int(semantics)
+        save.record_protection_info_tag = record_protection_info_tag
+        if zone_protection_info_tag:
+            save.zone_protection_info_tag = zone_protection_info_tag
+
+        logger.info(
+            "Saving record %s, presenting protection tag %s",
+            record.record_identifier.value.name or "<unnamed>",
+            record_protection_info_tag or "<none>",
+        )
+
+        response = await self._post_operation(PATH_RECORD_SAVE, request)
+        saved = response.record_save_response.server_fields
+
+        if not saved.record_identifier.value.name:
+            # The operation succeeded and returned no record. Reported rather than
+            # returned empty, because the next thing a caller does is read a tag off it
+            # and store an empty string as the tag its next write must present.
+            msg = (
+                "The save reported success but returned no record, so there is no new"
+                " protection tag to carry forward. Re-fetch before writing again."
+            )
+            raise UnhandledProtocolError(msg)
+
+        return saved
 
     async def function_invoke(self, service: str, name: str, parameters: bytes) -> bytes:
         """

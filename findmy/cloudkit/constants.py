@@ -29,6 +29,7 @@ PATH_ZONE_RETRIEVE = "/api/client/zone/retrieve"
 PATH_ZONE_SYNC = "/api/client/zone/sync"
 PATH_RECORD_RETRIEVE = "/api/client/record/retrieve"
 PATH_RECORD_SYNC = "/api/client/record/sync"
+PATH_RECORD_SAVE = "/api/client/record/save"
 
 # Server-side function invocation, beneath the code gateway rather than the database one.
 PATH_CODE_INVOKE = "/api/client/code/invoke"
@@ -47,6 +48,13 @@ PROTOBUF_CONTENT_TYPE = (
     'desc="https://gateway.icloud.com:443/static/protobuf/CloudDB/CloudDBClient.desc"; '
     "messageType=RequestOperation; delimited=true"
 )
+
+
+class SaveSemantics(IntEnum):
+    """Whether a save may create a record, update one, or either."""
+
+    CREATE = 2
+    UPDATE = 3
 
 
 class OperationType(IntEnum):

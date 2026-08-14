@@ -6,17 +6,18 @@ is: :mod:`findmy.keychain` recovers key material from the trust circle, and
 :mod:`findmy.cloudkit` reads and decrypts the accessory zone. Nothing needs them apart,
 and everything that uses them together assembles the same three steps.
 
-    async with await AsyncFindMyReader.open(account) as reader:
-        options = await reader.recovery_options()
-        await reader.unlock(options.recoverable[0], passcode)
+    async with await AsyncFindMyClient.open(account) as client:
+        options = await client.recovery_options()
+        await client.unlock(options.recoverable[0], passcode)
 
-        for accessory in await reader.accessories():
+        for accessory in await client.accessories():
             print(accessory.name, accessory.serial_number)
 
-**Read-only.** Nothing here writes to the account: no peer joins the trust circle, no
-voucher is signed, no escrow record is enrolled. The keys arrive before any write would
-have happened, which is what makes that possible -- see
-:meth:`findmy.keychain.AsyncKeychainSession.key_shares`.
+**Read-only except for :meth:`~AsyncFindMyClient.rename`.** Reading leaves no trace: no
+peer joins the trust circle, no voucher is signed, no escrow record is enrolled. The keys
+arrive before any write would have happened, which is what makes that possible -- see
+:meth:`findmy.keychain.AsyncKeychainSession.key_shares`. `rename` is the single
+exception, saves one record, and is never called by anything else here.
 
 **The passcode is spent once.** :meth:`unlock` needs the screen-lock passcode of the
 device whose escrow record is being recovered from. What it yields can be kept, and
@@ -35,7 +36,7 @@ from typing import TYPE_CHECKING
 
 from typing_extensions import Self, override
 
-from findmy.cloudkit.beacons import AsyncBeaconStore
+from findmy.cloudkit.beacons import AsyncBeaconStore, BeaconExportError
 from findmy.keychain.items import VIEW_MANATEE, VIEW_PROTECTED_CLOUD_STORAGE
 from findmy.keychain.session import AsyncKeychainSession, KeychainSessionError
 from findmy.util.abc import Closable
@@ -53,9 +54,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class AsyncFindMyReader(Closable):
+class AsyncFindMyClient(Closable):
     """
-    Reads a user's Find My accessories out of their iCloud account.
+    A user's Find My accessories, in their iCloud account.
+
+    **Reads, and renames.** Everything here reads except :meth:`rename`, which is the
+    only call that changes anything on the account -- hence a client rather than a
+    reader, which is what this was called while it could only read.
 
     Build one with :meth:`open`. It holds a keychain session and a beacon store, and
     closes both.
@@ -80,7 +85,7 @@ class AsyncFindMyReader(Closable):
     @classmethod
     async def open(cls, account: AsyncAppleAccount) -> Self:
         """
-        Establish a reader over a logged-in account.
+        Establish a client over a logged-in account.
 
         :param account: A logged-in account.
         :raises KeychainSessionError: If the keychain session cannot be established.
@@ -101,7 +106,7 @@ class AsyncFindMyReader(Closable):
         await self._session.close()
 
     async def __aenter__(self) -> Self:
-        """Enter a context that closes this reader on exit."""
+        """Enter a context that closes this client on exit."""
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -241,6 +246,55 @@ class AsyncFindMyReader(Closable):
         return await self._store.fetch_accessories(
             self._keychain_keys,
             continuation_token=continuation_token,
+        )
+
+    async def rename(
+        self,
+        naming: CloudKitRecord,
+        *,
+        name: str | None = None,
+        emoji: str | None = None,
+    ) -> CloudKitRecord:
+        """
+        Rename an accessory, by saving its naming record.
+
+        **The only thing here that writes to the account.** Everything else reads, and
+        this changes exactly the fields it is given -- the rest of the record is sent back
+        unchanged and merged, so nothing else about the accessory moves.
+
+        Find the record among :meth:`records`: it is the `BeaconNamingRecord` whose
+        `associatedBeacon` is the accessory's identifier.
+        :func:`~findmy.cloudkit.beacons.group_records` does that join.
+
+        .. warning::
+            **A success is not proof, and reading it back is barely better.** The value
+            returned is the server echoing what it was sent, and the field layout is one
+            this implementation could get wrong in a way only Apple would notice -- the
+            GCM tag precedes the ciphertext, so a value written the natural way round-
+            trips through this library perfectly and is unreadable to an Apple device.
+            Until an untouched device has shown a new name once, treat this as unverified.
+
+        :param naming: The naming record as fetched, from :meth:`records`.
+        :param name: The new name, if it is changing.
+        :param emoji: The new emoji, if it is changing.
+        :raises BeaconExportError: If the record is not a naming record, or neither a name
+            nor an emoji was given.
+        :raises KeychainSessionError: If no keys are held.
+        """
+        changes: dict[str, object] = {}
+        if name is not None:
+            changes["name"] = name
+        if emoji is not None:
+            changes["emoji"] = emoji
+
+        if not changes:
+            msg = "Nothing to change: pass a name, an emoji, or both."
+            raise BeaconExportError(msg)
+
+        return await self._store.save_naming_record(
+            naming,
+            await self.zone_keys(),
+            **changes,
         )
 
     def _require_keys(self) -> None:
