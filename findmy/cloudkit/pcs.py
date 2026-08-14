@@ -1023,6 +1023,76 @@ def unwrap_zone(
     return keys
 
 
+def unwrap_zone_record_defaults(
+    record_protection_info: bytes,
+    zone_keys: Sequence[ec.EllipticCurvePrivateKey],
+) -> list[bytes]:
+    """
+    Unwrap a zone's `recordProtectionInfo` into the default keys its records may use.
+
+    **§4 step 0's other branch, and it covers a record that carries no structure of its
+    own.** A zone has room for two protection structures: `protectionInfo`, which gives
+    the zone keys, and this one, which is decoded *against* those and gives master keys
+    directly. It is an alternative to a record's own keyset, never an input to one --
+    neither this nor the key ids inside it feed a record's structure.
+
+    Which of them applies to a given record is named by that record's `pcsKey`, a key-id
+    prefix -- see :func:`select_default_master_key`.
+
+    .. warning::
+        **Never exercised.** Every record on the one account examined carried its own
+        `protectionInfo` and none carried a `pcsKey`, so this branch has not run against
+        anything real. It is read-only and cannot damage an account, but if decryption
+        fails on a record that reached it, this is the first thing to suspect.
+
+    :param record_protection_info: The zone's `recordProtectionInfo` bytes.
+    :param zone_keys: What :func:`unwrap_zone` returned. **Not** the service keys.
+    :raises MissingKeyError: If no zone key appears in its keyset.
+    :raises PCSError: If the structure cannot be unwrapped.
+    """
+    unwrapped = unwrap_protection(ShareProtection.from_der(record_protection_info), zone_keys)
+    keys = unwrapped.master_keys
+
+    logger.warning(
+        "Using the zone's recordProtectionInfo, which yielded %d default record key(s)."
+        " This path has never run against a real account -- every record on the one"
+        " examined carried its own protectionInfo -- so if decryption fails below, this"
+        " is the first place to look.",
+        len(keys),
+    )
+    return keys
+
+
+def select_default_master_key(
+    master_keys: Sequence[bytes],
+    pcs_key: bytes,
+) -> bytes | None:
+    """
+    Pick the default record key a record's `pcsKey` names.
+
+    `pcsKey` is a **key-id prefix**, not a key: it is compared against the leading bytes
+    of each candidate's key id, the same comparison the encrypted-field header check makes.
+
+    An empty `pcsKey` names nothing. With exactly one default key that is unambiguous
+    anyway, so it is used and said; with several there is no way to choose, and guessing
+    would produce a decryption failure that reads as the wrong key rather than as no
+    selector.
+
+    :returns: The key, or None if nothing matches.
+    """
+    if not pcs_key:
+        if len(master_keys) == 1:
+            logger.info("The record names no pcsKey, and the zone offers exactly one default")
+            return master_keys[0]
+        return None
+
+    for key in master_keys:
+        if compute_key_id(key)[: len(pcs_key)] == pcs_key:
+            return key
+
+    return None
+
+
 def master_ec_keys(master_keys: Sequence[bytes]) -> list[ec.EllipticCurvePrivateKey]:
     """
     Derive the master EC key from each of a structure's master keys.

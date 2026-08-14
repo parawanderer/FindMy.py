@@ -31,10 +31,13 @@ from .pcs import (
     MissingKeyError,
     PCSError,
     ShareProtection,
+    UnwrappedProtection,
     decrypt_field,
     encrypt_field,
+    select_default_master_key,
     unwrap_protection,
     unwrap_zone,
+    unwrap_zone_record_defaults,
 )
 from .proto import cloudkit_pb2 as ck
 from .records import CloudKitRecord, records_from_changes
@@ -175,6 +178,7 @@ def decrypt_record(
     private_keys: Sequence[ec.EllipticCurvePrivateKey],
     *,
     allow_privacy_sensitive: bool = False,
+    default_master_keys: Sequence[bytes] = (),
 ) -> DecryptedRecord:
     """
     Decrypt every encrypted field of one record.
@@ -184,6 +188,9 @@ def decrypt_record(
     :param allow_privacy_sensitive: Decrypt record types this library otherwise refuses.
         `SafeLocation` holds the user's home and work coordinates; it arrives whether it
         is wanted or not, and discarding it is a decision rather than an omission.
+    :param default_master_keys: The zone's default record keys, from
+        :func:`~findmy.cloudkit.pcs.unwrap_zone_record_defaults`. Used only for a record
+        carrying no protection structure of its own -- see below.
     :raises MissingKeyError: If no local key protects this record.
     """
     if record.record_type in PRIVACY_SENSITIVE_RECORD_TYPES and not allow_privacy_sensitive:
@@ -195,11 +202,69 @@ def decrypt_record(
         raise BeaconExportError(msg)
 
     if record.protection_info is None:
-        msg = f"Record {record.name} carries no protection info and cannot be decrypted"
-        raise BeaconExportError(msg)
+        return _decrypt_with_zone_default(record, default_master_keys)
 
     unwrapped = unwrap_protection(ShareProtection.from_der(record.protection_info), private_keys)
 
+    return _decrypt_fields(record, unwrapped)
+
+
+def _decrypt_with_zone_default(
+    record: CloudKitRecord,
+    default_master_keys: Sequence[bytes],
+) -> DecryptedRecord:
+    """
+    Decrypt a record that carries no protection structure, using the zone's defaults.
+
+    §4 step 0's other branch. The record's `pcsKey` is a key-id prefix naming which of the
+    zone's default record keys applies; a record with neither its own structure nor a
+    matching default is genuinely not readable.
+
+    .. warning::
+        **This path has never run against a real account.** Every record on the one
+        examined carried its own `protectionInfo`, and none carried a `pcsKey`. It is
+        read-only and cannot damage anything, but a decryption failure on a record that
+        got here should be blamed on this before anything else.
+    """
+    if not default_master_keys:
+        msg = (
+            f"Record {record.name} carries no protection info of its own, and the zone"
+            " offered no recordProtectionInfo to fall back on, so it cannot be decrypted."
+        )
+        raise BeaconExportError(msg)
+
+    master_key = select_default_master_key(default_master_keys, record.pcs_key)
+    if master_key is None:
+        msg = (
+            f"Record {record.name} carries no protection info, and its pcsKey"
+            f" {record.pcs_key.hex() or '<absent>'} names none of the"
+            f" {len(default_master_keys)} default record key(s) the zone offered."
+        )
+        raise MissingKeyError(msg)
+
+    logger.warning(
+        "Record %s has no protection structure of its own and is being decrypted with a"
+        " zone-level default key. **This path has never run against a real account** --"
+        " if what comes out is wrong, suspect it before anything else.",
+        record.name,
+    )
+
+    return _decrypt_fields(
+        record,
+        UnwrappedProtection(
+            master_key=master_key,
+            share_key_derived=False,
+            read_only=False,
+            hmac_verified=False,
+            # There is no structure on the record to have signed, so this was not skipped
+            # by a flag -- there was nothing to check.
+            signature_verified=None,
+        ),
+    )
+
+
+def _decrypt_fields(record: CloudKitRecord, unwrapped: UnwrappedProtection) -> DecryptedRecord:
+    """Decrypt a record's fields under a key already arrived at, however that happened."""
     values: dict[str, Any] = {}
     raw_values: dict[str, bytes] = {}
     undecryptable: dict[str, str] = {}
@@ -804,7 +869,48 @@ class AsyncBeaconStore:
         """
         keys = await self.zone_keys(service_keys)
         records = await self.fetch_records(continuation_token=continuation_token)
-        return accessories_from_records(decrypt_records(records, keys))
+
+        return accessories_from_records(
+            decrypt_records(
+                records,
+                keys,
+                default_master_keys=await self.zone_record_defaults(keys),
+            ),
+        )
+
+    async def zone_record_defaults(
+        self,
+        zone_keys: Sequence[ec.EllipticCurvePrivateKey],
+    ) -> list[bytes]:
+        """
+        Unwrap the zone's `recordProtectionInfo`, if it carries one.
+
+        The fallback for a record with no protection structure of its own. **[observed]
+        the accessory zone carried none**, so this returns nothing on the only account
+        examined -- and returning nothing is the correct outcome there, not a failure.
+
+        A structure that is present but unreadable is reported and then treated as absent,
+        because every record seen so far protects itself and losing all of them over an
+        unused fallback would be the worse trade.
+        """
+        info = b""
+        for zone in await self._client.zone_retrieve():
+            if zone.target_zone.zone_identifier.value.name == BEACON_STORE_ZONE:
+                info = zone.target_zone.record_protection_info.protection_info
+                break
+
+        if not info:
+            return []
+
+        try:
+            return unwrap_zone_record_defaults(info, zone_keys)
+        except PCSError:
+            logger.exception(
+                "The zone carries a recordProtectionInfo that could not be unwrapped."
+                " Records with their own protection are unaffected; any without one will"
+                " now fail to decrypt, and this is why",
+            )
+            return []
 
     async def save_naming_record(
         self,
@@ -923,6 +1029,8 @@ class AsyncBeaconStore:
 def decrypt_records(
     records: Iterable[CloudKitRecord],
     private_keys: Sequence[ec.EllipticCurvePrivateKey],
+    *,
+    default_master_keys: Sequence[bytes] = (),
 ) -> list[DecryptedRecord]:
     """
     Decrypt the records worth decrypting, and report rather than hide what was skipped.
@@ -934,6 +1042,10 @@ def decrypt_records(
     same count whether the records really belong to someone else or the keys are compared
     in the wrong encoding, and those lead in opposite directions -- so the one message that
     tells them apart must not be swallowed by the tally that summarises it.
+
+    :param default_master_keys: The zone's default record keys, for records carrying no
+        protection structure of their own. See
+        :func:`~findmy.cloudkit.pcs.unwrap_zone_record_defaults`.
     """
     wanted = {RecordType.MASTER_BEACON, RecordType.BEACON_NAMING, RecordType.KEY_ALIGNMENT}
 
@@ -946,7 +1058,9 @@ def decrypt_records(
             skipped[record.record_type or "<untyped>"] = skipped.get(record.record_type, 0) + 1
             continue
         try:
-            decrypted.append(decrypt_record(record, private_keys))
+            decrypted.append(
+                decrypt_record(record, private_keys, default_master_keys=default_master_keys),
+            )
         except MissingKeyError as e:
             skipped["no key held"] = skipped.get("no key held", 0) + 1
             first_miss = first_miss or str(e)

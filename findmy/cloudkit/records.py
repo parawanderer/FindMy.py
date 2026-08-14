@@ -272,6 +272,15 @@ class CloudKitRecord:
     retrying with the same value -- see :meth:`AsyncCloudKitClient.record_save`.
     """
 
+    pcs_key: bytes = b""
+    """
+    A key-id prefix naming which of the zone's default record keys protects this record.
+
+    Only meaningful when :attr:`protection_info` is absent -- the two are alternatives.
+    **[observed] absent on every record of the one account examined**, alongside a zone
+    that carried no `recordProtectionInfo` for it to select from.
+    """
+
     source: ck.Record | None = None
     """
     The record exactly as it arrived.
@@ -317,6 +326,7 @@ class CloudKitRecord:
             protection_info=protection,
             etag=record.etag,
             protection_info_tag=record.protection_info.protection_info_tag,
+            pcs_key=record.pcs_key,
             source=record,
         )
 

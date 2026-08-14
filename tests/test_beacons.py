@@ -1028,3 +1028,77 @@ async def test_the_save_presents_the_tag_the_record_currently_carries() -> None:
     await store.save_naming_record(record, [private_key], name="New")
 
     assert client.saved[0]["record_protection_info_tag"] == "the-current-tag"
+
+
+# --------------------------------------------------------------------------------------
+# The zone-level default keys (S5 §4 step 0's other branch)
+# --------------------------------------------------------------------------------------
+
+
+def test_a_pcs_key_selects_the_default_whose_key_id_it_prefixes() -> None:
+    # pcsKey is a key-id PREFIX, not a key. It is the same comparison the encrypted-field
+    # header makes, against the same derivation.
+    keys = [bytes([1]) * 16, bytes([2]) * 16, bytes([3]) * 16]
+    wanted = pcs.compute_key_id(keys[1])[:4]
+
+    assert pcs.select_default_master_key(keys, wanted) == keys[1]
+
+
+def test_a_pcs_key_matching_nothing_selects_nothing() -> None:
+    assert pcs.select_default_master_key([bytes([1]) * 16], b"\xff\xff\xff\xff") is None
+
+
+def test_no_pcs_key_is_unambiguous_only_when_there_is_one_default() -> None:
+    # With one candidate there is nothing to choose between; with several, guessing would
+    # surface as a wrong key rather than as a missing selector.
+    only = bytes([1]) * 16
+
+    assert pcs.select_default_master_key([only], b"") == only
+    assert pcs.select_default_master_key([only, bytes([2]) * 16], b"") is None
+
+
+def test_a_record_with_no_protection_falls_back_to_the_zone_default() -> None:
+    master_key = bytes(range(16))
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    record, _ = make_encrypted_record(
+        private_key,
+        master_key,
+        {"name": (ValueType.STRING_TYPE, build_plaintext(ValueType.STRING_TYPE, "Keys"))},
+        record_type=RecordType.BEACON_NAMING,
+    )
+
+    # As it would arrive with no structure of its own, naming the zone's default instead.
+    stripped = replace(
+        record,
+        protection_info=None,
+        pcs_key=pcs.compute_key_id(master_key)[:4],
+    )
+
+    decrypted = decrypt_record(stripped, [], default_master_keys=[master_key])
+
+    assert decrypted.values["name"] == "Keys"
+
+
+def test_a_record_with_no_protection_and_no_default_says_which_is_missing() -> None:
+    record, _ = make_encrypted_record(ec.generate_private_key(ec.SECP256R1()), bytes(16), {})
+    stripped = replace(record, protection_info=None)
+
+    with pytest.raises(BeaconExportError, match="no recordProtectionInfo"):
+        decrypt_record(stripped, [], default_master_keys=[])
+
+
+def test_the_fallback_warns_that_it_has_never_run_for_real(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Shipping an unexercised branch is acceptable only because it is read-only and says
+    # so. Without this line it is just an untested path.
+    import logging  # noqa: PLC0415
+
+    master_key = bytes(range(16))
+    record, _ = make_encrypted_record(ec.generate_private_key(ec.SECP256R1()), master_key, {})
+    stripped = replace(record, protection_info=None)
+
+    with caplog.at_level(logging.WARNING, logger="findmy.cloudkit.beacons"):
+        decrypt_record(stripped, [], default_master_keys=[master_key])
+
+    assert "never run against a real account" in caplog.text
