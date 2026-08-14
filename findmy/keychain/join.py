@@ -496,3 +496,55 @@ def require_key_shares(shares: Sequence[cf.TlkShare]) -> None:
             " circle and an escrow record on the account in exchange for nothing."
         )
         raise JoinError(msg)
+
+
+@dataclass(frozen=True)
+class NewIdentity:
+    """
+    A freshly generated peer: its keys, its signed permanent info, and its identifier.
+
+    The permanent info is signed **once, here**, and those bytes are what everything after
+    it refers to -- the identifier digests them, the peer message carries them, the bottle
+    is built around the peer they name. Re-encoding the message later gives a different
+    signature and therefore a different peer.
+    """
+
+    signing_key: ec.EllipticCurvePrivateKey
+    encryption_key: ec.EllipticCurvePrivateKey
+    permanent: SignedBlob
+    peer_id: str
+
+
+def generate_identity(*, machine_id: str, model_id: str, creation_time: int) -> NewIdentity:
+    """
+    Generate the identity a join introduces, per §6.9.1.
+
+    Both keys are P-384 and fresh, and both public halves travel as DER SPKI.
+
+    :param machine_id: The Anisette `X-Apple-I-MD-M` header. **This binds the peer to the
+        Anisette in use, permanently**: the blob is signed at generation and never
+        rewritten, so a peer created under local Anisette and one created against a server
+        are different peers for good.
+    :param model_id: The hardware model this client claims to be.
+    :param creation_time: Milliseconds since the epoch, not seconds.
+    """
+    from .peers import peer_identifier  # noqa: PLC0415 -- avoids a circular import
+
+    signing = ec.generate_private_key(ec.SECP384R1())
+    encryption = ec.generate_private_key(ec.SECP384R1())
+
+    permanent = make_permanent_info(
+        signing,
+        signing_public=public_spki(signing.public_key()),
+        encryption_public=public_spki(encryption.public_key()),
+        machine_id=machine_id,
+        model_id=model_id,
+        creation_time=creation_time,
+    )
+
+    return NewIdentity(
+        signing_key=signing,
+        encryption_key=encryption,
+        permanent=permanent,
+        peer_id=peer_identifier(permanent.info, permanent.signature),
+    )

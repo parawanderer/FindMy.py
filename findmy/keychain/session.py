@@ -11,9 +11,10 @@ against a real account**: listing escrow records, judging which could be recover
 recovering one with a device passcode, opening the bottle it yields, and deleting records
 that are no longer good for anything.
 
-What it deliberately does not wrap is joining the trust circle, which is unbuilt and may
-turn out to be unnecessary -- so there is no method here that writes a peer or enrolls a
-record.
+It also carries the one sequence that **writes**: :meth:`AsyncKeychainSession.join`, which
+adds a peer to the circle and enrols an escrow record for it. That is deliberately one
+method rather than a set of steps a caller orders themselves, because the ordering is the
+part that matters -- see its docstring.
 
     async with await AsyncKeychainSession.open(account) as session:
         options = await session.recovery_options()
@@ -21,9 +22,10 @@ record.
             print(record.describe())
 
 .. warning::
-    :meth:`AsyncKeychainSession.recover` needs a device's screen-lock passcode, and
-    :meth:`AsyncKeychainSession.delete_record` destroys something irreversibly. Everything
-    else here reads.
+    :meth:`AsyncKeychainSession.recover` needs a device's screen-lock passcode,
+    :meth:`AsyncKeychainSession.delete_record` destroys something irreversibly, and
+    :meth:`AsyncKeychainSession.join` creates two things that nothing but a deliberate
+    removal takes back. Everything else here reads.
 """
 
 from __future__ import annotations
@@ -31,21 +33,37 @@ from __future__ import annotations
 import logging
 import plistlib
 import time
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from typing_extensions import Self, override
 
 from findmy.cloudkit.client import AsyncCloudKitClient
+from findmy.cloudkit.constants import CUTTLEFISH_SERVICE
 from findmy.cloudkit.pcs import public_key_forms
 from findmy.cloudkit.proto import cuttlefish_pb2 as cf
 from findmy.errors import UnhandledProtocolError
 from findmy.util.abc import Closable
 
-from .bottle import BottleKeys, OpenedBottle, find_bottle_keys, open_bottle
+from .bottle import (
+    BottleKeys,
+    CreatedBottle,
+    OpenedBottle,
+    find_bottle_keys,
+    open_bottle,
+    seal_bottle,
+)
 from .cuttlefish import ViableBottles, fetch_viable_bottles, make_cuttlefish_client
+from .enrolment import (
+    DeviceDescription,
+    enrol_record,
+    new_bottle_entropy,
+    record_label,
+)
 from .escrow import (
     AsyncEscrowProxy,
+    EscrowError,
     EscrowRecord,
     RecoveryOptions,
     escrow_host,
@@ -61,13 +79,26 @@ from .items import (
     readable_items,
     service_key_item,
 )
-from .peers import PeerDirectory, fetch_peer_directory
+from .join import (
+    NewIdentity,
+    TrustSet,
+    generate_identity,
+    make_dynamic_info,
+    make_join_request,
+    make_peer,
+    make_stable_info,
+    make_voucher,
+    merge_trust,
+    next_stable_clock,
+)
+from .peers import PeerDirectory, check_peer_identifiers, fetch_peer_directory
 from .recovery import recover_bottled_peer
 from .servicekey import ServiceKeyError, ServiceKeys, service_keys_from_der
 from .shares import (
     KeyShare,
     ViewKeyring,
     fetch_recoverable_shares,
+    make_share,
     summarise,
     unwrap_share,
 )
@@ -99,6 +130,15 @@ values for fields nothing reads.
 # avoids an expiry landing in the middle of an exchange that has already asked a user for
 # their passcode.
 PET_LIFETIME_SECONDS = 240
+
+METHOD_JOIN_WITH_VOUCHER = "joinWithVoucher"
+"""
+The one write in this stage.
+
+**Not `establish`**, which forms a new circle rather than joining one and would destroy
+the user's existing trust. Its request message is deliberately undefined in
+`cuttlefish.proto`, so nothing here can fall back to it.
+"""
 
 
 class KeychainSessionError(UnhandledProtocolError):
@@ -621,3 +661,219 @@ class AsyncKeychainSession(Closable):
         # The service reports success for a deletion that addressed nothing, so the only
         # proof is asking again. Dropping the cache forces that on the next call.
         self._options = None
+
+    async def join(
+        self,
+        peer: RecoveredPeer,
+        *,
+        passcode: str,
+        device: DeviceDescription,
+        os_version: str,
+    ) -> JoinOutcome:
+        """
+        Join the trust circle with a new identity the recovered peer vouches for.
+
+        **This is the one call in this library that cannot be undone.** It adds a peer to
+        the circle protecting every password the user has, and it enrols an escrow record
+        that no Apple interface displays. Everything before it -- listing, recovering,
+        reading key shares -- is reversible or read-only; this is not.
+
+        Consider whether it is needed at all. :meth:`key_shares` already yields the view
+        keys, because a share is wrapped to the *receiving* peer's encryption key and
+        recovery produces exactly that key. Joining is what makes this client a member in
+        its own right, so that it holds keys addressed to itself; it is not how the keys
+        are first obtained.
+
+        The order is §6.9.4's, and the part of it that matters is that **the escrow record
+        is enrolled before the join is sent**. The two failure modes are not comparable: a
+        join that succeeds with no record leaves a peer nobody can ever recover, invisible
+        to every listing and out of reach of deletion, while a record with no join is
+        listed by :meth:`recovery_options` and removable by :meth:`delete_record`. One is
+        permanent, the other is tidy-up.
+
+        :param peer: A peer from :meth:`recover`. It sponsors the new identity and its
+            shares are what get re-addressed.
+        :param passcode: The passcode **the new record** will be recoverable with. Not the
+            one that recovered `peer`, unless you mean them to be the same. Used inside
+            this call and not retained.
+        :param device: How this client describes itself, both in the escrow record's
+            metadata and in the peer's stable info -- so it is what a person sees in a
+            listing and in their device list.
+        :param os_version: This client's OS string, for the stable info.
+        :raises KeychainSessionError: If the peer identifier derivation cannot be
+            confirmed against the circle, or the sponsor holds no usable key shares.
+        """
+        directory = await self.peer_directory(refresh=True)
+
+        # Free, offline, and the only chance to check the one derivation a join depends on
+        # before it is spent. A wrong peer id names a beneficiary that does not exist, and
+        # that failure lands after the send.
+        check = check_peer_identifiers(directory)
+        if check.mismatched:
+            msg = (
+                "The peer identifier derivation does not reproduce"
+                f" {len(check.mismatched)} peer(s) already in this circle, so a voucher"
+                " built on it would name a beneficiary that does not exist. Refusing:"
+                " that failure would only surface after the join had been sent."
+            )
+            raise KeychainSessionError(msg)
+
+        recovered = [share.plaintext for share in await self.key_shares(peer) if share.plaintext]
+        if not recovered:
+            msg = (
+                "The sponsoring peer holds no key shares that could be unwrapped, so"
+                " joining would succeed and yield nothing -- while still leaving a peer in"
+                " the circle and a record on the account. Refusing."
+            )
+            raise KeychainSessionError(msg)
+
+        headers = await self._account.get_anisette_headers()
+        identity = generate_identity(
+            machine_id=headers.get("X-Apple-I-MD-M", ""),
+            model_id=device.model,
+            creation_time=int(time.time() * 1000),
+        )
+        logger.warning(
+            "Joining the trust circle as %s, sponsored by %s. This creates a peer and an"
+            " escrow record, and neither is undone by anything short of a deliberate"
+            " removal.",
+            identity.peer_id,
+            peer.peer_id,
+        )
+
+        voucher = make_voucher(identity.peer_id, peer.peer_id, peer.signing_key())
+        trust = merge_trust(directory, peer_id=identity.peer_id, sponsor=peer.peer_id)
+
+        bottle = seal_bottle(
+            peer_id=identity.peer_id,
+            signing_key=identity.signing_key,
+            encryption_key=identity.encryption_key,
+            entropy=new_bottle_entropy(),
+            adsid=self._account.adsid or self._account.dsid,
+            bottle_id=str(uuid.uuid4()).upper(),
+        )
+
+        # Before the join, and this ordering is the whole of §6.9.4's reasoning.
+        label = await self._enrol_for_join(identity, bottle, passcode, device)
+
+        request = make_join_request(
+            make_peer(
+                identity.peer_id,
+                permanent_info=identity.permanent,
+                stable_info=make_stable_info(
+                    identity.signing_key,
+                    clock=next_stable_clock(directory),
+                    os_version=os_version,
+                    serial_number=device.serial,
+                    device_name=device.name,
+                ),
+                dynamic_info=make_dynamic_info(identity.signing_key, trust),
+                voucher=voucher,
+            ),
+            bottle.bottle,
+            [
+                make_share(
+                    plaintext,
+                    peer_id=identity.peer_id,
+                    encryption_key=identity.encryption_key.public_key(),
+                    signing_key=identity.signing_key,
+                )
+                for plaintext in recovered
+            ],
+        )
+
+        response = await self._cuttlefish.function_invoke(
+            CUTTLEFISH_SERVICE,
+            METHOD_JOIN_WITH_VOUCHER,
+            request.SerializeToString(),
+        )
+
+        # Everything read before the join described a circle this peer was not in.
+        self._peers = None
+        self._options = None
+
+        logger.info("Joined as %s; Cuttlefish returned %d bytes", identity.peer_id, len(response))
+        return JoinOutcome(
+            identity=identity,
+            bottle=bottle,
+            label=label,
+            trust=trust,
+            shares=len(request.shares),
+            response=response,
+        )
+
+    async def _enrol_for_join(
+        self,
+        identity: NewIdentity,
+        bottle: CreatedBottle,
+        passcode: str,
+        device: DeviceDescription,
+    ) -> str:
+        """
+        Enrol the new peer's escrow record, retrying once if the label is already taken.
+
+        That retry is the one recovery §6.9.4 asks for, and it is deliberately narrow:
+        only on an error the escrow service itself **reported**. A transport failure has
+        not established that anything exists at that label, and deleting on one would
+        remove a record whose contents this client never saw.
+        """
+        await self._renew_token_if_stale()
+
+        async def enrol() -> str:
+            return await enrol_record(
+                self._proxy,
+                peer_id=identity.peer_id,
+                dsid=self._account.dsid,
+                password=passcode,
+                entropy=bottle.entropy,
+                device=device,
+                bottle_id=bottle.bottle_id,
+                escrowed_spki=bottle.escrowed_spki,
+            )
+
+        try:
+            return await enrol()
+        except EscrowError as e:
+            if not e.reported:
+                raise
+
+            label = record_label(identity.peer_id)
+            logger.warning(
+                "The escrow service refused to enrol %s (%s). Removing whatever is at that"
+                " label and enrolling again, which is what that error means when the label"
+                " is one this client just generated.",
+                label,
+                e,
+            )
+            await self._proxy.delete_label(label)
+            return await enrol()
+
+
+@dataclass(frozen=True)
+class JoinOutcome:
+    """What a completed join produced, and what has to outlive the process to use it."""
+
+    identity: NewIdentity
+    """The peer that was created. Its keys are the only copy in existence."""
+
+    bottle: CreatedBottle
+    """The bottle sent, and the entropy that recovers it."""
+
+    label: str
+    """The escrow record enrolled for it, addressable by §7.1's deletion."""
+
+    trust: TrustSet
+    """The dynamic info as sent, which §6.9.4 step 9 says to persist as sent."""
+
+    shares: int
+    """How many view keys were re-addressed to the new peer."""
+
+    response: bytes
+    """
+    Cuttlefish's reply, undecoded.
+
+    §6.9.4 step 9 says to apply the trust changes it carries, and **no message for it is
+    specified**. Guessing at one would be a parse that silently yields empty fields, which
+    is the failure §6.7.0 documents for the share record. So it is handed back whole.
+    """
+

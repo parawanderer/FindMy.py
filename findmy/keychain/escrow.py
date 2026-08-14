@@ -111,6 +111,19 @@ _CLIENT_INFO_BUNDLE = "com.apple.AuthKit/1 (com.apple.sbd/638.100.48)"
 class EscrowError(UnhandledProtocolError):
     """Raised when the escrow proxy rejects a request."""
 
+    def __init__(self, message: str, *, reported: bool = False) -> None:
+        """
+        Initialize the error.
+
+        :param reported: Whether the **service itself** described the failure, rather than
+            the request failing in transport. The distinction matters exactly once: an
+            enrolment that fails because a record already exists is worth resolving by
+            deleting that label and enrolling again, and doing that on a transport failure
+            would delete a record whose contents this client never established.
+        """
+        super().__init__(message)
+        self.reported = reported
+
 
 def _cert_versions() -> dict[str, list[int]]:
     """Build the pinned-certificate versions a club-handling command declares."""
@@ -606,7 +619,7 @@ class AsyncEscrowProxy(Closable):
         if data.get("success") is False or data.get("errorCode"):
             message = data.get("errorMessage") or "no message"
             msg = f"Escrow proxy rejected {command}: {message} (code {data.get('errorCode')})"
-            raise EscrowError(msg)
+            raise EscrowError(msg, reported=True)
 
         return data
 
@@ -815,6 +828,30 @@ class AsyncEscrowProxy(Closable):
                 # first half of this same transaction -- already answered that.
             },
         )
+
+    async def delete_label(
+        self,
+        label: str,
+        *,
+        user_action_label: str = "FindMy.py removing a record it just failed to enrol",
+    ) -> None:
+        """
+        Delete whatever is at one label, with none of :meth:`delete_record`'s guards.
+
+        **Not the method to reach for.** :meth:`delete_record` exists because a listing
+        contains records the user no longer recognises, and its four rules stop one being
+        removed on a judgement call. None of them applies here, which is why this is
+        separate and narrow rather than a flag on that method.
+
+        It is for exactly one case: an enrolment the service refused because a record
+        already exists at a label **this client generated moments earlier** for an identity
+        it created itself. There is no user judgement in that, and nothing else can be at
+        that label.
+
+        :param label: The record's label.
+        """
+        logger.warning("Deleting whatever is at %s, unconditionally", label)
+        await self._command("delete", label=label, user_action_label=user_action_label)
 
     async def delete_record(
         self,

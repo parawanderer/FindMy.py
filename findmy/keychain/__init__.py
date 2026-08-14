@@ -3,8 +3,10 @@
 from .bottle import (
     BottleError,
     BottleKeys,
+    CreatedBottle,
     derive_bottle_keys,
     keys_match_bottle,
+    seal_bottle,
 )
 from .cuttlefish import (
     CuttlefishError,
@@ -36,10 +38,14 @@ from .escrow import (
 )
 from .join import (
     JoinError,
+    NewIdentity,
     SignedBlob,
+    TrustSet,
+    generate_identity,
     make_join_request,
     make_peer,
     make_voucher,
+    merge_trust,
     require_key_shares,
 )
 from .recovery import (
@@ -51,6 +57,7 @@ from .recovery import (
 )
 from .session import (
     AsyncKeychainSession,
+    JoinOutcome,
     KeychainSessionError,
     RecoveredPeer,
 )
@@ -71,6 +78,7 @@ __all__ = (
     "AsyncKeychainSession",
     "BottleError",
     "BottleKeys",
+    "CreatedBottle",
     "CuttlefishError",
     "DeviceDescription",
     "EnrolmentError",
@@ -78,8 +86,10 @@ __all__ = (
     "EscrowListing",
     "EscrowRecord",
     "JoinError",
+    "JoinOutcome",
     "KeyShare",
     "KeychainSessionError",
+    "NewIdentity",
     "PinnedRoots",
     "RecoveredPeer",
     "RecoveryChallenge",
@@ -87,6 +97,7 @@ __all__ = (
     "RecoveryOptions",
     "ShareError",
     "SignedBlob",
+    "TrustSet",
     "ViableBottles",
     "build_escrow_blob",
     "build_record",
@@ -96,6 +107,7 @@ __all__ = (
     "escrow_timestamp",
     "fetch_recoverable_shares",
     "fetch_viable_bottles",
+    "generate_identity",
     "join_recovery_options",
     "keys_match_bottle",
     "make_cuttlefish_client",
@@ -103,11 +115,13 @@ __all__ = (
     "make_peer",
     "make_share",
     "make_voucher",
+    "merge_trust",
     "new_bottle_entropy",
     "parse_keyvault_message",
     "record_label",
     "recover_bottled_peer",
     "require_key_shares",
+    "seal_bottle",
     "sfies_decrypt",
     "sfies_decrypt_archive",
     "sfies_encrypt",

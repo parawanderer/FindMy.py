@@ -265,3 +265,349 @@ async def test_recovering_service_keys_reads_a_named_view() -> None:
     )
 
     assert seen == ["ProtectedCloudStorage"]
+
+
+# --------------------------------------------------------------------------------------
+# The join sequence (§6.9.4)
+# --------------------------------------------------------------------------------------
+
+
+class JoinProxy:
+    """An escrow proxy that records the order it was called in."""
+
+    def __init__(self, calls: list[str], *, refuse_first_enrol: bool = False) -> None:
+        self.calls = calls
+        self.refuse_first_enrol = refuse_first_enrol
+        self.deleted: list[str] = []
+        self.enrolled: list[str] = []
+
+    async def get_club_cert(self, transaction_id: str, **_: object) -> dict:
+        import base64  # noqa: PLC0415
+
+        self.calls.append("get_club_cert")
+        return {"clubCert": base64.b64encode(_CLUB[1]).decode(), "transactionUUID": transaction_id}
+
+    async def enroll(self, label: str, **_: object) -> dict:
+        from findmy.keychain.escrow import EscrowError  # noqa: PLC0415
+
+        self.calls.append("enroll")
+        if self.refuse_first_enrol and self.calls.count("enroll") == 1:
+            msg = "Escrow proxy rejected enroll: a record already exists (code 42)"
+            raise EscrowError(msg, reported=True)
+        self.enrolled.append(label)
+        return {}
+
+    async def delete_label(self, label: str, **_: object) -> None:
+        self.calls.append("delete_label")
+        self.deleted.append(label)
+
+    async def close(self) -> None:
+        return
+
+
+class JoinCuttlefish:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+        self.payload = b""
+
+    async def function_invoke(self, service: str, method: str, payload: bytes) -> bytes:
+        self.calls.append(method)
+        self.payload = payload
+        return b"the-changes"
+
+    async def close(self) -> None:
+        return
+
+
+class JoinAccount(FakeAccount):
+    async def get_anisette_headers(self, **_: object) -> dict[str, str]:
+        return {"X-Apple-I-MD-M": "the-machine-id"}
+
+
+_CLUB: tuple = ()
+
+
+def _prepare_club(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand a club certificate and its root in for the bundled ones."""
+    from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+
+    from cryptography import x509  # noqa: PLC0415
+    from cryptography.hazmat.primitives import hashes, serialization  # noqa: PLC0415
+    from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: PLC0415
+    from cryptography.x509.oid import NameOID  # noqa: PLC0415
+
+    from findmy.keychain.enrolment import PinnedRoots  # noqa: PLC0415
+
+    now = datetime.now(timezone.utc)
+
+    def name(common: str) -> x509.Name:
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common)])
+
+    root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    root = (
+        x509.CertificateBuilder()
+        .subject_name(name("Escrow Service Root CA"))
+        .issuer_name(name("Escrow Service Root CA"))
+        .public_key(root_key.public_key())
+        .serial_number(103)
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=365))
+        .sign(root_key, hashes.SHA256())
+    )
+    club_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    club = (
+        x509.CertificateBuilder()
+        .subject_name(name("Escrow Club"))
+        .issuer_name(root.subject)
+        .public_key(club_key.public_key())
+        .serial_number(7)
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=30))
+        .sign(root_key, hashes.SHA256())
+    )
+
+    global _CLUB  # noqa: PLW0603
+    _CLUB = (club_key, club.public_bytes(serialization.Encoding.DER))
+
+    monkeypatch.setattr(
+        "findmy.keychain.enrolment.PINNED_ROOT_FINGERPRINTS",
+        {103: root.fingerprint(hashes.SHA256())},
+    )
+    monkeypatch.setattr(
+        PinnedRoots,
+        "bundled",
+        classmethod(lambda cls: cls.load([root.public_bytes(serialization.Encoding.DER)])),
+    )
+
+
+def _a_joinable_session(monkeypatch: pytest.MonkeyPatch, **proxy_options: bool):
+    """A session whose circle, shares and club certificate are all stood in for."""
+    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.join import public_spki  # noqa: PLC0415
+    from findmy.keychain.peers import Peer, PeerDirectory  # noqa: PLC0415
+    from findmy.keychain.shares import KeyShare  # noqa: PLC0415
+
+    _prepare_club(monkeypatch)
+
+    calls: list[str] = []
+    cuttlefish = JoinCuttlefish(calls)
+    session = AsyncKeychainSession(
+        JoinAccount(),  # pyright: ignore [reportArgumentType]
+        FakeClient(),  # pyright: ignore [reportArgumentType]
+        cuttlefish,  # pyright: ignore [reportArgumentType]
+        FakeClient(),  # pyright: ignore [reportArgumentType]
+        JoinProxy(calls, **proxy_options),  # pyright: ignore [reportArgumentType]
+    )
+
+    sponsor_key = ec.generate_private_key(ec.SECP384R1())
+    sponsor = Peer(
+        hash="SHA256:sponsor",
+        signing_key=public_spki(sponsor_key.public_key()),
+        encryption_key=b"",
+        machine_id="",
+        model_id="",
+        stable_clock=3,
+        dynamic_clock=4,
+        includeds=("SHA256:sponsor",),
+    )
+
+    async def directory(_: object) -> PeerDirectory:
+        return PeerDirectory(peers={sponsor.hash: sponsor})
+
+    monkeypatch.setattr("findmy.keychain.session.fetch_peer_directory", directory)
+
+    material = cf.TlkKeyMaterial(
+        uuid="7F0A2C1E-0000-4000-8000-000000000001",
+        zone_name="Manatee",
+        key_class="tlk",
+        key=b"\x11" * 32,
+    ).SerializeToString()
+
+    async def shares(self: object, peer: object) -> list[KeyShare]:  # noqa: ARG001
+        calls.append("key_shares")
+        return [
+            KeyShare(
+                service="Manatee",
+                key_id="7F0A2C1E-0000-4000-8000-000000000001",
+                sender="SHA256:sponsor",
+                receiver="SHA256:sponsor",
+                wrapped_key=b"",
+                plaintext=material,
+            ),
+        ]
+
+    monkeypatch.setattr(AsyncKeychainSession, "key_shares", shares)
+
+    class Recovered:
+        peer_id = "SHA256:sponsor"
+
+        def signing_key(self):  # noqa: ANN202
+            return sponsor_key
+
+    return session, Recovered(), calls, cuttlefish
+
+
+def _a_device():
+    from findmy.keychain.enrolment import DeviceDescription  # noqa: PLC0415
+
+    return DeviceDescription(name="A Linux box", model="LinuxPC1,1", serial="X0X0", build="24A335")
+
+
+@pytest.mark.asyncio
+async def test_the_record_is_enrolled_before_the_join_is_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The ordering §6.9.4 exists for. A join that lands with no record leaves a peer
+    # nobody can ever recover, invisible to every listing; a record with no join is
+    # listed and deletable. One is permanent, the other is tidy-up.
+    session, recovered, calls, _ = _a_joinable_session(monkeypatch)
+
+    await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
+
+    assert calls.index("enroll") < calls.index("joinWithVoucher")
+
+
+@pytest.mark.asyncio
+async def test_the_join_carries_the_peer_its_bottle_and_its_shares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    session, recovered, _, cuttlefish = _a_joinable_session(monkeypatch)
+
+    outcome = await session.join(
+        recovered,
+        passcode="123456",
+        device=_a_device(),
+        os_version="6.1",
+    )
+
+    request = cf.CuttlefishJoinWithVoucherRequest()
+    request.ParseFromString(cuttlefish.payload)
+
+    assert request.peer.hash == outcome.identity.peer_id
+    assert request.bottle.peer_id == outcome.identity.peer_id
+    assert len(request.shares) == 1
+    # Never sent: this project receives view keys, it does not establish them.
+    assert list(request.keys) == []
+    assert outcome.response == b"the-changes"
+
+
+@pytest.mark.asyncio
+async def test_the_joining_peer_asserts_its_sponsors_trust_plus_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    session, recovered, _, cuttlefish = _a_joinable_session(monkeypatch)
+
+    outcome = await session.join(
+        recovered,
+        passcode="123456",
+        device=_a_device(),
+        os_version="6.1",
+    )
+
+    request = cf.CuttlefishJoinWithVoucherRequest()
+    request.ParseFromString(cuttlefish.payload)
+    dynamic = cf.PeerDynamicInfo()
+    dynamic.ParseFromString(request.peer.dynamic_info.info)
+
+    assert list(dynamic.includeds) == ["SHA256:sponsor", outcome.identity.peer_id]
+    assert dynamic.clock == 5
+
+
+@pytest.mark.asyncio
+async def test_the_bottle_and_the_record_come_from_one_derivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    session, recovered, _, cuttlefish = _a_joinable_session(monkeypatch)
+
+    outcome = await session.join(
+        recovered,
+        passcode="123456",
+        device=_a_device(),
+        os_version="6.1",
+    )
+
+    request = cf.CuttlefishJoinWithVoucherRequest()
+    request.ParseFromString(cuttlefish.payload)
+    inner = cf.OTBottle()
+    inner.ParseFromString(request.bottle.bottle)
+
+    assert outcome.bottle.escrowed_spki == inner.escrowed_signing_key
+    assert outcome.label.endswith(outcome.identity.peer_id)
+
+
+@pytest.mark.asyncio
+async def test_a_taken_label_is_cleared_and_enrolled_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, recovered, calls, _ = _a_joinable_session(monkeypatch, refuse_first_enrol=True)
+
+    outcome = await session.join(
+        recovered,
+        passcode="123456",
+        device=_a_device(),
+        os_version="6.1",
+    )
+
+    assert calls.count("enroll") == 2
+    assert calls.index("delete_label") < calls.index("joinWithVoucher")
+    assert session._proxy.deleted == [outcome.label]  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_does_not_delete_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only a failure the service *reported* establishes that something is at that label.
+    # Deleting on a transport error would remove a record this client never saw.
+    from findmy.keychain.escrow import EscrowError  # noqa: PLC0415
+
+    session, recovered, calls, _ = _a_joinable_session(monkeypatch)
+
+    async def refuse(label: str, **_: object) -> dict:
+        calls.append("enroll")
+        msg = "Escrow proxy returned HTTP 503 for enroll"
+        raise EscrowError(msg)
+
+    session._proxy.enroll = refuse  # noqa: SLF001  # pyright: ignore [reportAttributeAccessIssue]
+
+    with pytest.raises(EscrowError, match="503"):
+        await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
+
+    assert "delete_label" not in calls
+    assert "joinWithVoucher" not in calls
+
+
+@pytest.mark.asyncio
+async def test_joining_without_usable_shares_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from findmy.keychain.shares import KeyShare  # noqa: PLC0415
+
+    session, recovered, calls, _ = _a_joinable_session(monkeypatch)
+
+    async def nothing(self: object, peer: object) -> list[KeyShare]:  # noqa: ARG001
+        return [
+            KeyShare(
+                service="Manatee",
+                key_id="k",
+                sender="x",
+                receiver="y",
+                wrapped_key=b"",
+                error="would not unwrap",
+            ),
+        ]
+
+    monkeypatch.setattr(AsyncKeychainSession, "key_shares", nothing)
+
+    with pytest.raises(KeychainSessionError, match="yield nothing"):
+        await session.join(recovered, passcode="123456", device=_a_device(), os_version="6.1")
+
+    assert calls == []
