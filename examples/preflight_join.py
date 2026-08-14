@@ -89,10 +89,19 @@ async def main() -> int:  # noqa: PLR0915 -- a report, and it reads as one
             print(f"  {options.describe()}")
             print(f"  {options.device_count} device(s) by serial\n")
 
-            for record in options.recoverable:
-                print(f"  recoverable: {record.describe()}")
-            for record in options.described_but_not_viable:
-                print(f"  residue:     {record.describe()}")
+            # Whether each record's own peer is still in the circle. Nothing states what
+            # makes a bottle non-viable -- the trust-circle service returns those entries
+            # with no fields at all -- but a record names its peer in its label, and the
+            # directory says who is still a member. If the split lines up exactly, that is
+            # the answer; if it does not, membership is not the rule and the guess was
+            # wrong. Both outcomes are worth more than the guess.
+            for kind, records in (
+                ("recoverable", options.recoverable),
+                ("residue    ", options.described_but_not_viable),
+            ):
+                for record in records:
+                    member = "peer in circle" if record.peer_id in directory else "peer gone"
+                    print(f"  {kind}: {record.describe()} [{member}]")
 
             # ------------------------------------------------------------------
             print("\n--- The escrow club certificate ---")
