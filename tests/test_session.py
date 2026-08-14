@@ -214,3 +214,54 @@ async def test_material_without_entropy_names_the_field_it_wanted() -> None:
 
     with pytest.raises(KeychainSessionError, match="BottledPeerEntropy"):
         await session.recover(record, "123456")
+
+
+@pytest.mark.asyncio
+async def test_recovering_service_keys_is_one_call_from_a_record_and_a_passcode() -> None:
+    # The pair is always used together now, so a caller assembling it by hand is a caller
+    # who can get the order wrong for no benefit.
+    session = make_session([a_record()], viable=[LABEL])
+
+    recovered: list[object] = []
+
+    async def fake_recover(record, passcode):  # noqa: ANN001, ANN202
+        recovered.append((record.serial, passcode))
+        return "the-peer"
+
+    async def fake_service_keys(peer, *, view, shares=None):  # noqa: ANN001, ANN202, ARG001
+        recovered.append((peer, view))
+        return "the-keys"
+
+    session.recover = fake_recover  # type: ignore[method-assign]
+    session.service_keys = fake_service_keys  # type: ignore[method-assign]
+
+    options = await session.recovery_options()
+    keys = await session.recover_service_keys(options.recoverable[0], "1234")
+
+    assert keys == "the-keys"
+    assert recovered == [("C02JUNK1", "1234"), ("the-peer", "Manatee")]
+
+
+@pytest.mark.asyncio
+async def test_recovering_service_keys_reads_a_named_view() -> None:
+    session = make_session([a_record()], viable=[LABEL])
+    seen: list[str] = []
+
+    async def fake_recover(record, passcode):  # noqa: ANN001, ANN202, ARG001
+        return "the-peer"
+
+    async def fake_service_keys(peer, *, view, shares=None):  # noqa: ANN001, ANN202, ARG001
+        seen.append(view)
+        return "the-keys"
+
+    session.recover = fake_recover  # type: ignore[method-assign]
+    session.service_keys = fake_service_keys  # type: ignore[method-assign]
+
+    options = await session.recovery_options()
+    await session.recover_service_keys(
+        options.recoverable[0],
+        "1234",
+        view="ProtectedCloudStorage",
+    )
+
+    assert seen == ["ProtectedCloudStorage"]

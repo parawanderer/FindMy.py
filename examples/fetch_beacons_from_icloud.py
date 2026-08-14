@@ -6,15 +6,16 @@ everything that can be exercised without writing anything to that account.
 
     cd examples && python3 fetch_beacons_from_icloud.py
 
-Four parts, in increasing order of what they need:
+Three parts, in increasing order of what they need:
 
   1. **Fetch** the accessory records. Needs only a logged-in account.
   2. **Ask what the account could be recovered from** -- the escrow records Apple shows
      nowhere in its own interfaces, joined against the bottles the trust-circle service
      considers usable. Needs a fresh PET, which means one extra authentication.
-  3. **Decrypt.** The keys come from the `Manatee` keychain view, and this can recover
-     them itself -- which needs the screen-lock passcode of one of the account's devices.
-     Set MANATEE_KEYS_PATH to a file of PEM keys to skip that and use those instead.
+  3. **Decrypt.** The keys come from the `Manatee` keychain view, and this recovers them
+     itself -- one call, `session.recover_service_keys`, which needs the screen-lock
+     passcode of one of the account's devices. Set MANATEE_KEYS_PATH to a file of PEM keys
+     to skip that and use those instead.
 
 **Nothing here writes to the account.** No escrow record is created and no peer joins the
 trust circle. Recovering the keys is entirely read-only: a share is wrapped to the
@@ -77,7 +78,7 @@ def load_keys() -> list[ec.EllipticCurvePrivateKey]:
     return keys
 
 
-async def recover_keys(account) -> list[ec.EllipticCurvePrivateKey]:  # noqa: ANN001
+async def recover_keys(session: AsyncKeychainSession) -> list[ec.EllipticCurvePrivateKey]:
     """
     Recover the `Manatee` service keys, asking for a device passcode.
 
@@ -85,38 +86,33 @@ async def recover_keys(account) -> list[ec.EllipticCurvePrivateKey]:  # noqa: AN
     nothing is created, signed or enrolled. See `recover_escrow_material.py` for the same
     flow reported step by step.
     """
-    async with await AsyncKeychainSession.open(account) as session:
-        options = await session.recovery_options()
-        if not options.recoverable:
-            print("No record on this account is currently recoverable.")
-            return []
+    options = await session.recovery_options()
+    if not options.recoverable:
+        print("No record on this account is currently recoverable.")
+        return []
 
-        print(f"\n{len(options.recoverable)} record(s) can be recovered from:\n")
-        for record in options.recoverable:
-            print(f"  {record.describe()}")
+    print("\nEnter the SERIAL of the record to recover from, or nothing to skip.")
+    print("You will need that device's screen-lock passcode.\n")
 
-        print("\nEnter the SERIAL of the one to recover from, or nothing to skip.")
-        print("You will need that device's screen-lock passcode.\n")
+    typed = input("serial> ").strip()
+    if not typed:
+        return []
 
-        typed = input("serial> ").strip()
-        if not typed:
-            return []
+    chosen = next((r for r in options.recoverable if r.serial == typed), None)
+    if chosen is None:
+        print("No recoverable record has that serial.")
+        return []
 
-        chosen = next((r for r in options.recoverable if r.serial == typed), None)
-        if chosen is None:
-            print("No recoverable record has that serial.")
-            return []
+    passcode = getpass.getpass("passcode (not echoed)> ")
+    try:
+        keys = await session.recover_service_keys(chosen, passcode)
+    finally:
+        del passcode  # used inside the call above and wanted no longer
 
-        passcode = getpass.getpass("passcode (not echoed)> ")
-        try:
-            peer = await session.recover(chosen, passcode)
-        finally:
-            del passcode
-
-        return (await session.service_keys(peer)).for_pcs()
+    return keys.for_pcs()
 
 
-async def report_recovery_options(account) -> None:  # noqa: ANN001
+async def report_recovery_options(session: AsyncKeychainSession) -> None:
     """
     Report what this account could be recovered from, if anything.
 
@@ -130,12 +126,7 @@ async def report_recovery_options(account) -> None:  # noqa: ANN001
     """
     print("\n--- What this account could be recovered from ---")
 
-    try:
-        async with await AsyncKeychainSession.open(account) as session:
-            options = await session.recovery_options()
-    except UnhandledProtocolError as e:
-        print(f"Could not ask: {e}")
-        return
+    options = await session.recovery_options()
 
     total = len(options.recoverable) + len(options.described_but_not_viable)
     print(f"{total} record(s) across {options.device_count} device(s); {options.describe()}")
@@ -152,7 +143,32 @@ async def report_recovery_options(account) -> None:  # noqa: ANN001
         print(f"  undescribed: {bottle_id}")
 
 
-async def main() -> int:  # noqa: C901, PLR0912, PLR0915 -- a probe; linear reads better
+async def keys_to_decrypt_with(account) -> list[ec.EllipticCurvePrivateKey]:  # noqa: ANN001
+    """
+    Obtain the keys, from a file if one was supplied and by recovery otherwise.
+
+    One session for both the report and the recovery. Opening two would cost a second
+    container open and a second authentication for the same answers, and the listing the
+    report already fetched is cached on the session for the recovery to reuse.
+    """
+    supplied = load_keys()
+
+    try:
+        async with await AsyncKeychainSession.open(account) as session:
+            await report_recovery_options(session)
+
+            if supplied:
+                print(f"\nUsing {len(supplied)} key(s) from MANATEE_KEYS_PATH.")
+                return supplied
+
+            print("\n--- Recovering the keys to decrypt with ---")
+            return await recover_keys(session)
+    except UnhandledProtocolError as e:
+        print(f"\nCould not obtain keys: {e}")
+        return supplied
+
+
+async def main() -> int:  # noqa: C901, PLR0915 -- a probe; linear reads better
     """Fetch, and decrypt if keys were supplied."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(name)s: %(message)s")
     logging.getLogger("findmy.cloudkit").setLevel(logging.DEBUG)
@@ -207,12 +223,7 @@ async def main() -> int:  # noqa: C901, PLR0912, PLR0915 -- a probe; linear read
                 f"  {field_name:<30} {value.type_name:<22} encrypted={value.is_encrypted} {size}B",
             )
 
-        await report_recovery_options(account)
-
-        keys = load_keys()
-        if not keys:
-            print("\n--- Recovering the keys to decrypt with ---")
-            keys = await recover_keys(account)
+        keys = await keys_to_decrypt_with(account)
         if not keys:
             print("\nNo keys, so nothing above can be decrypted. Set MANATEE_KEYS_PATH to")
             print("a file of PEM private keys to supply them another way.")

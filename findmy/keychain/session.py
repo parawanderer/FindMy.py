@@ -451,6 +451,33 @@ class AsyncKeychainSession(Closable):
 
         return service_keys_from_der(payload_of(item))
 
+    async def recover_service_keys(
+        self,
+        record: EscrowRecord,
+        passcode: str,
+        *,
+        view: str = VIEW_MANATEE,
+    ) -> ServiceKeys:
+        """
+        Go from an escrow record and a device passcode to the keys Stage 5 decrypts with.
+
+        The whole of Stage 3 in one call, and the only one most callers want: recover the
+        peer, fetch its key shares, unwrap the view's keys, read the service key's item,
+        and return the elliptic-curve keys inside it.
+
+        **Read-only.** Nothing is created, signed or enrolled -- see :meth:`key_shares` for
+        why the keys arrive before any write would happen.
+
+        :param record: A recoverable record from :meth:`recovery_options`.
+        :param passcode: That device's screen-lock passcode. Used inside this call and not
+            retained; see :meth:`recover`.
+        :param view: The keychain view to read. `Manatee` holds Find My's keys.
+        :raises KeychainSessionError: If the record is not recoverable, or the view yields
+            no keys.
+        """
+        peer = await self.recover(record, passcode)
+        return await self.service_keys(peer, view=view)
+
     async def delete_record(
         self,
         record: EscrowRecord,
