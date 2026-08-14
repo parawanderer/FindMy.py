@@ -310,7 +310,7 @@ def test_the_top_level_key_is_the_plaintext_and_is_not_unwrapped_again() -> None
 
     keys = unwrap_view_keys([a_view_key("tlk", b"whatever")], key_material(top_level))
 
-    assert keys == {"tlk": top_level}
+    assert keys.by_slot == {"tlk": top_level}
 
 
 def test_an_entry_yields_three_keys() -> None:
@@ -326,7 +326,11 @@ def test_an_entry_yields_three_keys() -> None:
         key_material(top_level),
     )
 
-    assert keys == {"tlk": top_level, "classA": b"class A key", "classB": b"class B key"}
+    assert keys.by_slot == {
+        "tlk": top_level,
+        "classA": b"class A key",
+        "classB": b"class B key",
+    }
 
 
 def test_a_class_key_that_will_not_unwrap_does_not_cost_the_top_level_one() -> None:
@@ -334,11 +338,11 @@ def test_a_class_key_that_will_not_unwrap_does_not_cost_the_top_level_one() -> N
 
     keys = unwrap_view_keys([a_view_key("classA", b"not a wrapping")], key_material(top_level))
 
-    assert keys == {"tlk": top_level}
+    assert keys.by_slot == {"tlk": top_level}
 
 
 def test_a_plaintext_that_is_not_a_key_message_yields_no_keys_rather_than_raising() -> None:
-    assert unwrap_view_keys([a_view_key("classA", b"x")], b"\xff\xff\xff\xff") == {}
+    assert not unwrap_view_keys([a_view_key("classA", b"x")], b"\xff\xff\xff\xff")
 
 
 # --------------------------------------------------------------------------------------

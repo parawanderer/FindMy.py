@@ -364,6 +364,14 @@ class NameWrapper(_message.Message):
     name: str
     def __init__(self, name: _Optional[str] = ...) -> None: ...
 
+class Reference(_message.Message):
+    __slots__ = ("record_identifier", "action")
+    RECORD_IDENTIFIER_FIELD_NUMBER: _ClassVar[int]
+    ACTION_FIELD_NUMBER: _ClassVar[int]
+    record_identifier: RecordIdentifier
+    action: int
+    def __init__(self, record_identifier: _Optional[_Union[RecordIdentifier, _Mapping]] = ..., action: _Optional[int] = ...) -> None: ...
+
 class Record(_message.Message):
     __slots__ = ("etag", "record_identifier", "type", "created_by", "time_statistics", "record_field", "modified_by", "protection_info", "permission", "pcs_key")
     class Value(_message.Message):

@@ -77,6 +77,7 @@ def make_session(records: list[EscrowRecord], viable: list[str]) -> AsyncKeychai
         FakeAccount(),  # pyright: ignore [reportArgumentType]
         FakeClient(),  # pyright: ignore [reportArgumentType]
         FakeClient(),  # pyright: ignore [reportArgumentType]
+        FakeClient(),  # pyright: ignore [reportArgumentType]
         FakeProxy(records),  # pyright: ignore [reportArgumentType]
     )
 

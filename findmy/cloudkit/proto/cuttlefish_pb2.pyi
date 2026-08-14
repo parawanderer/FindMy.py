@@ -342,3 +342,19 @@ class ViewKey(_message.Message):
     key: bytes
     field_5: bytes
     def __init__(self, key_id: _Optional[str] = ..., top_level_key_id: _Optional[str] = ..., key_number: _Optional[int] = ..., key: _Optional[bytes] = ..., field_5: _Optional[bytes] = ...) -> None: ...
+
+class PcsServiceKeys(_message.Message):
+    __slots__ = ("encryption_key", "signing_key")
+    ENCRYPTION_KEY_FIELD_NUMBER: _ClassVar[int]
+    SIGNING_KEY_FIELD_NUMBER: _ClassVar[int]
+    encryption_key: PcsPrivateKey
+    signing_key: PcsPrivateKey
+    def __init__(self, encryption_key: _Optional[_Union[PcsPrivateKey, _Mapping]] = ..., signing_key: _Optional[_Union[PcsPrivateKey, _Mapping]] = ...) -> None: ...
+
+class PcsPrivateKey(_message.Message):
+    __slots__ = ("key", "public_structure")
+    KEY_FIELD_NUMBER: _ClassVar[int]
+    PUBLIC_STRUCTURE_FIELD_NUMBER: _ClassVar[int]
+    key: bytes
+    public_structure: bytes
+    def __init__(self, key: _Optional[bytes] = ..., public_structure: _Optional[bytes] = ...) -> None: ...

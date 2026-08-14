@@ -30,12 +30,16 @@ import asyncio
 import getpass
 import logging
 import sys
+from typing import TYPE_CHECKING
 
 from _login import get_account_async  # pyright: ignore [reportMissingImports]
 
 from findmy.errors import UnhandledProtocolError
 from findmy.keychain import AsyncKeychainSession, RecoveredPeer
 from findmy.keychain.shares import summarise
+
+if TYPE_CHECKING:
+    from findmy.keychain.servicekey import ServiceKeys
 
 ANISETTE_SERVER = None
 ANISETTE_LIBS_PATH = "ani_libs.bin"
@@ -73,10 +77,21 @@ def report_shares(shares: list) -> bool:
         state = f"{len(share.plaintext)} bytes" if share.plaintext else f"failed: {share.error}"
         sender = f" from {share.sender}" if share.sender else ""
         print(f"  {share.service or '<no view>'}{sender}: {state}")
-        for name, key in sorted(share.view_keys.items()):
+        for name, key in sorted(share.view_keys.by_slot.items()):
             print(f"      {name}: {len(key)} bytes")
 
     return any(share.plaintext for share in shares)
+
+
+def report_service_keys(keys: ServiceKeys) -> None:
+    """Report the keys the service key item yielded, without printing any of them."""
+    print("\n--- The service key ---")
+    print(f"  encryption key: {keys.encryption_key.curve.name}")
+    if keys.signing_key is not None:
+        print(f"  signing key:    {keys.signing_key.curve.name}")
+
+    print("\nThat is what Stage 5 decrypts accessory records with. Run")
+    print("fetch_beacons_from_icloud.py to use it.")
 
 
 async def main() -> int:
@@ -139,6 +154,10 @@ async def main() -> int:
             print("no peer created, no voucher signed, no escrow record enrolled, nothing")
             print("written to the account. Each view yields three keys -- the top-level")
             print("key and its two class keys -- and Manatee is the one Find My needs.")
+
+            # The last step: a view key is symmetric and Stage 5 needs an EC private key.
+            # The view key decrypts an item; the item's v_Data contains the EC key.
+            report_service_keys(await session.service_keys(peer, shares=shares))
     except UnhandledProtocolError as e:
         print(f"\nFailed: {e}")
         return 1

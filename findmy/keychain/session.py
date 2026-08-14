@@ -50,8 +50,16 @@ from .escrow import (
     escrow_host,
     join_recovery_options,
 )
+from .items import (
+    VIEW_MANATEE,
+    fetch_view,
+    make_securityd_client,
+    payload_of,
+    service_key_item,
+)
 from .peers import PeerDirectory, fetch_peer_directory
 from .recovery import recover_bottled_peer
+from .servicekey import ServiceKeys, service_keys_from_der
 from .shares import KeyShare, fetch_recoverable_shares, summarise, unwrap_share
 
 if TYPE_CHECKING:
@@ -144,6 +152,7 @@ class AsyncKeychainSession(Closable):
         account: AsyncAppleAccount,
         cloudkit: AsyncCloudKitClient,
         cuttlefish: AsyncCloudKitClient,
+        securityd: AsyncCloudKitClient,
         proxy: AsyncEscrowProxy,
     ) -> None:
         """Use :meth:`open`."""
@@ -152,6 +161,7 @@ class AsyncKeychainSession(Closable):
         self._account = account
         self._cloudkit = cloudkit
         self._cuttlefish = cuttlefish
+        self._securityd = securityd
         self._proxy = proxy
         self._pet_obtained_at = time.monotonic()
 
@@ -174,6 +184,11 @@ class AsyncKeychainSession(Closable):
         cloudkit = AsyncCloudKitClient(account)
         cuttlefish = make_cuttlefish_client(account)
 
+        # The same container as Cuttlefish, addressed to a different bundle. Keychain item
+        # zones answer to securityd, and reusing the Cuttlefish client asks the wrong
+        # service -- so the two are separate clients rather than one with a swapped header.
+        securityd = make_securityd_client(account)
+
         try:
             info = await cloudkit.open_container()
             partition = _require_partition(info.partition)
@@ -182,15 +197,17 @@ class AsyncKeychainSession(Closable):
         except Exception:
             await cloudkit.close()
             await cuttlefish.close()
+            await securityd.close()
             raise
 
         logger.info("Keychain session open on partition %s", info.partition)
-        return cls(account, cloudkit, cuttlefish, proxy)
+        return cls(account, cloudkit, cuttlefish, securityd, proxy)
 
     @override
     async def close(self) -> None:
         """Close everything this session opened. Does not close the account."""
         await self._proxy.close()
+        await self._securityd.close()
         await self._cuttlefish.close()
         await self._cloudkit.close()
 
@@ -382,6 +399,57 @@ class AsyncKeychainSession(Closable):
         ]
         logger.info("Shares for %s: %s", peer.peer_id, summarise(shares))
         return shares
+
+    async def service_keys(
+        self,
+        peer: RecoveredPeer,
+        *,
+        view: str = VIEW_MANATEE,
+        shares: list[KeyShare] | None = None,
+    ) -> ServiceKeys:
+        """
+        Recover the elliptic-curve keys Stage 5 decrypts accessory records with.
+
+        This is the whole path in one call: fetch the shares, unwrap the view's three keys,
+        enumerate the view's zone, follow the pointer tagged with this project's service,
+        decrypt that item, and read its `v_Data`.
+
+        **Note where the boundary is.** Everything up to the item is symmetric -- view
+        keys, item keys, AES-SIV -- and everything after it is elliptic-curve. A view key
+        never becomes an EC private key; the item's payload *contains* one.
+
+        Read-only throughout, and needs no passcode beyond the one :meth:`recover` spent.
+
+        :param peer: A peer from :meth:`recover`.
+        :param view: The keychain view to read. `Manatee` holds Find My's keys.
+        :param shares: Shares already fetched by :meth:`key_shares`, to avoid asking for
+            them twice. They are the same for every view, so a caller reading two views
+            should fetch once and pass them here.
+        :raises KeychainSessionError: If the view yields no keys for this peer.
+        :raises ItemError: If the item cannot be found or decrypted.
+        :raises ServiceKeyError: If its payload is not a key structure.
+        """
+        if shares is None:
+            shares = await self.key_shares(peer)
+
+        keyring = next(
+            (s.view_keys for s in shares if s.service == view and s.view_keys),
+            None,
+        )
+        if keyring is None:
+            available = sorted({s.service for s in shares if s.view_keys})
+            msg = (
+                f"No keys were recovered for the {view!r} view, so its items cannot be"
+                f" read. Views that did yield keys: {', '.join(available) or 'none'}"
+            )
+            raise KeychainSessionError(msg)
+
+        logger.info("Reading the %s view with %s", view, keyring.describe())
+
+        contents = await fetch_view(self._securityd, view)
+        item = service_key_item(contents, keyring)
+
+        return service_keys_from_der(payload_of(item))
 
     async def delete_record(
         self,

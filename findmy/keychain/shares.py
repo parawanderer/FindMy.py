@@ -368,7 +368,7 @@ class KeyShare:
     error: str | None = None
     """Why it could not be, if it could not."""
 
-    view_keys: dict[str, bytes] = field(default_factory=dict)
+    view_keys: ViewKeyring = field(default_factory=lambda: ViewKeyring())
     """The view's keys, unwrapped under the key this share yielded."""
 
     sender_known: bool = False
@@ -466,6 +466,15 @@ class ViewKey:
     wrapped_key: bytes
     upload_version: int
 
+    uuid: str = ""
+    """
+    The key's own UUID -- its record identifier.
+
+    This is what a keychain item's `parentkeyref` names, so it is the only thing that
+    matches an item to the key that unwraps it. The class *name* does not: `parentkeyref`
+    holds a UUID, and matching on `classA`/`classB` instead finds nothing.
+    """
+
     slot: str = ""
     """
     Which member of the view key set this came from: `tlk`, `classA` or `classB`.
@@ -486,6 +495,7 @@ class ViewKey:
             key_class=key_class if isinstance(key_class, str) else "",
             wrapped_key=_as_bytes(fields.get("wrappedkey")),
             upload_version=int(upload) if isinstance(upload, (int, float)) else 0,
+            uuid=record.record_identifier.value.name,
             slot=slot,
         )
 
@@ -926,7 +936,37 @@ def unwrap_class_key(wrapped: bytes, top_level_key: bytes) -> bytes:
         raise ShareError(msg) from None
 
 
-def unwrap_view_keys(keys: list[ViewKey], share_plaintext: bytes) -> dict[str, bytes]:
+@dataclass(frozen=True)
+class ViewKeyring:
+    """
+    A view's keys, addressable both ways.
+
+    Two indexes because two things need them and they ask differently: a person reads
+    `tlk`/`classA`/`classB`, while a keychain item's `parentkeyref` names a **UUID**.
+    Keeping only the names is what makes an item unmatchable.
+    """
+
+    by_uuid: dict[str, bytes] = field(default_factory=dict)
+    by_slot: dict[str, bytes] = field(default_factory=dict)
+
+    def get(self, uuid: str) -> bytes | None:
+        """Look up the key an item's `parentkeyref` names."""
+        return self.by_uuid.get(uuid)
+
+    def __len__(self) -> int:
+        """How many keys this holds."""
+        return len(self.by_slot)
+
+    def __bool__(self) -> bool:
+        """Whether it holds any key."""
+        return bool(self.by_slot)
+
+    def describe(self) -> str:
+        """Name the keys and their sizes, for a caller reporting to a person."""
+        return ", ".join(f"{n}: {len(k)} bytes" for n, k in sorted(self.by_slot.items()))
+
+
+def unwrap_view_keys(keys: list[ViewKey], share_plaintext: bytes) -> ViewKeyring:
     """
     Assemble a view's three keys.
 
@@ -941,32 +981,39 @@ def unwrap_view_keys(keys: list[ViewKey], share_plaintext: bytes) -> dict[str, b
 
     Failures are logged rather than raised, since a class key this client cannot read is
     not a reason to discard the top-level key it already has.
-
-    :returns: The keys by name -- `tlk`, `classA`, `classB`.
     """
     try:
         material = parse_key_material(share_plaintext)
     except ShareError as e:
         logger.warning("%s", e)
-        return {}
+        return ViewKeyring()
 
-    recovered = {"tlk": material.key}
+    by_uuid = {material.uuid: material.key} if material.uuid else {}
+    by_slot = {"tlk": material.key}
 
     for key in keys:
         if key.slot == "tlk":
             # Already held: this record carries the key the share itself decrypted to.
+            # Note its UUID is still worth taking, since the message and the record are
+            # two sources for the same identifier and either may be the one an item names.
+            if key.uuid:
+                by_uuid[key.uuid] = material.key
             continue
         if not key.wrapped_key:
             continue
-        try:
-            recovered[key.slot or key.key_class] = unwrap_class_key(
-                key.wrapped_key,
-                material.key,
-            )
-        except ShareError as e:
-            logger.warning("View key %r did not unwrap: %s", key.slot or key.key_class, e)
 
-    return recovered
+        name = key.slot or key.key_class
+        try:
+            unwrapped = unwrap_class_key(key.wrapped_key, material.key)
+        except ShareError as e:
+            logger.warning("View key %r did not unwrap: %s", name, e)
+            continue
+
+        by_slot[name] = unwrapped
+        if key.uuid:
+            by_uuid[key.uuid] = unwrapped
+
+    return ViewKeyring(by_uuid=by_uuid, by_slot=by_slot)
 
 
 def summarise(shares: Sequence[KeyShare]) -> str:

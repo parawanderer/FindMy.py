@@ -360,6 +360,18 @@ message NameWrapper {
   optional string name = 1;
 }
 
+// What a field's `reference_value` carries. A reference names another record, and the
+// name is what a keychain item's `parentkeyref` and a pointer's `item` are read for.
+//
+// ASSUMED field numbers: the specification says a reference's record identifier names the
+// target without giving the wrapper's own tags. Readers here scan for a submessage that
+// parses as a RecordIdentifier rather than trusting field 1, so a wrong guess costs
+// nothing -- see `reference_name`.
+message Reference {
+  optional RecordIdentifier record_identifier = 1;
+  optional int32 action = 2;
+}
+
 message Record {
   // A tagged union: a `type` discriminator plus whichever typed field is populated.
   //

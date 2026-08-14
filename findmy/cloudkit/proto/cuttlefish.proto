@@ -336,3 +336,23 @@ message ViewKey {
   // rather than silently corrected.
   optional bytes field_5 = 5;
 }
+
+// The payload of a v2 PCS private key structure: Stage 5 SS3.2's
+// `PrivateKey ::= CHOICE { v2 [APPLICATION 5] EXPLICIT SEQUENCE { data OCTET STRING } }`,
+// where that OCTET STRING is this message.
+//
+// ASSUMED field numbers. The specification names the two members and their order but not
+// their tags, so `service_keys_from_der` reads them positionally and reports what it saw
+// rather than relying on these.
+message PcsServiceKeys {
+  optional PcsPrivateKey encryption_key = 1;
+  optional PcsPrivateKey signing_key = 2;
+}
+
+message PcsPrivateKey {
+  // The private scalar, compressed -- 32 bytes for P-256.
+  optional bytes key = 1;
+
+  // The matching PublicKey structure of Stage 5 SS3.2, DER-encoded. Optional.
+  optional bytes public_structure = 2;
+}

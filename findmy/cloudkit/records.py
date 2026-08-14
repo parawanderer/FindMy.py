@@ -12,12 +12,13 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from google.protobuf.message import DecodeError
+
 from .constants import ValueType
+from .proto import cloudkit_pb2 as ck
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
-
-    from .proto import cloudkit_pb2 as ck
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,43 @@ def plain_value(value: ck.Record.Value) -> object:
         if value.HasField(name):
             return getattr(value, name)
     return None
+
+
+def reference_name(value: ck.Record.Value) -> str:
+    """
+    Read the record name a reference points at.
+
+    A reference's own wrapper tags are not specified, so rather than trusting a field
+    number this scans its submessages for one that parses as a `RecordIdentifier` naming
+    something. A wrong guess about the wrapper therefore costs nothing, where a hardcoded
+    field number would yield an empty name and no indication why.
+    """
+    if not value.HasField("reference_value"):
+        return ""
+
+    data = value.reference_value
+
+    reference = ck.Reference()
+    try:
+        reference.ParseFromString(data)
+    except DecodeError:
+        pass
+    else:
+        if reference.record_identifier.value.name:
+            return reference.record_identifier.value.name
+
+    for _, wire, payload in iter_wire_fields(data):
+        if wire != 2:
+            continue
+        identifier = ck.RecordIdentifier()
+        try:
+            identifier.ParseFromString(payload)
+        except DecodeError:
+            continue
+        if identifier.value.name:
+            return identifier.value.name
+
+    return ""
 
 
 def named_fields(record: ck.Record) -> dict[str, object]:
