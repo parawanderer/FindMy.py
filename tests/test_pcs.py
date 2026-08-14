@@ -1060,17 +1060,18 @@ def test_a_zone_unwraps_into_the_keys_its_records_use() -> None:
 
     keys = unwrap_zone(zone_der, [service_key])
 
-    assert len(keys) == 1
     assert keys[0].private_numbers().private_value == zone_scalar
 
 
-def test_a_zone_carrying_no_elliptic_curve_keys_says_so() -> None:
-    # The zone's whole purpose is the keys inside it, so an empty one is fatal here even
-    # though the same emptiness at the record level is not.
-    from findmy.cloudkit.pcs import PCSError, unwrap_zone  # noqa: PLC0415
+def test_a_zone_with_no_identity_still_yields_its_derived_key() -> None:
+    # §5's master EC key is the one construction turning a zone-level secret into an
+    # elliptic-curve key, so a zone whose meta carries only symmetric keys is not
+    # keyless -- it has whatever those derive to.
+    from findmy.cloudkit.pcs import master_ec_keys, unwrap_zone  # noqa: PLC0415
 
     service_key = ec.generate_private_key(ec.SECP256R1())
     zone_master = bytes(range(16))
+    extra = bytes(range(16, 32))
 
     zone_der = build_protection(
         entries=[(pcs.compress_public_key(service_key.public_key()), wrap_master_key(
@@ -1078,11 +1079,28 @@ def test_a_zone_carrying_no_elliptic_curve_keys_says_so() -> None:
         truncated_key_id=pcs.compute_key_id(zone_master)[:4],
         version=5,
         hmac_master_key=zone_master,
-        meta=build_meta(zone_master, symm_keys=[bytes(16)]),
+        meta=build_meta(zone_master, symm_keys=[extra]),
     )
 
-    with pytest.raises(PCSError, match="no elliptic-curve keys"):
-        unwrap_zone(zone_der, [service_key])
+    keys = unwrap_zone(zone_der, [service_key])
+
+    # One per master key: the one unwrapped to us, then each of symmKeys.
+    assert len(keys) == 2
+    assert [k.private_numbers().private_value for k in keys] == [
+        m.private_numbers().private_value for m in master_ec_keys([zone_master, extra])
+    ]
+
+
+def test_the_derived_key_is_the_one_that_verifies_a_signature() -> None:
+    # It is the same derivation §4 step 4 verifies with, so offering it as a zone key is
+    # not a new construction -- it is the existing one, asked a different question.
+    from findmy.cloudkit.pcs import derive_master_ec_private_key, master_ec_keys  # noqa: PLC0415
+
+    master = bytes(range(16))
+
+    assert master_ec_keys([master])[0].private_numbers().private_value == (
+        derive_master_ec_private_key(master)
+    )
 
 
 def test_a_meta_that_holds_neither_member_names_its_tags(

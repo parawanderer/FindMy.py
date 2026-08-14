@@ -991,9 +991,16 @@ def unwrap_zone(
     """
     unwrapped = unwrap_protection(ShareProtection.from_der(protection_info), service_keys)
 
-    if not unwrapped.private_keys:
+    # The identity keys, plus the one construction in this protocol that turns a
+    # zone-level *secret* into an elliptic-curve key: §5's master EC key, derived from each
+    # master key the zone carries. It exists to verify signatures, but a record's keyset
+    # names a public x and this produces one, so it costs nothing to offer and a record
+    # naming it would answer where zone keys come from outright.
+    keys = [*unwrapped.private_keys, *master_ec_keys(unwrapped.master_keys)]
+
+    if not keys:
         msg = (
-            "The zone's protection structure unwrapped but carries no elliptic-curve keys,"
+            "The zone's protection structure unwrapped but yields no elliptic-curve keys,"
             " so there is nothing for its records to be protected under. Its meta is where"
             " those keys live, and it held"
             f" {len(unwrapped.meta.symmetric_keys)} symmetric key(s) and none of the other"
@@ -1004,13 +1011,41 @@ def unwrap_zone(
     # Name them the way a record names a key -- as a bare x coordinate -- because the next
     # failure is a record asking for one, and the only useful question then is whether it
     # is among these. Public keys, so naming them discloses nothing.
-    named = ", ".join(bare_x(key.public_key())[:8].hex() for key in unwrapped.private_keys[:4])
+    named = ", ".join(bare_x(key.public_key())[:8].hex() for key in keys[:6])
     logger.info(
-        "The zone yields %d key(s) for its records: %s",
+        "The zone yields %d key(s) for its records (%d from identities, %d derived): %s",
+        len(keys),
         len(unwrapped.private_keys),
+        len(keys) - len(unwrapped.private_keys),
         named,
     )
-    return unwrapped.private_keys
+    return keys
+
+
+def master_ec_keys(master_keys: Sequence[bytes]) -> list[ec.EllipticCurvePrivateKey]:
+    """
+    Derive the master EC key from each of a structure's master keys.
+
+    §5's derivation is the only construction here that turns a symmetric secret into an
+    elliptic-curve key. It exists to verify a structure's own signature, but the key it
+    produces is an ordinary P-256 key with a public x like any other -- so where a level
+    below names a key by its public part and the level above holds only secrets, this is
+    the one bridge between them.
+
+    Offered rather than assumed: a record either names one of these or does not, and the
+    check costs a PBKDF2 with ten iterations.
+    """
+    keys: list[ec.EllipticCurvePrivateKey] = []
+
+    for master_key in master_keys:
+        try:
+            keys.append(
+                ec.derive_private_key(derive_master_ec_private_key(master_key), ec.SECP256R1()),
+            )
+        except ValueError as e:  # noqa: PERF203 -- one bad key must not cost the others
+            logger.debug("A master key yields no master EC key: %s", e)
+
+    return keys
 
 
 # --------------------------------------------------------------------------------------
