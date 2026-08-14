@@ -45,7 +45,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from findmy.cloudkit import AsyncBeaconStore, MissingKeyError, decrypt_records
 from findmy.cloudkit.beacons import accessories_from_records
-from findmy.cloudkit.pcs import PCSError
+from findmy.cloudkit.pcs import PCSError, ShareProtection, bare_x
 from findmy.errors import UnhandledProtocolError
 from findmy.keychain import AsyncKeychainSession
 
@@ -175,6 +175,38 @@ async def keys_to_decrypt_with(account) -> list[ec.EllipticCurvePrivateKey]:  # 
         return supplied
 
 
+def report_key_sources(records, *, keychain_keys, zone_keys) -> None:  # noqa: ANN001
+    """
+    Say where the key a record asks for could possibly have come from.
+
+    The zone's meta is specified as the only source of zone keys, so a record naming one
+    this client does not hold is either a short read of that meta or something else
+    entirely -- and those lead in opposite directions. Asking whether the named key is
+    among the *keychain* keys distinguishes them for free: if it is, the level is wrong
+    again; if it is in neither set, no amount of reading either better would have found it.
+    """
+    wanted = next((r for r in records if r.protection_info and r.record_type), None)
+    if wanted is None:
+        return
+
+    try:
+        protection = ShareProtection.from_der(wanted.protection_info)
+    except Exception as e:  # noqa: BLE001 -- a probe reporting, not a library deciding
+        print(f"  (could not read a record's protection structure: {e})")
+        return
+
+    named = {entry.public_key for entry in protection.keys}
+    in_keychain = any(bare_x(k.public_key()) in named for k in keychain_keys)
+    in_zone = any(bare_x(k.public_key()) in named for k in zone_keys)
+
+    print(f"\n  A {wanted.record_type} names {len(named)} key(s):")
+    print(f"    among the {len(keychain_keys)} keychain keys: {in_keychain}")
+    print(f"    among the {len(zone_keys)} zone keys:     {in_zone}")
+
+    if not in_keychain and not in_zone:
+        print("    So it is in neither set, and reading either better would not find it.")
+
+
 async def main() -> int:  # noqa: C901, PLR0912, PLR0915 -- a probe; linear reads better
     """Fetch, and decrypt if keys were supplied."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(name)s: %(message)s")
@@ -245,6 +277,8 @@ async def main() -> int:  # noqa: C901, PLR0912, PLR0915 -- a probe; linear read
         except PCSError as e:
             print(f"The zone did not unwrap: {e}")
             return 1
+
+        report_key_sources(records, keychain_keys=keys, zone_keys=record_keys)
 
         print(f"The zone yields {len(record_keys)} key(s). Decrypting records...")
         try:
