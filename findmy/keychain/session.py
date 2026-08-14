@@ -53,6 +53,7 @@ from .escrow import (
 )
 from .items import (
     VIEW_MANATEE,
+    VIEW_PROTECTED_CLOUD_STORAGE,
     ItemError,
     fetch_view,
     make_securityd_client,
@@ -72,6 +73,8 @@ from .shares import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from cryptography.hazmat.primitives.asymmetric import ec
 
     from findmy.reports.account import AsyncAppleAccount
@@ -474,7 +477,7 @@ class AsyncKeychainSession(Closable):
         self,
         peer: RecoveredPeer,
         *,
-        view: str = VIEW_MANATEE,
+        views: Sequence[str] = (VIEW_MANATEE, VIEW_PROTECTED_CLOUD_STORAGE),
         shares: list[KeyShare] | None = None,
     ) -> list[ec.EllipticCurvePrivateKey]:
         """
@@ -491,9 +494,43 @@ class AsyncKeychainSession(Closable):
         zone was fetched once already.
 
         :param peer: A peer from :meth:`recover`.
-        :param view: The keychain view to read.
+        :param views: The keychain views to read. **Both by default**, because Stage 5 §2
+            says both must be synced before decryption can begin -- reading only the one
+            that "holds these keys" is a reading of that sentence, and the cheaper mistake
+            is to read the other as well.
         :param shares: Shares already fetched, to avoid asking twice.
         """
+        if shares is None:
+            shares = await self.key_shares(peer)
+
+        keys: list[ec.EllipticCurvePrivateKey] = []
+        for view in views:
+            # A view that yields no shares is not a reason to skip the other.
+            keys.extend(await self._pcs_keys_or_none(peer, view, shares))
+
+        logger.info("%d elliptic-curve key(s) across %s", len(keys), ", ".join(views))
+        return keys
+
+    async def _pcs_keys_or_none(
+        self,
+        peer: RecoveredPeer,
+        view: str,
+        shares: list[KeyShare],
+    ) -> list[ec.EllipticCurvePrivateKey]:
+        """Read one view's keys, reporting rather than raising if it cannot be read."""
+        try:
+            return await self._pcs_keys_in(peer, view, shares)
+        except KeychainSessionError as e:
+            logger.warning("Could not read the %s view: %s", view, e)
+            return []
+
+    async def _pcs_keys_in(
+        self,
+        peer: RecoveredPeer,
+        view: str,
+        shares: list[KeyShare],
+    ) -> list[ec.EllipticCurvePrivateKey]:
+        """Read every elliptic-curve key one view's items hold."""
         keyring = await self._view_keyring(peer, view, shares)
         contents = await fetch_view(self._securityd, view)
 

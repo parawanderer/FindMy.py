@@ -928,10 +928,15 @@ def _find_our_key(
         {len(form) for key in private_keys for form in public_key_forms(key.public_key())},
     )
 
+    # With the sizes agreeing, the only thing that moves this forward is *which* key the
+    # record names -- a public key, so naming it costs nothing and identifies the holder.
+    named = ", ".join(k.public_key[:8].hex() for k in protection.keys[:4])
+
     msg = (
         f"None of the {len(private_keys)} key(s) held locally appears among the"
         f" {len(protection.keys)} entries protecting this record. Their public keys are"
         f" {theirs} bytes; the forms compared against are {ours}."
+        f" The record names: {named}"
     )
     raise MissingKeyError(msg)
 
