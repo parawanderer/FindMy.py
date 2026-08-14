@@ -35,6 +35,7 @@ from _login import get_account_async  # pyright: ignore [reportMissingImports]
 
 from findmy.cloudkit.beacons import decrypt_records
 from findmy.cloudkit.constants import RecordType
+from findmy.cloudkit.records import CloudKitRecord
 from findmy.errors import UnhandledProtocolError
 from findmy.icloud import AsyncFindMyClient
 
@@ -72,7 +73,7 @@ async def unlock(client: AsyncFindMyClient) -> bool:
     return True
 
 
-def choose(named: list[tuple[object, str]]) -> int:
+def choose(named: list[tuple[CloudKitRecord, str]]) -> int:
     """
     Show what can be renamed and ask which. Returns an index, or -1 to stop.
 
@@ -139,7 +140,7 @@ async def main() -> int:  # noqa: PLR0911
                 print("\nCancelled. Nothing was sent, and your account is unchanged.")
                 return 0
 
-            await client.rename(record, name=new)  # pyright: ignore [reportArgumentType]
+            await client.rename(record, name=new)
 
             # Reading it back proves the two halves of THIS library agree, and nothing
             # more. It is worth doing because a failure here is decisive, but a success
