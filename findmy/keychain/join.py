@@ -563,6 +563,16 @@ class SignatureCheck:
     vouchers_verified: list[str] = field(default_factory=list)
     vouchers_failed: list[str] = field(default_factory=list)
 
+    unvouched: list[str] = field(default_factory=list)
+    """
+    Peers carrying no voucher at all, which is not a fault.
+
+    **[observed] Exactly one peer in a thirteen-peer circle has none.** A voucher is what a
+    peer *joining* an existing circle carries, and the peer that established the circle
+    joined nothing -- so one unvouched peer is the expected shape, and its absence would be
+    the surprising result.
+    """
+
     der_spki_keys: int = 0
     """
     How many signing keys parsed as DER SubjectPublicKeyInfo.
@@ -584,6 +594,8 @@ class SignatureCheck:
         if self.vouchers_verified or self.vouchers_failed:
             vouchers = len(self.vouchers_verified) + len(self.vouchers_failed)
             parts.append(f"{len(self.vouchers_verified)}/{vouchers} vouchers")
+        if self.unvouched:
+            parts.append(f"{len(self.unvouched)} unvouched")
         if self.unverifiable:
             parts.append(f"{len(self.unverifiable)} could not be checked")
         return ", ".join(parts)
@@ -618,6 +630,7 @@ def check_peer_signatures(directory: PeerDirectory) -> SignatureCheck:
     unverifiable: list[str] = []
     vouchers_verified: list[str] = []
     vouchers_failed: list[str] = []
+    unvouched: list[str] = []
     der_spki = 0
 
     for peer in directory.peers.values():
@@ -631,7 +644,14 @@ def check_peer_signatures(directory: PeerDirectory) -> SignatureCheck:
         blob = SignedBlob(info=peer.permanent_info, signature=peer.permanent_signature)
         (verified if blob.verify(key, TYPE_PERMANENT_INFO) else failed).append(peer.hash)
 
-        _check_voucher(peer, directory, vouchers_verified, vouchers_failed, unverifiable)
+        _check_voucher(
+            peer,
+            directory,
+            vouchers_verified,
+            vouchers_failed,
+            unverifiable,
+            unvouched,
+        )
 
     check = SignatureCheck(
         verified=verified,
@@ -639,6 +659,7 @@ def check_peer_signatures(directory: PeerDirectory) -> SignatureCheck:
         unverifiable=unverifiable,
         vouchers_verified=vouchers_verified,
         vouchers_failed=vouchers_failed,
+        unvouched=unvouched,
         der_spki_keys=der_spki,
     )
 
@@ -672,15 +693,20 @@ def _is_der_spki(key: bytes) -> bool:
     return True
 
 
-def _check_voucher(
+def _check_voucher(  # noqa: PLR0913 -- one list per outcome, and there are four
     peer: Peer,
     directory: PeerDirectory,
     verified: list[str],
     failed: list[str],
     unverifiable: list[str],
+    unvouched: list[str],
 ) -> None:
     """Verify one peer's voucher against the sponsor it names, if it carries one."""
     if not peer.voucher_info or not peer.voucher_signature:
+        # Recorded rather than skipped. A circle's founder has no voucher, so seeing one
+        # such peer is the expected shape -- but counting only what was checked would
+        # report "12/12 vouchers" for thirteen peers and leave the difference unexplained.
+        unvouched.append(peer.hash)
         return
 
     try:

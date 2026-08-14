@@ -775,10 +775,13 @@ class AsyncEscrowProxy(Closable):
             extra=_cert_versions(),
         )
 
-        # Only `clubCert` is read. If the reply also carries the issuing chain, the roots
-        # would not have to be bundled at all -- they could be fetched, fingerprint-checked
-        # and used, which survives Apple adding a version 501. One real reply answers that,
-        # so the shape is logged: names and sizes only, since the values are certificates.
+        # **[observed] The reply carries the leaf and nothing else** -- `clubCert` plus
+        # `dsid`, `message`, `status` and `version`. So the issuing chain is not available
+        # here, and the four roots have to be carried by the client; fetching and
+        # fingerprint-checking them at runtime is not an option Apple offers.
+        #
+        # Still logged, because that answer has a shelf life: if a future reply does carry
+        # a chain, this is what would show it.
         logger.debug(
             "get_club_cert returned: %s",
             ", ".join(

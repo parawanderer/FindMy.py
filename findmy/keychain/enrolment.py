@@ -33,7 +33,7 @@ import plistlib
 import secrets
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -100,8 +100,12 @@ _INTEGRITY_DIGEST = "sha256"
 #
 # Note the dates: 101, 102 and 103 run to 2049, but **500 expires in 2032** -- issued in
 # 2022 with a ten-year life, breaking the sequence in numbering and in validity together.
-# If 500 is the one in active use, that is the deadline on any hardcoded set, this one
-# included.
+#
+# **[observed] 500 is the one in active use**: a live club certificate verified against it
+# and against none of the others. So that expiry is this library's deadline rather than a
+# hypothetical one, and Apple will roll to a root not in this set well before it -- which
+# `verify_club_certificate` warns about as the date approaches, since the alternative is
+# enrolment failing one day with a message about certificates.
 PINNED_ROOT_FINGERPRINTS: Mapping[int, bytes] = {
     101: bytes.fromhex("5644C142208DD4BF7AD770902F70D6730B8571164FD874D9AE5168807B32F766"),
     102: bytes.fromhex("D4EAA88170B8AEE18FCEFF68698310D4C2AB4CEB48179D99206A53AC73E8A4EB"),
@@ -366,10 +370,36 @@ def verify_club_certificate(
         _require_current(certificate, moment, "the club certificate")
 
         logger.info("The club certificate verifies against pinned escrow root %d", version)
+        _warn_if_expiring(root, moment, version)
         return certificate
 
     msg = "The club certificate did not verify against any pinned root: " + "; ".join(failures)
     raise EnrolmentError(msg)
+
+
+ROOT_EXPIRY_WARNING = timedelta(days=365)
+"""
+How far ahead a root's expiry is worth saying out loud.
+
+**[observed] The root in active use is 500, which expires in 2032** -- ten years from issue,
+where the other three run to 2049. So this set has a real end date, and Apple will move to a
+root not in it before then. The failure that would follow is enrolment refusing with a
+message about certificates, months after anybody could have acted on it, so it is worth a
+year's notice.
+"""
+
+
+def _warn_if_expiring(root: x509.Certificate, moment: datetime, version: int) -> None:
+    """Say so while there is still time to ship a new root."""
+    remaining = root.not_valid_after_utc - moment
+    if remaining < ROOT_EXPIRY_WARNING:
+        logger.warning(
+            "Escrow root %d expires on %s, and it is the one this account's club"
+            " certificate chains to. This library carries a fixed set of roots, so a"
+            " newer one has to ship before then or enrolment stops working.",
+            version,
+            f"{root.not_valid_after_utc:%Y-%m-%d}",
+        )
 
 
 def _require_current(certificate: x509.Certificate, moment: datetime, description: str) -> None:

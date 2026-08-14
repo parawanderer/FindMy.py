@@ -647,3 +647,41 @@ def test_the_passphrase_shape_is_described_honestly(
 
     assert client["SecureBackupUsesNumericPassphrase"] is numeric
     assert client["SecureBackupNumericPassphraseLength"] == length
+
+
+def test_a_root_about_to_expire_is_reported_while_there_is_time(
+    pinned,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 500 is the root a live club certificate chains to, and it expires in 2032 where the
+    # other three run to 2049. So this set has a real end date, and the failure that
+    # follows is enrolment refusing with a message about certificates months after anyone
+    # could have acted. A year's notice is the point.
+    from findmy.keychain.enrolment import verify_club_certificate  # noqa: PLC0415
+
+    root_key, root = pinned
+    _, club = _make_club(root_key, root, not_after=NOW + timedelta(days=300))
+    roots = PinnedRoots.load([root.public_bytes(serialization.Encoding.DER)])
+
+    with caplog.at_level("WARNING"):
+        verify_club_certificate(
+            club.public_bytes(serialization.Encoding.DER),
+            roots,
+            # Inside the root's own validity, but within a year of its end.
+            now=NOW + timedelta(days=200),
+        )
+
+    assert "has to ship before then" in caplog.text
+
+
+def test_a_root_with_years_left_says_nothing(pinned, caplog: pytest.LogCaptureFixture) -> None:
+    from findmy.keychain.enrolment import verify_club_certificate  # noqa: PLC0415
+
+    root_key, root = pinned
+    _, club = _make_club(root_key, root)
+    roots = PinnedRoots.load([root.public_bytes(serialization.Encoding.DER)])
+
+    with caplog.at_level("WARNING"):
+        verify_club_certificate(club.public_bytes(serialization.Encoding.DER), roots, now=NOW)
+
+    assert caplog.text == ""

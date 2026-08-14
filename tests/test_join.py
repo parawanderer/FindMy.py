@@ -677,6 +677,19 @@ def test_a_blob_signed_without_the_type_prefix_does_not_verify() -> None:
     assert check.failed == ["A"]
 
 
+def test_a_peer_with_no_voucher_is_counted_rather_than_skipped() -> None:
+    # **[observed] exactly one peer in a thirteen-peer circle has none**, because the peer
+    # that established the circle joined nothing. Counting only what was checked would
+    # report "12/12 vouchers" for thirteen peers and leave the difference unexplained.
+    from findmy.keychain.join import check_peer_signatures  # noqa: PLC0415
+
+    check = check_peer_signatures(a_circle(_signed_peer("founder", a_key())))
+
+    assert check.unvouched == ["founder"]
+    assert "1 unvouched" in check.describe()
+    assert check.confirmed
+
+
 def test_a_peer_carrying_nothing_to_check_is_neither_pass_nor_fail() -> None:
     from findmy.keychain.join import check_peer_signatures  # noqa: PLC0415
 
