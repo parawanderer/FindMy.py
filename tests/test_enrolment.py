@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import plistlib
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import srp._pysrp as srp
@@ -147,6 +148,57 @@ def test_pem_is_accepted_as_well_as_der(pinned) -> None:
 def test_the_real_fingerprints_are_the_four_the_specification_names() -> None:
     assert sorted(PINNED_ROOT_FINGERPRINTS) == [101, 102, 103, 500]
     assert all(len(digest) == 32 for digest in PINNED_ROOT_FINGERPRINTS.values())
+
+
+def test_the_bundled_roots_are_the_four_and_match_their_fingerprints() -> None:
+    # The fingerprint check is not relaxed for the roots that ship with the library. It is
+    # the reason they could be delivered by any route at all -- a wrong file cannot match
+    # one -- so a bundled certificate that fails is a corrupted install, and this is the
+    # test that says so.
+    roots = PinnedRoots.bundled()
+
+    assert sorted(roots.by_version) == [101, 102, 103, 500]
+    for version, certificate in roots.by_version.items():
+        assert certificate.fingerprint(hashes.SHA256()) == PINNED_ROOT_FINGERPRINTS[version]
+        assert certificate.serial_number == version
+        assert certificate.subject == certificate.issuer
+
+
+def test_the_bundled_roots_are_four_independent_anchors_not_a_chain() -> None:
+    # 101 does not sign 102. All four go in the store, and the club certificate chains to
+    # whichever issued it -- which is why the subjects differ only by the serialNumber
+    # attribute, and why matching an issuer picks exactly one.
+    roots = PinnedRoots.bundled()
+    subjects = {certificate.subject for certificate in roots.by_version.values()}
+
+    assert len(subjects) == 4
+
+
+def test_the_files_ship_inside_the_package() -> None:
+    # A data file that lives beside the source but is not packaged works in a checkout and
+    # fails in a wheel, where nothing in this suite would notice.
+    import findmy  # noqa: PLC0415
+
+    package = Path(findmy.__file__).parent
+    for version in (101, 102, 103, 500):
+        assert (package / "keychain" / "roots" / f"{version}.crt").is_file()
+
+
+def test_the_root_in_active_use_may_be_the_one_that_expires_first() -> None:
+    # 101 to 103 run to 2049; 500 was issued in 2022 with a ten-year life. If 500 is the
+    # one in use, 2032 is the deadline on this hardcoded set -- so this asserts the fact
+    # rather than leaving it in a comment nobody re-reads.
+    roots = PinnedRoots.bundled()
+
+    assert roots.by_version[500].not_valid_after_utc.year == 2032
+    assert all(roots.by_version[v].not_valid_after_utc.year == 2049 for v in (101, 102, 103))
+
+
+def test_a_caller_can_still_supply_their_own_set(pinned) -> None:
+    _, certificate = pinned
+    roots = PinnedRoots.load([certificate.public_bytes(serialization.Encoding.DER)])
+
+    assert list(roots.by_version) == [103]
 
 
 def test_a_club_certificate_verifies_against_its_pinned_root(pinned) -> None:

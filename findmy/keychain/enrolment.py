@@ -34,6 +34,7 @@ import secrets
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import srp._pysrp as srp
@@ -92,6 +93,15 @@ _INTEGRITY_DIGEST = "sha256"
 # Pinned roots
 # --------------------------------------------------------------------------------------
 
+# The version *is* the certificate's X.509 serial number -- 0x65 is 101, 0x01F4 is 500 --
+# doubling as Apple's identifier for the root, which is why the request field is called
+# `baseRootCertVersions`. Each carries it again in its subject as an X.520 serialNumber
+# attribute, which is the only part of the four subjects that differs.
+#
+# Note the dates: 101, 102 and 103 run to 2049, but **500 expires in 2032** -- issued in
+# 2022 with a ten-year life, breaking the sequence in numbering and in validity together.
+# If 500 is the one in active use, that is the deadline on any hardcoded set, this one
+# included.
 PINNED_ROOT_FINGERPRINTS: Mapping[int, bytes] = {
     101: bytes.fromhex("5644C142208DD4BF7AD770902F70D6730B8571164FD874D9AE5168807B32F766"),
     102: bytes.fromhex("D4EAA88170B8AEE18FCEFF68698310D4C2AB4CEB48179D99206A53AC73E8A4EB"),
@@ -114,16 +124,67 @@ Note that 500 expires in 2032 while the three older roots run to 2049.
 """
 
 
+ROOT_DIRECTORY = Path(__file__).parent / "roots"
+"""
+Where the four roots ship, one DER file per version, named `<version>.crt`.
+
+**Pinning data is not user input.** Asking a caller for these would ask them for four
+certificates they have no way to find, and the likely outcome is somebody pasting whatever
+a search turned up -- worse than shipping them, because it looks like a security decision
+was made when none was.
+
+Shipping them costs nothing in trust, which is the part worth internalising: the
+**fingerprints** are the anchor, and a wrong file cannot match one. So these needed no
+trusted delivery path, and neither would a replacement from anywhere. It is also why
+:meth:`load` fingerprint-checks the bundled files exactly as it checks a caller's -- a
+bundled certificate that fails is a corrupted install, and refusing as loudly is the whole
+security property rather than a check on it.
+
+**They are four independent anchors, not a chain.** 101 does not sign 102. All four go in
+the store and the club certificate chains to whichever issued it.
+
+They reach a built wheel because `setuptools-scm` includes what git tracks, so a `.crt`
+left untracked -- or excluded by a rule about binary files -- is absent from the package
+while every test in a checkout still passes. `test_the_files_ship_inside_the_package`
+covers the path; the tracking is the part a `.gitignore` could quietly undo.
+"""
+
+
 @dataclass(frozen=True)
 class PinnedRoots:
     """
     The escrow roots a client will accept, each checked against its fingerprint.
 
-    Build one with :meth:`load`. Constructing it directly from certificates that were not
-    fingerprint-checked defeats the point of the type existing.
+    :meth:`bundled` is what enrolment uses by default. :meth:`load` takes a caller's own
+    set for anyone who would rather supply it, and checks it identically. Constructing this
+    directly from certificates that were not fingerprint-checked defeats the point of the
+    type existing.
     """
 
     by_version: Mapping[int, x509.Certificate] = field(default_factory=dict)
+
+    @classmethod
+    def bundled(cls) -> PinnedRoots:
+        """
+        Load the roots shipped with this package, each checked against its fingerprint.
+
+        :raises EnrolmentError: If one cannot be read or does not match, which means a
+            corrupted install rather than a caller's mistake.
+        """
+        try:
+            certificates = [
+                (ROOT_DIRECTORY / f"{version}.crt").read_bytes()
+                for version in sorted(PINNED_ROOT_FINGERPRINTS)
+            ]
+        except OSError as e:
+            msg = (
+                f"An escrow root bundled with this package could not be read ({e}), which"
+                " is a broken install rather than a configuration problem: these ship with"
+                " the library precisely so that nobody has to source them."
+            )
+            raise EnrolmentError(msg) from None
+
+        return cls.load(certificates)
 
     @classmethod
     def load(cls, certificates: Iterable[bytes]) -> PinnedRoots:
@@ -133,6 +194,9 @@ class PinnedRoots:
         Each is accepted only if its SHA-256 matches a known version, its serial number
         agrees with that version, and it is self-signed -- the three things a root
         certificate asserts about itself, all checkable offline.
+
+        This is the same path the bundled roots take. The check does not relax for them:
+        a certificate that ships with the library still has to be the one it claims to be.
 
         :param certificates: DER or PEM encodings, in any order.
         :raises EnrolmentError: If any certificate is not one of the pinned roots. This is
@@ -263,7 +327,7 @@ def verify_club_certificate(
     ordinary web PKI without saying so.
 
     :param encoded: The certificate, DER or PEM, from `get_club_cert`.
-    :param roots: The pinned roots, from :meth:`PinnedRoots.load`.
+    :param roots: The pinned roots, normally :meth:`PinnedRoots.bundled`.
     :param now: The moment to judge validity at. Defaults to now, and exists so that a
         test does not expire.
     :raises EnrolmentError: If it does not verify, is expired, or was issued by something
@@ -798,7 +862,7 @@ def record_label(peer_id: str) -> str:
 
 async def fetch_club_certificate(
     proxy: AsyncEscrowProxy,
-    roots: PinnedRoots,
+    roots: PinnedRoots | None,
     transaction_id: str,
     *,
     now: datetime | None = None,
@@ -809,9 +873,12 @@ async def fetch_club_certificate(
     Read-only: `get_club_cert` creates nothing. It is separate from :func:`enrol_record` so
     that a caller can check the pinning works before anything writes.
 
+    :param roots: The pinned roots. `None` uses the ones bundled with this package, which
+        is what a caller normally wants.
     :param transaction_id: Shared with the `enroll` that follows.
     :raises EnrolmentError: If the certificate is missing, or does not verify.
     """
+    roots = roots if roots is not None else PinnedRoots.bundled()
     response = await proxy.get_club_cert(transaction_id)
 
     encoded = response.get("clubCert")
@@ -825,7 +892,7 @@ async def fetch_club_certificate(
 
 async def enrol_record(  # noqa: PLR0913 -- everything an escrow record is made of
     proxy: AsyncEscrowProxy,
-    roots: PinnedRoots,
+    roots: PinnedRoots | None = None,
     *,
     peer_id: str,
     dsid: str,
@@ -848,6 +915,7 @@ async def enrol_record(  # noqa: PLR0913 -- everything an escrow record is made 
     The order is not incidental: the certificate is fetched and **verified before** the
     blob is built, because the blob is encrypted to it.
 
+    :param roots: The pinned roots. `None` uses the bundled ones.
     :param peer_id: The new identity, whose label the record takes.
     :param dsid: The numeric account id -- also the SRP identity of a future recovery.
     :param password: The passcode this record will be recoverable with. Used inside this

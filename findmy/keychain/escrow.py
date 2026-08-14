@@ -754,13 +754,27 @@ class AsyncEscrowProxy(Closable):
 
         :param transaction_id: Shared with the `enroll` request.
         """
-        return await self._command(
+        response = await self._command(
             "get_club_cert",
             label=ESCROW_LABEL_ICDP,
             user_action_label=user_action_label,
             transaction_id=transaction_id,
             extra=_cert_versions(),
         )
+
+        # Only `clubCert` is read. If the reply also carries the issuing chain, the roots
+        # would not have to be bundled at all -- they could be fetched, fingerprint-checked
+        # and used, which survives Apple adding a version 501. One real reply answers that,
+        # so the shape is logged: names and sizes only, since the values are certificates.
+        logger.debug(
+            "get_club_cert returned: %s",
+            ", ".join(
+                f"{key}={len(value)}B" if isinstance(value, (bytes, str)) else f"{key}={value!r}"
+                for key, value in sorted(response.items())
+            ),
+        )
+
+        return response
 
     async def enroll(  # noqa: PLR0913 -- the fields an enrolment sends, and it is six
         self,
