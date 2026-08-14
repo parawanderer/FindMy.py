@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from findmy.cloudkit.records import CloudKitRecord
     from findmy.keychain.escrow import EscrowRecord, RecoveryOptions
     from findmy.reports.account import AsyncAppleAccount
+    from findmy.reports.reports import LocationReport
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +64,14 @@ class AsyncFindMyReader(Closable):
 
     def __init__(
         self,
+        account: AsyncAppleAccount,
         session: AsyncKeychainSession,
         store: AsyncBeaconStore,
     ) -> None:
         """Use :meth:`open`."""
         super().__init__()
 
+        self._account = account
         self._session = session
         self._store = store
 
@@ -90,7 +93,7 @@ class AsyncFindMyReader(Closable):
             await session.close()
             raise
 
-        return cls(session, store)
+        return cls(account, session, store)
 
     @override
     async def close(self) -> None:
@@ -227,6 +230,41 @@ class AsyncFindMyReader(Closable):
             self._keychain_keys,
             continuation_token=continuation_token,
         )
+
+    async def locations(
+        self,
+        accessories: Sequence[FindMyAccessory] | None = None,
+    ) -> dict[FindMyAccessory, LocationReport | None]:
+        """
+        Fetch each accessory's last known location from the Find My network.
+
+        A different service from everything else here: the records say what an accessory
+        *is*, and this asks the network where it has been seen. It needs no keychain
+        material -- the accessory's own key material, already decrypted, is what generates
+        the identifiers to ask about.
+
+        .. warning::
+            **An accessory with no key-alignment record searches its whole history.** It
+            starts at index zero from its pairing date, which for an eighteen-month-old
+            tag is around fifty thousand keys against a service that answers a few hundred
+            at a time. That is slow, and enough of it looks like abuse of the account
+            rather than like a first sync. Exports from format `0.0.2` carry the alignment
+            record that avoids it.
+
+        :param accessories: Which to locate. Fetched with :meth:`accessories` if omitted.
+        :returns: The last report for each, or None where the network has none.
+        """
+        wanted = list(accessories) if accessories is not None else await self.accessories()
+        if not wanted:
+            return {}
+
+        logger.info("Asking the Find My network about %d accessor(ies)", len(wanted))
+        located = await self._account.fetch_location(wanted)
+
+        # fetch_location keys its result by whatever it was handed, so this is already the
+        # mapping the caller wants -- but it omits nothing, and a missing accessory would
+        # be indistinguishable from one the network has not seen.
+        return {accessory: located.get(accessory) for accessory in wanted}
 
     def _require_keys(self) -> None:
         """Insist on keys, naming the two ways to get them."""

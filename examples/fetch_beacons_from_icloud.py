@@ -6,7 +6,7 @@ everything that can be exercised without writing anything to that account.
 
     cd examples && python3 fetch_beacons_from_icloud.py
 
-Three parts, in increasing order of what they need:
+Four parts, in increasing order of what they need:
 
   1. **Fetch** the accessory records. Needs only a logged-in account.
   2. **Ask what the account could be recovered from** -- the escrow records Apple shows
@@ -14,6 +14,8 @@ Three parts, in increasing order of what they need:
      considers usable. Needs a fresh PET, which means one extra authentication.
   3. **Decrypt.** The keys come from the `Manatee` keychain view, and this recovers them
      itself -- which needs the screen-lock passcode of one of the account's devices.
+  4. **Locate.** Ask the Find My network where each accessory was last seen. A different
+     service from all of the above, and the only part that needs no keychain material.
 
 **Nothing here writes to the account.** No escrow record is created and no peer joins the
 trust circle. Recovering the keys is entirely read-only: a share is wrapped to the
@@ -179,7 +181,7 @@ async def unlock(reader: AsyncFindMyReader) -> bool:
     return True
 
 
-def report_accessories(accessories: list) -> None:
+def report_accessories(accessories: list, located: dict) -> None:
     """Print what came out, which is the point of all of it."""
     print(f"\n{len(accessories)} accessor{'y' if len(accessories) == 1 else 'ies'}:")
     for accessory in accessories:
@@ -187,6 +189,14 @@ def report_accessories(accessories: list) -> None:
         print(f"    identifier: {accessory.identifier}")
         print(f"    serial:     {accessory.serial_number}")
         print(f"    paired:     {accessory.paired_at:%Y-%m-%d}")
+
+        report = located.get(accessory)
+        if report is None:
+            print("    location:   not seen by the network")
+        else:
+            seen = f"{report.timestamp:%Y-%m-%d %H:%M}"
+            print(f"    location:   {report.latitude:.5f}, {report.longitude:.5f}")
+            print(f"                {seen}, within {report.horizontal_accuracy}m")
 
 
 async def main() -> int:
@@ -215,7 +225,14 @@ async def main() -> int:
                 zone_keys=await reader.zone_keys(),
             )
 
-            report_accessories(await reader.accessories())
+            accessories = await reader.accessories()
+
+            # A different service: the records say what an accessory *is*, and this asks
+            # the Find My network where it has been seen. Slow for an accessory with no
+            # key-alignment record, which searches its whole history -- see
+            # AsyncFindMyReader.locations.
+            print("\nAsking the Find My network for their last known locations...")
+            report_accessories(accessories, await reader.locations(accessories))
     except UnhandledProtocolError as e:
         print(f"\nFailed: {e}")
         return 1
