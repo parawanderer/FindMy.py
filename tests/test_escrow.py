@@ -34,6 +34,13 @@ class FakeResponse:
     def ok(self) -> bool:
         return str(self.status_code).startswith("2")
 
+    @property
+    def content(self) -> bytes:
+        # The real HttpResponse exposes this, and the failure path reads it. A fake
+        # missing a method the code under test calls does not fail loudly -- it fails as
+        # an empty string somewhere downstream.
+        return self._content
+
     def plist(self) -> dict:
         return plistlib.loads(self._content)
 
@@ -690,3 +697,37 @@ async def test_srp_init_and_recover_share_one_transaction_id() -> None:
 
     ids = {plistlib.loads(c["data"])["transactionUUID"] for c in proxy._http.calls}  # noqa: SLF001
     assert ids == {"SHARED-TX"}
+
+
+def test_a_rejection_is_read_as_a_plist_rather_than_dumped_as_text() -> None:
+    # **[observed]** A rejected `recover` comes back as HTTP 409 carrying a complete reply:
+    # status, message, respBlob and version. Reading it as text throws away the two fields
+    # that say what happened and leaves a truncated XML dump in the exception.
+    from findmy.keychain.escrow import _failure  # noqa: PLC0415
+
+    body = plistlib.dumps(
+        {
+            "version": 1,
+            "status": "-6015",
+            "respBlob": "c3RyaXBwZWQ=",
+            "message": "CLUBH ERROR: Credentials did not verify",
+        },
+    )
+    error = _failure("recover", FakeResponse(409, body))
+
+    assert "status '-6015'" in str(error)
+    assert "CLUBH ERROR" in str(error)
+    assert "respBlob came back too" in str(error)
+    # The service described this, rather than the request failing in transport.
+    assert error.reported
+
+
+def test_a_rejection_that_is_not_a_plist_still_reports_what_arrived() -> None:
+    from findmy.keychain.escrow import _failure  # noqa: PLC0415
+
+    error = _failure("enroll", FakeResponse(503, b"<html>upstream is unwell</html>"))
+
+    assert "HTTP 503" in str(error)
+    assert "upstream is unwell" in str(error)
+    # Nothing described this, so it must not take the delete-and-re-enrol path.
+    assert not error.reported

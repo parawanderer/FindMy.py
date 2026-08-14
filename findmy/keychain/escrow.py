@@ -446,6 +446,49 @@ def join_recovery_options(
     )
 
 
+# **[observed]** A rejected `recover` comes back as HTTP 409 carrying a *complete* reply:
+# `status`, `message`, `respBlob` and `version`. So a non-2xx status does not mean the body
+# is unstructured -- reading it as plain text throws away the two fields that say what
+# happened and leaves a truncated XML dump in the exception instead.
+_FAILURE_FIELDS = ("status", "message", "errorCode", "errorMessage")
+
+
+def _failure(command: str, resp: object) -> EscrowError:
+    """
+    Build the error for a non-2xx reply, reading the body as a property list first.
+
+    The escrow proxy answers a rejection with the same plist shape it answers success
+    with, so the useful part -- a numeric `status` and a `message` naming the fault -- is
+    in there. Falling back to the raw text is for a body that genuinely is not one.
+    """
+    status_code = getattr(resp, "status_code", "?")
+
+    try:
+        data = resp.plist()  # pyright: ignore [reportAttributeAccessIssue]
+    except Exception:  # noqa: BLE001 -- any failure here just means it is not a plist
+        data = None
+
+    if isinstance(data, dict):
+        described = ", ".join(
+            f"{key} {data[key]!r}" for key in _FAILURE_FIELDS if data.get(key) is not None
+        )
+        blob = " (a respBlob came back too)" if data.get("respBlob") else ""
+        msg = (
+            f"Escrow proxy rejected {command} with HTTP {status_code}:"
+            f" {described or 'no status or message'}{blob}"
+        )
+        # The service described this rather than the request failing in transport.
+        return EscrowError(msg, reported=True)
+
+    try:
+        body = resp.content.decode("utf-8", errors="replace").strip()  # pyright: ignore [reportAttributeAccessIssue]
+    except (AttributeError, UnicodeDecodeError):  # pragma: no cover
+        body = ""
+
+    detail = f": {body[:500]}" if body else ""
+    return EscrowError(f"Escrow proxy returned HTTP {status_code} for {command}{detail}")
+
+
 def _parse_metadata(label: str, encoded: bytes | str) -> EscrowRecord:
     """Decode one record's metadata plist, tolerating a shape this does not know."""
     raw = base64.b64decode(encoded) if isinstance(encoded, str) else encoded
@@ -600,18 +643,7 @@ class AsyncEscrowProxy(Closable):
         )
 
         if not resp.ok:
-            # Include whatever came back. A failure body is often the only thing that
-            # says which field the service objected to, and discarding it leaves a bare
-            # status code to guess from.
-            detail = ""
-            try:
-                failure_body = resp.content.decode("utf-8", errors="replace").strip()
-            except (AttributeError, UnicodeDecodeError):  # pragma: no cover
-                failure_body = ""
-            if failure_body:
-                detail = f": {failure_body[:500]}"
-            msg = f"Escrow proxy returned HTTP {resp.status_code} for {command}{detail}"
-            raise EscrowError(msg)
+            raise _failure(command, resp)
 
         data = resp.plist()
         # Check success before reading anything else. The messages are specific and worth

@@ -40,6 +40,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from findmy.errors import UnhandledProtocolError
 
 from .escrow import (
+    EscrowError,
     KeyVaultSection,
     build_keyvault_message,
     parse_keyvault_message,
@@ -329,6 +330,35 @@ def unwrap_inner_blob(blob: bytes, passcode: str) -> bytes:
     return _strip_padding(plaintext)
 
 
+RETRY_LIMIT_UNVERIFIED = (
+    "Passcode-authenticated escrow services normally limit how many attempts a record"
+    " allows, and Apple's does; how many this one allows, and what happens at the end of"
+    " them, is **not established by the specification this implements**. Treat attempts as"
+    " a resource rather than as free retries, and prefer being sure of the passcode over"
+    " trying variations."
+)
+"""
+Why a rejected recovery is worth stopping on rather than retrying immediately.
+
+Deliberately hedged, because the consequence of being wrong in the incautious direction --
+a record that stops being recoverable at all -- is far worse than the cost of being wrong
+in the cautious one, which is a sentence of advice nobody needed.
+"""
+
+
+def _rejected(error: EscrowError) -> RecoveryError:
+    """Explain a rejection the service reported, without claiming to know which fault."""
+    msg = (
+        f"The escrow proxy rejected the recovery: {error}\n\n"
+        "A wrong passcode and a mis-parameterised exchange fail identically here, by"
+        " design -- so this does not establish which. What it does establish is that the"
+        " first half succeeded: srp_init was answered, so the record, the transport and"
+        " the label are all right, and the fault is in the proof or the passcode.\n\n"
+        f"{RETRY_LIMIT_UNVERIFIED}"
+    )
+    return RecoveryError(msg)
+
+
 async def recover_bottled_peer(
     proxy: AsyncEscrowProxy,
     record: EscrowRecord,
@@ -393,12 +423,15 @@ async def recover_bottled_peer(
             msg = "Could not compute an SRP proof from the challenge"
             raise RecoveryError(msg)
 
-        response = await proxy.recover(
-            record.label,
-            build_recovery_proof(challenge, proof),
-            transaction_id,
-            dsid=challenge.dsid,
-        )
+        try:
+            response = await proxy.recover(
+                record.label,
+                build_recovery_proof(challenge, proof),
+                transaction_id,
+                dsid=challenge.dsid,
+            )
+        except EscrowError as e:
+            raise _rejected(e) from None
 
         blob = _blob_bytes(response.get("respBlob"), "recover's respBlob")
 
