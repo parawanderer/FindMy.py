@@ -32,6 +32,7 @@ that sequence -- turning recovered entropy into the three keys the bottle is sea
 from __future__ import annotations
 
 import logging
+import secrets
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -495,4 +496,146 @@ def open_bottle(
         sponsor_known=sponsor is not None,
         sponsor_verified=sponsor_verified,
         escrowed_key_verified=escrowed_verified,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Creating a bottle (§6.9.3)
+# --------------------------------------------------------------------------------------
+
+BOTTLE_IV_LENGTH = 32
+"""
+The seal's IV. **Not 12, and not 16** -- both of which a GCM implementation would offer as
+its default or its obvious alternative, and neither of which is this.
+"""
+
+OT_PRIVATE_KEY_TYPE = 1
+"""What `OTPrivateKey.keyType` carries. The rest of the enumeration is unspecified."""
+
+
+def peer_key_material(key: ec.EllipticCurvePrivateKey) -> bytes:
+    """
+    Render a peer's private key the way a bottle carries it.
+
+    The **uncompressed public point followed by the private scalar**, 97 + 48 bytes on
+    P-384, which is what :func:`parse_peer_private_key` reads back.
+
+    Not to be confused with the 64-byte layout of §6.8.1 -- public x then scalar, with no
+    point prefix and no y. Two Apple key blobs, two layouts, one stage.
+    """
+    point = key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    scalar = key.private_numbers().private_value.to_bytes(PEER_PRIVATE_SCALAR_LENGTH, "big")
+    return point + scalar
+
+
+def _spki(key: ec.EllipticCurvePrivateKey) -> bytes:
+    """Render a private key's public half as DER SubjectPublicKeyInfo."""
+    return key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+
+
+@dataclass(frozen=True)
+class CreatedBottle:
+    """
+    A bottle for a new identity, and the two values its escrow record must agree with.
+
+    Those two are here rather than left to a caller to recompute because they must come
+    from **one** derivation. An escrow record built from separately generated entropy
+    enrols cleanly, joins cleanly, and recovers to a peer that does not exist.
+    """
+
+    bottle: cf.Bottle
+    entropy: bytes
+    """The 72 bytes this bottle was derived from. What the escrow record escrows."""
+
+    escrowed_spki: bytes
+    """`OTBottle.escrowedSigningKey`, which is also the record's `escrowedSPKI`."""
+
+    @property
+    def bottle_id(self) -> str:
+        """The bottle's UUID, which the escrow record's metadata also carries."""
+        return self.bottle.bottle_id
+
+
+def seal_bottle(  # noqa: PLR0913 -- the identity, the account, and the entropy
+    *,
+    peer_id: str,
+    signing_key: ec.EllipticCurvePrivateKey,
+    encryption_key: ec.EllipticCurvePrivateKey,
+    entropy: bytes,
+    adsid: str,
+    bottle_id: str,
+) -> CreatedBottle:
+    """
+    Seal a bottle for a newly generated identity, inverting §6.7 steps 2 to 4.
+
+    The three escrow keys come from the entropy exactly as recovery derives them, with the
+    `adsid` as salt -- so a bottle sealed here opens with nothing but that entropy and that
+    account, which is what makes the new peer recoverable at all.
+
+    **Both signatures are by the peer the bottle belongs to.** §6.7 step 3 describes the
+    second as verifying "under the sponsoring peer's signing key", which is accurate for a
+    bottle being *read*: the bottle recovered was created by the peer sponsoring us. The
+    general rule is the peer the bottle is for, and for every bottle this project creates
+    that is this client.
+
+    :param peer_id: The new peer's identifier.
+    :param signing_key: The new peer's signing key. Sealed inside, and signs the outside.
+    :param encryption_key: The new peer's encryption key. Sealed inside.
+    :param entropy: 72 fresh bytes, from
+        :func:`~findmy.keychain.enrolment.new_bottle_entropy`. **The same bytes the escrow
+        record escrows** -- see :class:`CreatedBottle`.
+    :param adsid: The account identifier, the HKDF salt.
+    :param bottle_id: A v4 UUID, upper-case. Passed in so that the record and the bottle
+        cannot be given different ones.
+    """
+    keys = derive_bottle_keys(entropy, adsid)
+
+    inner = cf.OTInternalBottle(
+        signing_key=cf.OTPrivateKey(
+            key_type=OT_PRIVATE_KEY_TYPE,
+            key_data=peer_key_material(signing_key),
+        ),
+        encryption_key=cf.OTPrivateKey(
+            key_type=OT_PRIVATE_KEY_TYPE,
+            key_data=peer_key_material(encryption_key),
+        ),
+    )
+
+    iv = secrets.token_bytes(BOTTLE_IV_LENGTH)
+    encryptor = Cipher(algorithms.AES(keys.symmetric), modes.GCM(iv)).encryptor()
+    sealed = encryptor.update(inner.SerializeToString()) + encryptor.finalize()
+
+    escrowed_spki = _spki(keys.signing)
+    contents = cf.OTBottle(
+        peer_id=peer_id,
+        bottle_id=bottle_id,
+        escrowed_signing_key=escrowed_spki,
+        escrowed_encryption_key=_spki(keys.encryption),
+        peer_signing_key=_spki(signing_key),
+        peer_encryption_key=_spki(encryption_key),
+        ciphertext=cf.OTAuthenticatedCiphertext(
+            ciphertext=sealed,
+            # Beside the ciphertext rather than appended to it, which is how §6.7 step 4
+            # reads it back.
+            authentication_code=encryptor.tag,
+            initialization_vector=iv,
+        ),
+    )
+
+    # Serialised once. Both signatures cover exactly these bytes and these bytes are what
+    # gets sent -- re-encoding the message before sending would invalidate both over
+    # content that has not changed.
+    payload = contents.SerializeToString()
+
+    return CreatedBottle(
+        bottle=cf.Bottle(
+            bottle=payload,
+            escrowed_signing_key=escrowed_spki,
+            escrowed_key_signature=keys.signing.sign(payload, ec.ECDSA(hashes.SHA384())),
+            peer_key_signature=signing_key.sign(payload, ec.ECDSA(hashes.SHA384())),
+            peer_id=peer_id,
+            bottle_id=bottle_id,
+        ),
+        entropy=entropy,
+        escrowed_spki=escrowed_spki,
     )

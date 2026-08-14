@@ -311,3 +311,123 @@ def test_the_two_halves_of_a_peer_key_check_each_other() -> None:
 def test_a_peer_key_of_the_wrong_length_names_the_expected_one() -> None:
     with pytest.raises(BottleError, match="145 bytes"):
         bottle.parse_peer_private_key(b"\x04" * 97)
+
+
+# --------------------------------------------------------------------------------------
+# Creating a bottle (§6.9.3)
+# --------------------------------------------------------------------------------------
+
+
+def _p384():
+    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+
+    return ec.generate_private_key(ec.SECP384R1())
+
+
+def _sealed(entropy: bytes = b"\x33" * 72, adsid: str = "1234567890"):
+    from findmy.keychain.bottle import seal_bottle  # noqa: PLC0415
+
+    signing, encryption = _p384(), _p384()
+    created = seal_bottle(
+        peer_id="SHA256:new",
+        signing_key=signing,
+        encryption_key=encryption,
+        entropy=entropy,
+        adsid=adsid,
+        bottle_id="4A1E5B9C-0000-4000-8000-000000000000",
+    )
+    return created, signing, encryption
+
+
+def test_a_sealed_bottle_opens_with_nothing_but_its_entropy_and_the_account() -> None:
+    # The whole point of the bottle: a future recovery has the passcode, which yields the
+    # entropy, and nothing else. If sealing and opening disagree anywhere -- the info
+    # strings, the 32-byte IV, the detached tag -- this yields nothing.
+    from findmy.keychain.bottle import derive_bottle_keys, open_bottle  # noqa: PLC0415
+
+    created, signing, encryption = _sealed()
+
+    opened = open_bottle(created.bottle, derive_bottle_keys(created.entropy, "1234567890"))
+
+    assert opened.signing().private_numbers() == signing.private_numbers()
+    assert opened.encryption().private_numbers() == encryption.private_numbers()
+    assert opened.escrowed_key_verified
+    assert opened.key_encoding == "der-spki"
+
+
+def test_a_bottle_is_signed_by_the_peer_it_belongs_to() -> None:
+    # §6.7 step 3 calls the second signature the sponsoring peer's, which is what it is
+    # when reading one. The rule is the peer the bottle is for -- this client.
+    from findmy.keychain.bottle import derive_bottle_keys, open_bottle  # noqa: PLC0415
+    from findmy.keychain.join import public_spki  # noqa: PLC0415
+    from findmy.keychain.peers import Peer  # noqa: PLC0415
+
+    created, signing, _ = _sealed()
+    itself = Peer(
+        hash="SHA256:new",
+        signing_key=public_spki(signing.public_key()),
+        encryption_key=b"",
+        machine_id="",
+        model_id="",
+    )
+
+    opened = open_bottle(
+        created.bottle,
+        derive_bottle_keys(created.entropy, "1234567890"),
+        sponsor=itself,
+    )
+
+    assert opened.sponsor_verified
+
+
+def test_the_wrong_account_does_not_open_it() -> None:
+    # The adsid is the HKDF salt, so two accounts with the same entropy derive different
+    # keys. That is what the salt is for.
+    from findmy.keychain.bottle import BottleError, derive_bottle_keys, open_bottle  # noqa: PLC0415
+
+    created, _, _ = _sealed()
+
+    with pytest.raises(BottleError, match="do not match"):
+        open_bottle(created.bottle, derive_bottle_keys(created.entropy, "9999999999"))
+
+
+def test_the_seal_uses_a_thirty_two_byte_iv() -> None:
+    # Not 12, not 16 -- the two a GCM implementation offers by default.
+    created, _, _ = _sealed()
+
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    inner = cf.OTBottle()
+    inner.ParseFromString(created.bottle.bottle)
+
+    assert len(inner.ciphertext.initialization_vector) == 32
+    assert len(inner.ciphertext.authentication_code) == 16
+
+
+def test_the_private_keys_are_point_then_scalar_at_key_type_one() -> None:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.bottle import derive_bottle_keys  # noqa: PLC0415
+    from findmy.keychain.bottle import open_bottle as _open  # noqa: PLC0415
+
+    created, signing, _ = _sealed()
+    opened = _open(created.bottle, derive_bottle_keys(created.entropy, "1234567890"))
+
+    assert opened.signing_key_type == 1
+    assert len(opened.signing_key) == 97 + 48
+    assert opened.signing_key[0] == 0x04
+    assert cf.OTPrivateKey  # the message this came from
+
+
+def test_the_escrow_record_and_the_bottle_share_one_derivation() -> None:
+    # escrowedSPKI is OTBottle.escrowedSigningKey, and both come from the same entropy.
+    # Two calls that each generate their own would enrol and join cleanly and recover to
+    # a peer that does not exist.
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+    created, _, _ = _sealed()
+
+    inner = cf.OTBottle()
+    inner.ParseFromString(created.bottle.bottle)
+
+    assert created.escrowed_spki == inner.escrowed_signing_key
+    assert created.bottle_id == inner.bottle_id == created.bottle.bottle_id
