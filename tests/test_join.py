@@ -238,6 +238,57 @@ def a_key() -> ec.EllipticCurvePrivateKey:
     return ec.generate_private_key(ec.SECP384R1())
 
 
+def _trusting(
+    name: str,
+    clock: int,
+    *,
+    includeds: list[str] | None = None,
+    excludeds: list[str] | None = None,
+    key: ec.EllipticCurvePrivateKey | None = None,
+):
+    from findmy.keychain.join import public_spki  # noqa: PLC0415
+    from findmy.keychain.peers import Peer  # noqa: PLC0415
+
+    return Peer(
+        hash=name,
+        signing_key=public_spki((key or a_key()).public_key()),
+        encryption_key=b"",
+        machine_id="",
+        model_id="",
+        dynamic_clock=clock,
+        includeds=tuple(includeds or []),
+        excludeds=tuple(excludeds or []),
+    )
+
+
+def _vouched_by(  # noqa: PLR0913
+    name: str,
+    clock: int,
+    *,
+    sponsor: str,
+    key: ec.EllipticCurvePrivateKey,
+    beneficiary: str | None = None,
+    includeds: list[str] | None = None,
+):
+    """A peer carrying a voucher signed by `key` and naming `sponsor` as its sponsor."""
+    import dataclasses  # noqa: PLC0415
+
+    from findmy.keychain.join import make_voucher  # noqa: PLC0415
+
+    voucher = make_voucher(beneficiary or name, sponsor, key)
+    return dataclasses.replace(
+        _trusting(name, clock, includeds=includeds),
+        voucher_info=voucher.info,
+        voucher_signature=voucher.signature,
+    )
+
+
+def a_circle(*peers):
+    from findmy.keychain.peers import PeerDirectory  # noqa: PLC0415
+
+    return PeerDirectory(peers={peer.hash: peer for peer in peers})
+
+
 def test_a_joining_peers_stable_clock_is_the_circles_highest_plus_one() -> None:
     from findmy.keychain.join import next_stable_clock  # noqa: PLC0415
     from findmy.keychain.peers import Peer, PeerDirectory  # noqa: PLC0415
@@ -265,19 +316,165 @@ def test_a_first_peer_sends_clock_one_not_zero() -> None:
     assert next_stable_clock(PeerDirectory()) == 1
 
 
-def test_a_joining_peers_dynamic_info_asserts_nothing() -> None:
-    # includeds is empty, which is the opposite of what the field name suggests: trust is
-    # asserted afterwards by updateTrust, once the peer is in and has synced.
-    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
-    from findmy.keychain.join import make_dynamic_info  # noqa: PLC0415
+def test_a_joining_peer_inherits_its_sponsors_trust_and_adds_itself() -> None:
+    # The corrected §6.8.2. An empty includeds with clock 0 is the ESTABLISH shape, and
+    # sending it on a join admits a peer that claims to trust nobody.
+    from findmy.keychain.join import merge_trust  # noqa: PLC0415
 
-    blob = make_dynamic_info(a_key())
+    directory = a_circle(
+        _trusting("sponsor", 4, includeds=["sponsor", "old"], excludeds=["gone"]),
+    )
+
+    trust = merge_trust(directory, peer_id="new", sponsor="sponsor")
+
+    assert trust.clock == 5
+    assert trust.includeds == ("sponsor", "old", "new")
+    assert trust.excludeds == ("gone",)
+
+
+def test_a_higher_clocked_peer_is_merged_and_its_removals_applied_after() -> None:
+    from findmy.keychain.join import merge_trust  # noqa: PLC0415
+
+    directory = a_circle(
+        _trusting("sponsor", 4, includeds=["sponsor", "doomed", "ahead"]),
+        _trusting("ahead", 9, includeds=["sponsor", "extra"], excludeds=["doomed"]),
+    )
+
+    trust = merge_trust(directory, peer_id="new", sponsor="sponsor")
+
+    # Includes first, then excludes: "doomed" is carried in from the sponsor and removed
+    # by the later peer, not the other way round.
+    assert "doomed" not in trust.includeds
+    assert trust.includeds == ("sponsor", "ahead", "extra", "new")
+    assert trust.excludeds == ("doomed",)
+    assert trust.clock == 10
+
+
+def test_peers_are_fast_forwarded_in_ascending_clock_order() -> None:
+    # Out of order, a removal made by a newer peer can be undone by an older one's
+    # inclusion, and the result silently re-trusts a peer the circle removed.
+    from findmy.keychain.join import merge_trust  # noqa: PLC0415
+
+    directory = a_circle(
+        _trusting("sponsor", 1, includeds=["sponsor", "later", "earlier"]),
+        _trusting("later", 8, excludeds=["revoked"]),
+        _trusting("earlier", 3, includeds=["revoked"]),
+    )
+
+    trust = merge_trust(directory, peer_id="new", sponsor="sponsor")
+
+    assert "revoked" not in trust.includeds
+    assert trust.excludeds == ("revoked",)
+    assert trust.clock == 9
+
+
+def test_an_unvouched_peers_update_is_ignored() -> None:
+    # A peer asserting membership is how an untrusted party would write itself into the
+    # circle. Without a valid voucher its whole update is dropped, not merged.
+    from findmy.keychain.join import merge_trust  # noqa: PLC0415
+
+    directory = a_circle(
+        _trusting("sponsor", 2, includeds=["sponsor"]),
+        _trusting("stranger", 6, includeds=["stranger", "friend"]),
+    )
+
+    trust = merge_trust(directory, peer_id="new", sponsor="sponsor")
+
+    assert trust.includeds == ("sponsor", "new")
+    assert trust.clock == 3
+
+
+def test_a_vouched_peer_is_adopted() -> None:
+    from findmy.keychain.join import merge_trust  # noqa: PLC0415
+
+    sponsor_key = a_key()
+    directory = a_circle(
+        _trusting("sponsor", 2, includeds=["sponsor"], key=sponsor_key),
+        _vouched_by("newcomer", 6, sponsor="sponsor", key=sponsor_key, includeds=["newcomer"]),
+    )
+
+    trust = merge_trust(directory, peer_id="new", sponsor="sponsor")
+
+    assert "newcomer" in trust.includeds
+    assert trust.clock == 7
+
+
+def test_a_voucher_signed_by_the_wrong_key_does_not_admit() -> None:
+    from findmy.keychain.join import merge_trust  # noqa: PLC0415
+
+    directory = a_circle(
+        _trusting("sponsor", 2, includeds=["sponsor"], key=a_key()),
+        # Vouched, but signed by a key that is not the sponsor's.
+        _vouched_by("newcomer", 6, sponsor="sponsor", key=a_key(), includeds=["newcomer"]),
+    )
+
+    assert "newcomer" not in merge_trust(directory, peer_id="new", sponsor="sponsor").includeds
+
+
+def test_a_voucher_for_somebody_else_does_not_admit_the_bearer() -> None:
+    from findmy.keychain.join import merge_trust  # noqa: PLC0415
+
+    sponsor_key = a_key()
+    directory = a_circle(
+        _trusting("sponsor", 2, includeds=["sponsor"], key=sponsor_key),
+        _vouched_by(
+            "newcomer",
+            6,
+            sponsor="sponsor",
+            key=sponsor_key,
+            beneficiary="somebody-else",
+            includeds=["newcomer"],
+        ),
+    )
+
+    assert "newcomer" not in merge_trust(directory, peer_id="new", sponsor="sponsor").includeds
+
+
+def test_an_excluded_peer_is_not_readmitted_by_its_own_voucher() -> None:
+    from findmy.keychain.join import merge_trust  # noqa: PLC0415
+
+    sponsor_key = a_key()
+    directory = a_circle(
+        _trusting("sponsor", 2, includeds=["sponsor"], excludeds=["newcomer"], key=sponsor_key),
+        _vouched_by("newcomer", 6, sponsor="sponsor", key=sponsor_key, includeds=["newcomer"]),
+    )
+
+    assert "newcomer" not in merge_trust(directory, peer_id="new", sponsor="sponsor").includeds
+
+
+def test_joining_without_a_sponsor_in_the_circle_is_refused() -> None:
+    from findmy.keychain.join import JoinError, merge_trust  # noqa: PLC0415
+    from findmy.keychain.peers import PeerDirectory  # noqa: PLC0415
+
+    with pytest.raises(JoinError, match="no trust to inherit"):
+        merge_trust(PeerDirectory(), peer_id="new", sponsor="absent")
+
+
+def test_the_signed_dynamic_info_is_what_was_merged() -> None:
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.join import make_dynamic_info, merge_trust  # noqa: PLC0415
+
+    directory = a_circle(_trusting("sponsor", 4, includeds=["sponsor"]))
+    trust = merge_trust(directory, peer_id="new", sponsor="sponsor")
 
     info = cf.PeerDynamicInfo()
-    info.ParseFromString(blob.info)
+    info.ParseFromString(make_dynamic_info(a_key(), trust).info)
+
+    assert info.clock == 5
+    assert list(info.includeds) == ["sponsor", "new"]
+
+
+def test_the_empty_shape_survives_where_it_belongs() -> None:
+    # clock 0 with everything cleared is the reset a client applies when it finds itself
+    # outside the circle -- not the join.
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from findmy.keychain.join import reset_dynamic_info  # noqa: PLC0415
+
+    info = cf.PeerDynamicInfo()
+    info.ParseFromString(reset_dynamic_info(a_key()).info)
+
     assert info.clock == 0
     assert list(info.includeds) == []
-    assert list(info.excludeds) == []
 
 
 def test_the_stable_info_carries_both_policies_verbatim() -> None:
@@ -307,8 +504,10 @@ def test_each_blob_is_signed_under_its_own_type_string() -> None:
         make_dynamic_info,
     )
 
+    from findmy.keychain.join import TrustSet  # noqa: PLC0415
+
     key = a_key()
-    blob = make_dynamic_info(key)
+    blob = make_dynamic_info(key, TrustSet(clock=1, includeds=("a",), excludeds=()))
 
     assert blob.verify(key.public_key())
     assert not blob.verify(key.public_key(), TYPE_STABLE_INFO)

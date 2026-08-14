@@ -5,12 +5,10 @@ Implements the message layer of Stage 3 §6.9 of the Find My key-export protocol
 specification: constructing a peer, signing its blobs, and assembling a
 `joinWithVoucher` request.
 
-**Sending one is not implemented, and deliberately so.** Joining writes to the user's
-account -- it creates an escrow record and adds a peer to the circle protecting every
-password they have -- and it depends on the passcode-authenticated recovery of §6.2 to
-§6.5, which is not built either. What is here is the part that can be written and tested
-without touching an account: the structures, the signing discipline, and the check that
-must happen before a join is worth attempting at all.
+**Nothing here sends anything.** Joining writes to the user's account -- it creates an
+escrow record and adds a peer to the circle protecting every password they have -- so this
+module builds and signs, and :mod:`findmy.keychain.session` is where the sequence that
+sends lives. What is here can be exercised offline in full.
 
 .. warning::
     ``establish`` forms a **new** circle rather than joining an existing one, and falling
@@ -21,11 +19,13 @@ must happen before a join is worth attempting at all.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from google.protobuf.message import DecodeError
 
 from findmy.cloudkit.proto import cuttlefish_pb2 as cf
 from findmy.errors import UnhandledProtocolError
@@ -33,11 +33,13 @@ from findmy.errors import UnhandledProtocolError
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from .peers import PeerDirectory
+    from .peers import Peer, PeerDirectory
 
-# The voucher reason this project uses. The enumeration is not specified; zero is the
-# protobuf default and is what an unset reason would serialise as.
-VOUCHER_REASON_DEFAULT = 0
+logger = logging.getLogger(__name__)
+
+# The reason a voucher carries. The rest of the enumeration is unspecified; this is the
+# value §6.9.4 step 3 names for the join this project performs.
+VOUCHER_REASON_DEFAULT = 1
 
 # A SignedInfo's signature covers a type string prepended to the serialised message, not
 # the message alone. That prefix is what stops a blob of one kind being presented as
@@ -136,6 +138,9 @@ POLICY_FLEXIBLE_HASH = b"SHA256:OIzjC3WyLGrM8GAd/EyIfVzTJdYmcGoKPFdQeWeRZTY="
 USER_CONTROLLABLE_VIEWS_ENABLED = 1
 """What a real client sends for `userControllableViewStatus`."""
 
+PERMANENT_INFO_EPOCH = 1
+"""What a peer's permanent info declares. Not zero, which is the protobuf default."""
+
 
 def next_stable_clock(directory: PeerDirectory) -> int:
     """
@@ -150,6 +155,20 @@ def next_stable_clock(directory: PeerDirectory) -> int:
     return max((peer.stable_clock for peer in directory.peers.values()), default=0) + 1
 
 
+def public_spki(key: ec.EllipticCurvePublicKey) -> bytes:
+    """
+    Encode a public key the way a peer's permanent info carries it: **DER SPKI**.
+
+    Not a raw point. The identifier of §6.8.2 digests the signed blob these sit inside, so
+    the encoding is part of the peer's identity -- the same key written as an uncompressed
+    point is a different peer, with a different id, vouched for by nobody.
+    """
+    return key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
 def make_permanent_info(  # noqa: PLR0913 -- every field of the message, and it is six
     signing_key: ec.EllipticCurvePrivateKey,
     *,
@@ -157,7 +176,7 @@ def make_permanent_info(  # noqa: PLR0913 -- every field of the message, and it 
     encryption_public: bytes,
     machine_id: str,
     model_id: str,
-    epoch: int = 0,
+    epoch: int = PERMANENT_INFO_EPOCH,
     creation_time: int,
 ) -> SignedBlob:
     """
@@ -170,13 +189,17 @@ def make_permanent_info(  # noqa: PLR0913 -- every field of the message, and it 
 
     :param signing_key: The new identity's own signing key. A peer signs its own permanent
         info; the sponsor's key signs only the voucher.
-    :param signing_public: The new identity's public signing key, as sent.
-    :param encryption_public: Its public encryption key.
-    :param machine_id: This installation's machine identifier.
+    :param signing_public: The new identity's public signing key, **DER SPKI** -- see
+        :func:`public_spki`.
+    :param encryption_public: Its public encryption key, likewise DER SPKI.
+    :param machine_id: The Anisette `X-Apple-I-MD-M` header, which is the machine identity
+        the session itself is bound to. A peer created under local Anisette and one created
+        against a server carry different ids **permanently**, because this blob is signed
+        at generation and never rewritten.
     :param model_id: The model this client claims to be.
-    :param creation_time: When this identity was made. Passed in rather than read from the
-        clock so that the bytes are reproducible, which matters for a value a digest
-        covers.
+    :param creation_time: When this identity was made, in **milliseconds** since the epoch,
+        not seconds. Passed in rather than read from the clock so that the bytes are
+        reproducible, which matters for a value a digest covers.
     """
     info = cf.PeerPermanentInfo(
         epoch=epoch,
@@ -226,17 +249,149 @@ def make_stable_info(
     return SignedBlob.sign(info.SerializeToString(), signing_key, TYPE_STABLE_INFO)
 
 
-def make_dynamic_info(signing_key: ec.EllipticCurvePrivateKey) -> SignedBlob:
+@dataclass(frozen=True)
+class TrustSet:
+    """A dynamic info's three merged values, before it is signed."""
+
+    clock: int
+    includeds: tuple[str, ...]
+    excludeds: tuple[str, ...]
+
+    def to_proto(self) -> cf.PeerDynamicInfo:
+        """Render as the message, with nothing else set."""
+        return cf.PeerDynamicInfo(
+            clock=self.clock,
+            includeds=list(self.includeds),
+            excludeds=list(self.excludeds),
+        )
+
+
+def merge_trust(directory: PeerDirectory, *, peer_id: str, sponsor: str) -> TrustSet:
     """
-    Build and sign the dynamic info a *joining* peer sends: `clock: 0` and nothing else.
+    Work out the trust a joining peer asserts: its sponsor's, brought forward, plus itself.
 
-    **`includeds` is empty**, which is the opposite of what the field's name suggests.
-    Trust is asserted afterwards by a separate `updateTrust`, once the peer is in the
-    circle and has synced it -- a peer trying to enter has nothing to assert about the
-    circle yet, and enumerating the one it wants to join is not what the message means.
+    **A joining peer inherits trust rather than inventing it, and never sends an empty
+    set.** An empty `includeds` with `clock: 0` is the `establish` shape -- the call this
+    project must never make -- and sending it on a join produces a peer that is admitted
+    while claiming to trust nobody. That is the "accepted, then behaves oddly" failure,
+    landing long after the irreversible call.
 
-    The same reset applies later: a client that finds itself *not* in the circle returns
-    here rather than resending whatever it last asserted.
+    The steps are §6.8.2's: start from the sponsor's `includeds`, `excludeds` and `clock`;
+    fast-forward over every peer with a higher clock in ascending order, adopting what it
+    includes and then applying what it excludes; add this peer's own id; increment.
+
+    :param directory: The circle, and it must be **current** -- everything here reads it.
+    :param peer_id: The joining peer's identifier, which it adds to its own trust.
+    :param sponsor: The recovered peer that signed the voucher.
+    :raises JoinError: If the sponsor is not in the directory, since there is then nothing
+        to inherit and the alternative is asserting a set this client invented.
+    """
+    seed = directory.get(sponsor)
+    if seed is None:
+        msg = (
+            f"The sponsoring peer {sponsor} is not in the trust circle, so there is no"
+            " trust to inherit. Joining with a set this client invented is what the"
+            " empty-includeds failure looks like from the other direction."
+        )
+        raise JoinError(msg)
+
+    includeds = list(seed.includeds)
+    excludeds = list(seed.excludeds)
+    clock = seed.dynamic_clock
+
+    # Ascending, because each peer's excludeds are applied on top of what earlier ones
+    # established. Out of order, a removal can be undone by an older peer's inclusion.
+    ahead = sorted(
+        (p for p in directory.peers.values() if p.dynamic_clock > clock),
+        key=lambda p: p.dynamic_clock,
+    )
+
+    for peer in ahead:
+        trusted = peer.hash in includeds
+        if not trusted and not _voucher_admits(peer, includeds, excludeds, directory):
+            # Not believed. A peer asserting membership is exactly how an untrusted party
+            # would write itself into the circle, so an unvouched update is ignored rather
+            # than merged -- and said out loud, since silently dropping trust changes
+            # looks identical to a circle that never had them.
+            logger.info(
+                "Ignoring the trust update from %s: it is not already trusted and carries"
+                " no valid voucher from a peer that is.",
+                peer.hash,
+            )
+            continue
+
+        for included in peer.includeds:
+            if included not in includeds:
+                includeds.append(included)
+        for excluded in peer.excludeds:
+            if excluded in includeds:
+                includeds.remove(excluded)
+            if excluded not in excludeds:
+                excludeds.append(excluded)
+
+        clock = peer.dynamic_clock
+
+    if peer_id not in includeds:
+        includeds.append(peer_id)
+
+    # One past everything it was derived from, so the info sent supersedes its sources.
+    return TrustSet(clock=clock + 1, includeds=tuple(includeds), excludeds=tuple(excludeds))
+
+
+def _voucher_admits(
+    peer: Peer,
+    includeds: Sequence[str],
+    excludeds: Sequence[str],
+    directory: PeerDirectory,
+) -> bool:
+    """
+    Whether a peer not already trusted has earned being adopted.
+
+    Four conditions, and all of them: the voucher's sponsor is already trusted, its
+    signature verifies under that sponsor's signing key, its beneficiary is the peer
+    presenting it, and that beneficiary has not been excluded. Anything less and a peer
+    could join the circle by asserting that it had.
+    """
+    if not peer.voucher_info or peer.hash in excludeds:
+        return False
+
+    try:
+        voucher = cf.Voucher.FromString(peer.voucher_info)
+    except DecodeError:
+        return False
+
+    if voucher.beneficiary != peer.hash or voucher.sponsor not in includeds:
+        return False
+
+    sponsor = directory.get(voucher.sponsor)
+    key = sponsor.signing_public_key() if sponsor else None
+    if key is None:
+        return False
+
+    blob = SignedBlob(info=peer.voucher_info, signature=peer.voucher_signature)
+    return blob.verify(key, TYPE_VOUCHER)
+
+
+def make_dynamic_info(signing_key: ec.EllipticCurvePrivateKey, trust: TrustSet) -> SignedBlob:
+    """
+    Build and sign the dynamic info a *joining* peer sends.
+
+    :param signing_key: The joining peer's own signing key.
+    :param trust: From :func:`merge_trust`. Not assembled here, so that what is asserted
+        can be inspected -- and tested -- before it is signed and sent.
+    """
+    return SignedBlob.sign(trust.to_proto().SerializeToString(), signing_key, TYPE_DYNAMIC_INFO)
+
+
+def reset_dynamic_info(signing_key: ec.EllipticCurvePrivateKey) -> SignedBlob:
+    """
+    Build the dynamic info of a client that finds itself **outside** the circle.
+
+    `clock: 0` with everything cleared, which is the one place that shape is right. It is
+    the reset, not the join: a client that has been removed starts again rather than
+    resending whatever it last asserted about a circle it is no longer in.
+
+    **Not for joining.** :func:`merge_trust` is what a join sends.
     """
     return SignedBlob.sign(
         cf.PeerDynamicInfo(clock=0).SerializeToString(),

@@ -150,6 +150,26 @@ class Peer:
     :func:`~findmy.keychain.join.next_stable_clock`.
     """
 
+    dynamic_clock: int = 0
+    """This peer's `PeerDynamicInfo.clock`. A different clock from :attr:`stable_clock`."""
+
+    includeds: tuple[str, ...] = ()
+    """Who this peer trusts. A joining peer starts from its sponsor's copy of this."""
+
+    excludeds: tuple[str, ...] = ()
+    """Who this peer has removed. Applied after :attr:`includeds` when merging."""
+
+    voucher_info: bytes = b""
+    """
+    The serialised `Voucher` that admitted this peer, as it arrived.
+
+    Kept so that a trust update from a peer not already trusted can be checked rather than
+    believed -- without it, any peer asserting membership would be taken at its word.
+    """
+
+    voucher_signature: bytes = b""
+    """The signature over the above, by the sponsor the voucher names."""
+
     def signing_public_key(self) -> ec.EllipticCurvePublicKey | None:
         """Load the signing key, or None if it is not in a shape this understands."""
         return load_public_key(self.signing_key)
@@ -208,6 +228,8 @@ def _peer_from_proto(peer: cf.CuttlefishPeer) -> Peer | None:
         logger.warning("Peer %s carries no signing key", peer.hash)
         return None
 
+    dynamic = _dynamic_info(peer)
+
     return Peer(
         hash=peer.hash,
         signing_key=info.signing_key,
@@ -219,7 +241,30 @@ def _peer_from_proto(peer: cf.CuttlefishPeer) -> Peer | None:
         permanent_info=peer.permanent_info.info,
         permanent_signature=peer.permanent_info.signature,
         stable_clock=_stable_clock(peer),
+        dynamic_clock=dynamic.clock,
+        includeds=tuple(dynamic.includeds),
+        excludeds=tuple(dynamic.excludeds),
+        voucher_info=peer.voucher.info,
+        voucher_signature=peer.voucher.signature,
     )
+
+
+def _dynamic_info(peer: cf.CuttlefishPeer) -> cf.PeerDynamicInfo:
+    """
+    Read a peer's dynamic info, treating an unreadable one as asserting nothing.
+
+    An empty result contributes no trust rather than removing any: a joining peer merges
+    these, and a peer whose claims could not be read should widen nothing rather than
+    silently narrowing what its neighbours already established.
+    """
+    info = cf.PeerDynamicInfo()
+    try:
+        info.ParseFromString(peer.dynamic_info.info)
+    except DecodeError:
+        logger.debug("Peer %s has dynamic info that does not decode", peer.hash)
+        return cf.PeerDynamicInfo()
+
+    return info
 
 
 def _stable_clock(peer: cf.CuttlefishPeer) -> int:
