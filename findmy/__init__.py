@@ -1,5 +1,7 @@
 """A package providing everything you need to work with Apple's FindMy network."""
 
+from typing import TYPE_CHECKING, Any
+
 from .accessory import (
     FindMyAccessory,
     FindMyAccessoryMapping,
@@ -40,12 +42,6 @@ from .reports import (
     Terms,
     TermsError,
     TrustedDeviceSecondFactorMethod,
-)
-from .scanner import (
-    NearbyOfflineFindingDevice,
-    OfflineFindingDevice,
-    OfflineFindingScanner,
-    SeparatedOfflineFindingDevice,
 )
 
 __all__ = (
@@ -93,3 +89,46 @@ __all__ = (
     "UnauthorizedError",
     "UnhandledProtocolError",
 )
+
+
+# The scanner is reached lazily, so that importing this package does not require `bleak`.
+#
+# `bleak` is the Bluetooth stack, and it is not a small dependency: `pyobjc-core` and two
+# CoreBluetooth frameworks on macOS, seven `winrt-*` packages on Windows, `dbus-fast` on
+# Linux. Everything else here -- logging in, reading reports, fetching accessories from
+# iCloud -- reaches Apple over the network and touches no radio, and a frozen application
+# that never scans was paying tens of megabytes for a module it never called.
+#
+# It could not be avoided from outside: importing a submodule executes this file first, so
+# there was no import path into the library that did not pull the radio in. PyInstaller's
+# `excludes` does not help either, because the exclusion has to survive `import findmy`.
+#
+# `from findmy import OfflineFindingScanner` still works, and still needs `bleak` -- the
+# cost is now paid by the clients that scan.
+_SCANNER_EXPORTS = frozenset(
+    {
+        "NearbyOfflineFindingDevice",
+        "OfflineFindingDevice",
+        "OfflineFindingScanner",
+        "SeparatedOfflineFindingDevice",
+    },
+)
+
+if TYPE_CHECKING:  # so that type checkers and IDEs still resolve these names
+    from .scanner import (
+        NearbyOfflineFindingDevice,
+        OfflineFindingDevice,
+        OfflineFindingScanner,
+        SeparatedOfflineFindingDevice,
+    )
+
+
+def __getattr__(name: str) -> Any:  # noqa: ANN401 -- a re-export of whatever was asked for
+    """Import the scanner on first use, rather than on importing this package."""
+    if name in _SCANNER_EXPORTS:
+        from . import scanner  # noqa: PLC0415 -- deferred on purpose; see above
+
+        return getattr(scanner, name)
+
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)

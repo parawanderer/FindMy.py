@@ -182,3 +182,30 @@ def test_the_default_is_not_written_so_existing_files_are_unchanged() -> None:
     assert RemoteAnisetteProvider.from_json(
         {"type": "aniRemote", "url": "https://a/"},
     ).serial == CLIENT_SERIAL
+
+
+def test_importing_the_package_does_not_import_the_bluetooth_stack() -> None:
+    """Test that `import findmy` costs nothing for a client that never scans."""
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    # A fresh interpreter, because this process has almost certainly imported it already.
+    probe = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", "import sys, findmy; print('bleak' in sys.modules)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert probe.stdout.strip() == "False"
+
+
+def test_the_scanner_is_still_reachable_by_the_name_it_always_had() -> None:
+    """Test that going lazy did not move anything a caller imports."""
+    import findmy  # noqa: PLC0415
+
+    assert findmy.OfflineFindingScanner.__name__ == "OfflineFindingScanner"
+    assert "OfflineFindingScanner" in findmy.__all__
+
+    with pytest.raises(AttributeError, match="no attribute"):
+        _ = findmy.NotAThingThatExists
