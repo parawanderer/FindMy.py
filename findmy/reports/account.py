@@ -37,7 +37,7 @@ from findmy.errors import (
     UnhandledProtocolError,
 )
 
-from .anisette import CLIENT_SERIAL, AnisetteMapping, get_provider_from_mapping
+from .anisette import AnisetteMapping, get_provider_from_mapping
 from .reports import LocationReport, LocationReportsFetcher
 from .state import LoginState
 from .terms import (
@@ -254,6 +254,22 @@ class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapp
         """
         raise NotImplementedError
 
+    @property
+    @abstractmethod
+    def serial(self) -> str:
+        """
+        The device serial this account presents, in `X-Apple-I-SRL-NO`.
+
+        The other half of the identity :attr:`client_info` describes, and the half a person
+        actually reads: it is what names this client in the account's device list. Set it
+        on the Anisette provider, which is where it is stored and serialized; everything
+        that sends it reads it from here, so one value describes one device.
+
+        A path that sends a different one does not fail -- it **registers a second device**,
+        next to a button inviting the owner to remove something they do not recognise.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def request_pet(self) -> MaybeCoro[str]:
         """
@@ -431,7 +447,7 @@ class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapp
     def get_anisette_headers(
         self,
         with_client_info: bool = False,
-        serial: str = CLIENT_SERIAL,
+        serial: str | None = None,
     ) -> MaybeCoro[dict[str, str]]:
         """
         Retrieve a complete dictionary of Anisette headers.
@@ -579,6 +595,12 @@ class AsyncAppleAccount(BaseAppleAccount):
     def client_info(self) -> str:
         """See :meth:`BaseAppleAccount.client_info`."""
         return self._anisette.client
+
+    @property
+    @override
+    def serial(self) -> str:
+        """See :meth:`BaseAppleAccount.serial`."""
+        return self._anisette.serial
 
     @override
     def to_json(self, path: str | Path | io.TextIOBase | None = None, /) -> AccountStateMapping:
@@ -1376,7 +1398,7 @@ class AsyncAppleAccount(BaseAppleAccount):
     async def get_anisette_headers(
         self,
         with_client_info: bool = False,
-        serial: str = CLIENT_SERIAL,
+        serial: str | None = None,
     ) -> dict[str, str]:
         """See :meth:`BaseAppleAccount.get_anisette_headers`."""
         return await self._anisette.get_headers(self._uid, self._devid, serial, with_client_info)
@@ -1464,6 +1486,12 @@ class AppleAccount(BaseAppleAccount):
     def client_info(self) -> str:
         """See :meth:`AsyncAppleAccount.client_info`."""
         return self._asyncacc.client_info
+
+    @property
+    @override
+    def serial(self) -> str:
+        """See :meth:`AsyncAppleAccount.serial`."""
+        return self._asyncacc.serial
 
     @override
     def to_json(self, dst: str | Path | None = None, /) -> AccountStateMapping:
@@ -1632,7 +1660,7 @@ class AppleAccount(BaseAppleAccount):
     def get_anisette_headers(
         self,
         with_client_info: bool = False,
-        serial: str = CLIENT_SERIAL,
+        serial: str | None = None,
     ) -> dict[str, str]:
         """See :meth:`AsyncAppleAccount.get_anisette_headers`."""
         coro = self._asyncacc.get_anisette_headers(with_client_info, serial)

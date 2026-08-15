@@ -81,6 +81,9 @@ class FakeAccount:
 
     def __init__(self) -> None:
         self.client_info = FINDMY_CLIENT_INFO
+        # The CloudKit client takes its serial from the account rather than keeping a
+        # second copy, so this fake has to carry one too.
+        self.serial = "0FINDMYPY001"
         self.device_uuid = DEVICE_UUID
         self.dsid = "1234567890"
         self.service_tokens = {

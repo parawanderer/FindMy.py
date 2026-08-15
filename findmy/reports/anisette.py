@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal, TypedDict
 
 from anisette import Anisette, AnisetteHeaders
-from typing_extensions import Required, override
+from typing_extensions import NotRequired, Required, override
 
 from findmy import util
 
@@ -47,6 +47,15 @@ class RemoteAnisetteMapping(TypedDict, total=False):
     type: Required[Literal["aniRemote"]]
     url: Required[str]
 
+    serial: str
+    """
+    The serial this provider presents as, when it is not the library's default.
+
+    Written only when it differs, so existing files stay valid -- and, more to the point,
+    keep the identity they already have. A restored account that reverted to the default
+    would add a device-list entry rather than reusing the one it had.
+    """
+
     allow_unverified_https: bool
     """
     Only written when it is true, so existing files stay valid and unchanged.
@@ -62,6 +71,9 @@ class LocalAnisetteMapping(TypedDict):
 
     type: Literal["aniLocal"]
     prov_data: str | None
+
+    serial: NotRequired[str]
+    """The serial this provider presents as, written only when it is not the default."""
 
 
 AnisetteMapping = RemoteAnisetteMapping | LocalAnisetteMapping
@@ -87,6 +99,28 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
 
     Generously derived from https://github.com/nythepegasus/grandslam/blob/main/src/grandslam/gsa.py#L41.
     """
+
+    def __init__(self, *, serial: str = CLIENT_SERIAL) -> None:
+        """
+        Initialize the provider.
+
+        :param serial: What this client presents as its device serial. Set it once, here:
+            it is part of an identity rather than a per-request detail, and a path that
+            sends a different one **registers a second device** rather than failing.
+        """
+        super().__init__()
+
+        self._serial = serial
+
+    @property
+    def serial(self) -> str:
+        """
+        The serial this provider presents as, in `X-Apple-I-SRL-NO`.
+
+        Read by everything that needs the identity -- including the CloudKit client, which
+        takes it from the account rather than keeping a second copy. One value, one device.
+        """
+        return self._serial
 
     @property
     @abstractmethod
@@ -157,13 +191,16 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         self,
         user_id: str,
         device_id: str,
-        serial: str = CLIENT_SERIAL,
+        serial: str | None = None,
         with_client_info: bool = False,
     ) -> dict[str, str]:
         """
         Generate a complete dictionary of Anisette headers.
 
         Consider using :meth:`BaseAppleAccount.get_anisette_headers` instead.
+
+        :param serial: Overrides this provider's own for one call. Defaults to it, which
+            is what a caller should want -- see :attr:`serial`.
         """
         headers = {
             # Current Time
@@ -183,7 +220,7 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
             # 'Device Unique Identifier'
             "X-Mme-Device-Id": str(device_id).upper(),
             # 'Device Serial Number'
-            "X-Apple-I-SRL-NO": serial,
+            "X-Apple-I-SRL-NO": serial or self._serial,
         }
 
         if with_client_info:
@@ -197,7 +234,7 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         self,
         user_id: str,
         device_id: str,
-        serial: str = CLIENT_SERIAL,
+        serial: str | None = None,
     ) -> dict[str, str]:
         """
         Generate a complete dictionary of CPD data.
@@ -221,11 +258,19 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
 
     _ANISETTE_DATA_VALID_FOR = 30
 
-    def __init__(self, server_url: str, *, allow_unverified_https: bool = False) -> None:
+    def __init__(
+        self,
+        server_url: str,
+        *,
+        serial: str = CLIENT_SERIAL,
+        allow_unverified_https: bool = False,
+    ) -> None:
         """
         Initialize the provider with URL to te remote server.
 
         :param server_url: Where to fetch Anisette headers from.
+        :param serial: What this client presents as its device serial; see
+            :attr:`BaseAnisetteProvider.serial`.
         :param allow_unverified_https: Skip certificate verification for **this server
             only**. Off by default, and the only switch of its kind in the library.
 
@@ -238,7 +283,7 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
             Turning it on means anything on the network path to that server can read and
             alter the Anisette data your logins are built from.
         """
-        super().__init__()
+        super().__init__(serial=serial)
 
         self._server_url = server_url
         self._allow_unverified_https = allow_unverified_https
@@ -256,6 +301,8 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
             "type": "aniRemote",
             "url": self._server_url,
         }
+        if self._serial != CLIENT_SERIAL:
+            state["serial"] = self._serial
         if self._allow_unverified_https:
             state["allow_unverified_https"] = True
 
@@ -275,6 +322,7 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
 
         return cls(
             server_url,
+            serial=val.get("serial", CLIENT_SERIAL),
             allow_unverified_https=val.get("allow_unverified_https", False),
         )
 
@@ -301,7 +349,7 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
         self,
         user_id: str,
         device_id: str,
-        serial: str = CLIENT_SERIAL,
+        serial: str | None = None,
         with_client_info: bool = False,
     ) -> dict[str, str]:
         """See :meth::meth:`BaseAnisetteProvider.get_headers`."""
@@ -340,9 +388,15 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
         *,
         state_blob: BytesIO | None = None,
         libs_path: str | Path | None = None,
+        serial: str = CLIENT_SERIAL,
     ) -> None:
-        """Initialize the provider."""
-        super().__init__()
+        """
+        Initialize the provider.
+
+        :param serial: What this client presents as its device serial; see
+            :attr:`BaseAnisetteProvider.serial`.
+        """
+        super().__init__(serial=serial)
 
         if isinstance(libs_path, str):
             libs_path = Path(libs_path)
@@ -417,13 +471,14 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
                 self._ani.save_provisioning(buf)
                 prov_data = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        return util.files.save_and_return_json(
-            {
-                "type": "aniLocal",
-                "prov_data": prov_data,
-            },
-            dst,
-        )
+        state: LocalAnisetteMapping = {
+            "type": "aniLocal",
+            "prov_data": prov_data,
+        }
+        if self._serial != CLIENT_SERIAL:
+            state["serial"] = self._serial
+
+        return util.files.save_and_return_json(state, dst)
 
     @classmethod
     @override
@@ -441,14 +496,18 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
         prov_data = val["prov_data"]
         state_blob = None if prov_data is None else BytesIO(base64.b64decode(prov_data))
 
-        return cls(state_blob=state_blob, libs_path=libs_path)
+        return cls(
+            state_blob=state_blob,
+            libs_path=libs_path,
+            serial=val.get("serial", CLIENT_SERIAL),
+        )
 
     @override
     async def get_headers(
         self,
         user_id: str,
         device_id: str,
-        serial: str = CLIENT_SERIAL,
+        serial: str | None = None,
         with_client_info: bool = False,
     ) -> dict[str, str]:
         """See :meth:`BaseAnisetteProvider.get_headers`."""

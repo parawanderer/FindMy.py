@@ -118,3 +118,67 @@ def test_an_older_saved_provider_still_loads_and_verifies() -> None:
     restored = RemoteAnisetteProvider.from_json({"type": "aniRemote", "url": "https://a/"})
 
     assert restored._http._ssl is apple_trust_context()  # noqa: SLF001
+
+
+def test_a_provider_presents_the_serial_it_was_given() -> None:
+    """Test that a serial set once reaches the header that carries it."""
+    import asyncio  # noqa: PLC0415
+
+    from findmy.reports.anisette import BaseAnisetteProvider  # noqa: PLC0415
+
+    class Provider(BaseAnisetteProvider):
+        """The base header assembly, with nothing fetched from anywhere."""
+
+        @property
+        def otp(self) -> str:
+            return "otp"
+
+        @property
+        def machine(self) -> str:
+            return "machine"
+
+        async def close(self) -> None:
+            return
+
+        def to_json(self, dst=None):  # noqa: ANN001, ANN202, ARG002
+            return {}
+
+        @classmethod
+        def from_json(cls, val):  # noqa: ANN001, ANN206, ARG003
+            raise NotImplementedError
+
+    provider = Provider(serial="0PENTAGVIEWR")
+    headers = asyncio.run(provider.get_headers("user", "device"))
+
+    assert provider.serial == "0PENTAGVIEWR"
+    assert headers["X-Apple-I-SRL-NO"] == "0PENTAGVIEWR"
+    # A per-call override still works, and is the exception rather than the way in.
+    assert asyncio.run(provider.get_headers("u", "d", "0OVERRIDE001"))[
+        "X-Apple-I-SRL-NO"
+    ] == "0OVERRIDE001"
+
+
+def test_a_chosen_serial_survives_being_saved_and_reloaded() -> None:
+    """Test that a serial is serialized, so a restored account keeps its identity."""
+    provider = RemoteAnisetteProvider("https://ani.example/", serial="0PENTAGVIEWR")
+
+    state = provider.to_json()
+    assert state.get("serial") == "0PENTAGVIEWR"
+
+    # The failure this prevents: a restored account reverting to the default adds a
+    # device-list entry rather than reusing the one it had.
+    assert RemoteAnisetteProvider.from_json(state).serial == "0PENTAGVIEWR"
+
+
+def test_the_default_is_not_written_so_existing_files_are_unchanged() -> None:
+    """Test that a provider using the default serial writes no serial at all."""
+    from findmy.reports.anisette import CLIENT_SERIAL  # noqa: PLC0415
+
+    provider = RemoteAnisetteProvider("https://ani.example/")
+
+    assert provider.serial == CLIENT_SERIAL
+    assert provider.to_json() == {"type": "aniRemote", "url": "https://ani.example/"}
+    # And a file written before this existed restores to the default rather than to None.
+    assert RemoteAnisetteProvider.from_json(
+        {"type": "aniRemote", "url": "https://a/"},
+    ).serial == CLIENT_SERIAL

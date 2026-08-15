@@ -19,7 +19,6 @@ from urllib.parse import quote
 from typing_extensions import override
 
 from findmy.errors import UnauthorizedError, UnhandledProtocolError
-from findmy.reports.anisette import CLIENT_SERIAL
 from findmy.util.abc import Closable
 from findmy.util.http import HttpSession
 
@@ -276,7 +275,7 @@ class AsyncCloudKitClient(Closable):
         environment: str = "Production",
         database_scope: str = "PRIVATE",
         device_name: str = "FindMy.py",
-        device_serial: str = CLIENT_SERIAL,
+        device_serial: str | None = None,
     ) -> None:
         """
         Initialize the client.
@@ -286,8 +285,10 @@ class AsyncCloudKitClient(Closable):
         :param container: The CloudKit container id. Defaults to the Find My one.
         :param bundle: The bundle id that owns the container.
         :param device_name: Name this client reports itself by.
-        :param device_serial: Serial this client reports itself by. Defaults to matching
-            what the account already sends as its Anisette serial.
+        :param device_serial: Serial this client reports itself by. Defaults to the
+            account's, which is the answer a caller wants: a serial set here that differs
+            from the one the account authenticates with does not fail, it **registers a
+            second device**. Set it once on the Anisette provider instead.
         """
         super().__init__()
 
@@ -297,7 +298,7 @@ class AsyncCloudKitClient(Closable):
         self._environment = environment
         self._database_scope = database_scope
         self._device_name = device_name
-        self._device_serial = device_serial
+        self._device_serial = device_serial or account.serial
 
         self._identity = _ClientIdentity.parse(account.client_info)
         self._info: CloudKitContainerInfo | None = None
