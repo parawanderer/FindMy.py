@@ -25,7 +25,7 @@ from typing import (
 
 import bs4
 import srp._pysrp as srp
-from typing_extensions import ParamSpec, override
+from typing_extensions import NotRequired, ParamSpec, override
 
 from findmy import util
 from findmy.errors import (
@@ -93,6 +93,15 @@ class _AccountStateMappingAccount(TypedDict):
     username: str | None
     password: str | None
     info: _AccountInfo | None
+
+    device_name: NotRequired[str]
+    """
+    What this client registers as in the account's device list.
+
+    Written only when set, so existing files stay valid -- and keep whatever entry they
+    already have. A name that reverted on reload would describe, under a second name, a
+    device the user is already looking at.
+    """
 
 
 class _AccountStateMappingLoginState(TypedDict):
@@ -251,6 +260,43 @@ class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapp
 
         Names the model, OS release and bundle this client claims to be. Its parts must be
         internally consistent and stable across logins.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def device_name(self) -> str | None:
+        """
+        What this client registers as in the account's device list, if it has been set.
+
+        The other field a person reads in that list, beside :attr:`serial`. Without it an
+        entry is named after whatever hardware the client claims to be -- a bare `iPhone`
+        among the user's real ones, with nothing to tell it apart and a *Remove from
+        Account* button beside it.
+
+        Setting this does not register anything. :meth:`announce_device` does.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def announce_device(self) -> MaybeCoro[None]:
+        """
+        Register this client's name in the account's device list.
+
+        **This writes to the user's account**, and it is what turns an entry named after
+        claimed hardware into one the user can recognise as software they installed.
+
+        Signing in already registered a device; this names it. Doing it once is enough --
+        the registration is the client's identity for the life of the installation, and
+        creating a fresh one per operation would ask for a verification code every time.
+
+        .. note::
+            **No push token is ever sent.** A registered device that carries one is the
+            most likely way it becomes trusted for verification codes, and a library that
+            made its consumers into second factors for their users' Apple IDs would be
+            doing real harm. There is no parameter for it and no way to switch it on.
+
+        :raises InvalidStateError: If no device name was set on this account.
         """
         raise NotImplementedError
 
@@ -462,6 +508,9 @@ class AsyncAppleAccount(BaseAppleAccount):
 
     # auth endpoints
     _ENDPOINT_GSA = "https://gsa.apple.com/grandslam/GsService2"
+    # Note the host: `gsas`, not `gsa`. One letter, a different host, and no useful error
+    # if you get it wrong.
+    _ENDPOINT_POSTDATA = "https://gsas.apple.com/grandslam/GsService2/postdata"
     _ENDPOINT_LOGIN_MOBILEME = "https://setup.icloud.com/setup/iosbuddy/loginDelegates"
     _ENDPOINT_TERMS_UI = TERMS_UI_URL
 
@@ -480,11 +529,14 @@ class AsyncAppleAccount(BaseAppleAccount):
         anisette: BaseAnisetteProvider,
         *,
         state_info: AccountStateMapping | None = None,
+        device_name: str | None = None,
     ) -> None:
         """
         Initialize the apple account.
 
         :param anisette: An instance of :meth:`AsyncAnisetteProvider`.
+        :param device_name: What this client registers as in the account's device list.
+            :meth:`announce_device` is what sends it; setting this alone changes nothing.
         """
         super().__init__()
 
@@ -500,6 +552,10 @@ class AsyncAppleAccount(BaseAppleAccount):
             LoginState(state_info["login"]["state"]) if state_info else LoginState.LOGGED_OUT
         )
         self._login_state_data: dict = state_info["login"]["data"] if state_info else {}
+
+        self._device_name: str | None = device_name or (
+            state_info["account"].get("device_name") if state_info else None
+        )
 
         self._account_info: _AccountInfo | None = (
             state_info["account"]["info"] if state_info else None
@@ -602,16 +658,26 @@ class AsyncAppleAccount(BaseAppleAccount):
         """See :meth:`BaseAppleAccount.serial`."""
         return self._anisette.serial
 
+    @property
+    @override
+    def device_name(self) -> str | None:
+        """See :meth:`BaseAppleAccount.device_name`."""
+        return self._device_name
+
     @override
     def to_json(self, path: str | Path | io.TextIOBase | None = None, /) -> AccountStateMapping:
+        account: _AccountStateMappingAccount = {
+            "username": self._username,
+            "password": self._password,
+            "info": self._account_info,
+        }
+        if self._device_name is not None:
+            account["device_name"] = self._device_name
+
         res: AccountStateMapping = {
             "type": "account",
             "ids": {"uid": self._uid, "devid": self._devid},
-            "account": {
-                "username": self._username,
-                "password": self._password,
-                "info": self._account_info,
-            },
+            "account": account,
             "login": {
                 "state": self._login_state.value,
                 "data": self._login_state_data,
@@ -1249,10 +1315,15 @@ class AsyncAppleAccount(BaseAppleAccount):
         if au is None:
             logger.info("GSA authentication successful")
 
-            idms_pet = spd.get("t", {}).get("com.apple.gs.idms.pet", {}).get("token", "")
+            tokens = spd.get("t", {})
+            idms_pet = tokens.get("com.apple.gs.idms.pet", {}).get("token", "")
+            # The heartbeat token, which is what `postdata` authenticates with. Kept
+            # rather than dropped: it is issued here and nowhere else, so recovering it
+            # later means authenticating again.
+            idms_hb = tokens.get("com.apple.gs.idms.hb", {}).get("token", "")
             return self._set_login_state(
                 LoginState.AUTHENTICATED,
-                {"idms_pet": idms_pet, "adsid": spd["adsid"]},
+                {"idms_pet": idms_pet, "idms_hb": idms_hb, "adsid": spd["adsid"]},
             )
 
         msg = f"Unknown auth value: {au}"
@@ -1327,6 +1398,9 @@ class AsyncAppleAccount(BaseAppleAccount):
                 # `dsid`, some services want it, and re-authenticating to recover it is a
                 # round trip for a value already in hand.
                 "adsid": adsid,
+                # Likewise, and for the same reason: `announce_device` needs it, and it is
+                # only ever issued by the GSA exchange that has just finished.
+                "idms_hb": self._login_state_data.get("idms_hb", ""),
             },
         )
 
@@ -1393,6 +1467,91 @@ class AsyncAppleAccount(BaseAppleAccount):
             msg = f"Error response for GSA request: {resp.status_code}"
             raise UnhandledProtocolError(msg)
         return resp.plist()["Response"]
+
+    @_require_login_state(LoginState.AUTHENTICATED, LoginState.LOGGED_IN)
+    @override
+    async def announce_device(self) -> None:
+        """See :meth:`BaseAppleAccount.announce_device`."""
+        if not self._device_name:
+            msg = (
+                "This account has no device name to announce. Set one when constructing"
+                " it -- AsyncAppleAccount(anisette, device_name=...) -- since the entry"
+                " is otherwise named after whatever hardware this client claims to be."
+            )
+            raise InvalidStateError(msg)
+
+        adsid = self._login_state_data.get("adsid", "")
+        heartbeat = self._login_state_data.get("idms_hb", "")
+        if not adsid or not heartbeat:
+            msg = (
+                "The heartbeat token this call authenticates with is missing, so the"
+                " account was restored from a file written before it was kept. Logging in"
+                " again obtains one."
+            )
+            raise InvalidStateError(msg)
+
+        headers = {
+            "Content-Type": "text/x-xml-plist",
+            "Accept": "*/*",
+            "User-Agent": "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0",
+            "X-MMe-Client-Info": self._anisette.client,
+            "X-Apple-HB-Token": base64.b64encode(f"{adsid}:{heartbeat}".encode()).decode(),
+            "X-Apple-I-UrlSwitch-Info": base64.b64encode(f"{adsid}:postdata".encode()).decode(),
+            "X-Apple-I-Service-Type": "itunesstore",
+            "X-Apple-I-CDP-Status": "true",
+            "X-Apple-I-OT-Status": "true",
+            "X-Apple-I-CK-Presence": "true",
+            "X-Apple-AK-DataRecoveryService-Status": "1",
+            "X-Apple-I-Device-Configuration-Mode": "0",
+            "X-Apple-I-DeviceUserMode": "0",
+            "X-Apple-Requested-Partition": "0",
+            "X-Apple-I-TimeZone-Offset": "0",
+            "x-apple-i-device-type": "1",
+        }
+        headers.update(await self.get_anisette_headers())
+
+        body = {
+            "Header": {"Version": "1.0.1"},
+            "Request": {
+                "dn": self._device_name,
+                "event": "liveness",
+                "loc": "en_US",
+                # Empty: this client provides none.
+                "services": [],
+                "cfuids": [],
+                "cdpStatus": True,
+                "circleStatus": True,
+                "otStatus": True,
+                "icscStatus": True,
+                "prkgen": True,
+                "denyICloudWebAccess": True,
+                "icloudMailEnabled": False,
+                "stingrayDisabledIndicator": False,
+                "rep": 1,
+                "ut": 1,
+                "signinPartition": 1,
+                "isLegacyContactAssignee": 1,
+                "isRecoveryContactAssignee": 1,
+                "reason": 5,
+                "usrt": 4,
+                "pkc": "1",
+                # There is deliberately no `ptkn` here, and no way to add one. A push
+                # token is the most likely reason a registered device becomes trusted for
+                # verification codes, and this client must never become a second factor
+                # for somebody's Apple ID. Absent, not empty.
+            },
+        }
+
+        logger.info("Announcing this device to the account as %r", self._device_name)
+
+        resp = await self._http.post(
+            self._ENDPOINT_POSTDATA,
+            headers=headers,
+            data=plistlib.dumps(body),
+        )
+        if not resp.ok:
+            msg = f"Announcing the device failed with HTTP {resp.status_code}"
+            raise UnhandledProtocolError(msg)
 
     @override
     async def get_anisette_headers(
@@ -1492,6 +1651,17 @@ class AppleAccount(BaseAppleAccount):
     def serial(self) -> str:
         """See :meth:`AsyncAppleAccount.serial`."""
         return self._asyncacc.serial
+
+    @property
+    @override
+    def device_name(self) -> str | None:
+        """See :meth:`AsyncAppleAccount.device_name`."""
+        return self._asyncacc.device_name
+
+    @override
+    def announce_device(self) -> None:
+        """See :meth:`AsyncAppleAccount.announce_device`."""
+        return self._evt_loop.run_until_complete(self._asyncacc.announce_device())
 
     @override
     def to_json(self, dst: str | Path | None = None, /) -> AccountStateMapping:

@@ -116,3 +116,96 @@ def test_the_client_serial_reaches_the_header_that_names_it_in_the_device_list()
     assert CLIENT_SERIAL == "0FINDMYPY001"
     # Deliberately not mistakable for hardware.
     assert not CLIENT_SERIAL.isalnum() or CLIENT_SERIAL.startswith("0FINDMYPY")
+
+
+def _a_provider():
+    """A provider that answers headers without reaching anything."""
+    from findmy.reports.anisette import BaseAnisetteProvider  # noqa: PLC0415
+
+    class Provider(BaseAnisetteProvider):
+        @property
+        def otp(self) -> str:
+            return "otp"
+
+        @property
+        def machine(self) -> str:
+            return "machine"
+
+        async def close(self) -> None:
+            return
+
+        def to_json(self, dst=None):  # noqa: ANN001, ANN202, ARG002
+            return {"type": "aniRemote", "url": "https://a/"}
+
+        @classmethod
+        def from_json(cls, val):  # noqa: ANN001, ANN206, ARG003
+            raise NotImplementedError
+
+    return Provider()
+
+
+def test_the_announce_never_carries_a_push_token() -> None:
+    """Test that no push token can reach the device announce, by any route."""
+    # The absence is the feature. A registered device carrying one is the most likely way
+    # it becomes trusted for verification codes, and a library whose consumers became
+    # second factors for their users' Apple IDs would be doing real harm. So this checks
+    # the shape of the call rather than one code path: no parameter, and no mention.
+    import inspect  # noqa: PLC0415
+
+    from findmy.reports.account import AsyncAppleAccount  # noqa: PLC0415
+
+    source = inspect.getsource(AsyncAppleAccount.announce_device)
+
+    assert "ptkn" not in source.replace("`ptkn`", "")
+    assert inspect.signature(AsyncAppleAccount.announce_device).parameters.keys() == {"self"}
+
+
+def test_announcing_without_a_name_says_which_one_is_missing() -> None:
+    """Test that an account with no device name refuses rather than sending a blank."""
+    import asyncio  # noqa: PLC0415
+
+    from findmy.errors import InvalidStateError  # noqa: PLC0415
+    from findmy.reports.account import AsyncAppleAccount, LoginState  # noqa: PLC0415
+
+    account = AsyncAppleAccount(_a_provider())
+    account._login_state = LoginState.LOGGED_IN  # noqa: SLF001
+    account._login_state_data = {"adsid": "a", "idms_hb": "h"}  # noqa: SLF001
+
+    with pytest.raises(InvalidStateError, match="no device name"):
+        asyncio.run(account.announce_device())
+
+
+def test_a_restored_account_without_a_heartbeat_token_says_so() -> None:
+    """Test that a file written before the token was kept explains itself."""
+    import asyncio  # noqa: PLC0415
+
+    from findmy.errors import InvalidStateError  # noqa: PLC0415
+    from findmy.reports.account import AsyncAppleAccount, LoginState  # noqa: PLC0415
+
+    account = AsyncAppleAccount(_a_provider(), device_name="OpenTagViewer App")
+    account._login_state = LoginState.LOGGED_IN  # noqa: SLF001
+    account._login_state_data = {"adsid": "a"}  # noqa: SLF001
+
+    with pytest.raises(InvalidStateError, match="heartbeat token"):
+        asyncio.run(account.announce_device())
+
+
+def test_the_device_name_survives_being_saved_and_reloaded() -> None:
+    """Test that the name is part of the account's persisted identity."""
+    from findmy.reports.account import AsyncAppleAccount  # noqa: PLC0415
+
+    account = AsyncAppleAccount(_a_provider(), device_name="OpenTagViewer App")
+    state = account.to_json()
+
+    assert state["account"]["device_name"] == "OpenTagViewer App"
+    assert AsyncAppleAccount(_a_provider(), state_info=state).device_name == "OpenTagViewer App"
+
+
+def test_an_account_without_a_name_writes_none() -> None:
+    """Test that existing files are unchanged by this addition."""
+    from findmy.reports.account import AsyncAppleAccount  # noqa: PLC0415
+
+    account = AsyncAppleAccount(_a_provider())
+
+    assert account.device_name is None
+    assert "device_name" not in account.to_json()["account"]
