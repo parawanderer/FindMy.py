@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import inspect
+import sys
 from dataclasses import replace
 
 import pytest
 
+from findmy import util
 from findmy.cloudkit.client import _ClientIdentity
 from findmy.reports.account import (
     _ACCOUNTSD_BUNDLE,
@@ -228,6 +231,39 @@ def test_half_an_identity_is_refused_rather_than_completed_at_random() -> None:
 
     with pytest.raises(ValueError, match="both or neither"):
         AsyncAppleAccount(a_provider(), devid=A_DEVID)
+
+
+def test_a_refused_account_does_not_throw_again_when_it_is_collected() -> None:
+    """Test that the refusal is the only thing the caller has to deal with."""
+    # `Closable.__del__` runs on an object whose `__init__` raised, and reaching for
+    # attributes that were never set turns one clear `ValueError` into that plus an
+    # ignored `AttributeError` from the collector, pointing at the wrong place entirely.
+    unraisable: list[object] = []
+    previous = sys.unraisablehook
+    sys.unraisablehook = unraisable.append
+
+    try:
+        for account_type in (AsyncAppleAccount, AppleAccount):
+            with pytest.raises(ValueError, match="both or neither"):
+                account_type(a_provider(), uid=A_UID)
+            gc.collect()
+    finally:
+        sys.unraisablehook = previous
+
+    assert unraisable == []
+
+
+def test_a_closable_that_never_finished_initializing_collects_quietly() -> None:
+    """Test the same guarantee at its source, for every subclass rather than one."""
+    # The half-built object every `Closable` subclass can produce: `__init__` raised
+    # before `super().__init__()`, so `_loop` does not exist.
+    class NeverBuilt(util.abc.Closable):
+        async def close(self) -> None:
+            raise AssertionError
+
+    half_built = NeverBuilt.__new__(NeverBuilt)
+
+    half_built.__del__()  # must not raise, and must not call close()
 
 
 def test_a_restored_account_keeps_the_ids_it_was_established_with() -> None:

@@ -35,6 +35,15 @@ class Closable(ABC):
 
     def __del__(self) -> None:
         """Attempt to automatically clean up when garbage collected."""
+        # Python calls this on an object whose `__init__` **raised**, so the attributes it
+        # sets may not exist and neither may anything `close` reaches for. Nothing was
+        # constructed, so there is nothing to close -- and going ahead anyway replaces a
+        # caller's real exception with an ignored `AttributeError` from the collector,
+        # which is noise pointing at the wrong place. Note `_loop` may legitimately be
+        # None on a fully built object, so this asks whether it was ever set.
+        if not hasattr(self, "_loop"):
+            return
+
         try:
             loop = self._loop or asyncio.get_running_loop()
             if loop.is_running():

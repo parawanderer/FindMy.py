@@ -650,8 +650,10 @@ class AsyncAppleAccount(BaseAppleAccount):
             worse than neither: it is a shape no real client produces.
         :raises ValueError: If exactly one of `uid` and `devid` is given.
         """
-        super().__init__()
-
+        # Before `super().__init__()`, so a refused account is one that never began
+        # rather than one that half exists: `Closable.__del__` runs on an object whose
+        # `__init__` raised, and an object with nothing to close should have nothing to
+        # collect either.
         if (uid is None) != (devid is None):
             msg = (
                 "uid and devid are one identity: pass both or neither. "
@@ -659,6 +661,8 @@ class AsyncAppleAccount(BaseAppleAccount):
                 "sharing a serial, which is worse than being one unfamiliar device."
             )
             raise ValueError(msg)
+
+        super().__init__()
 
         self._anisette: BaseAnisetteProvider = anisette
         # `state_info` wins over both, always. A restored account keeps the identity it was
