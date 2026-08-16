@@ -305,10 +305,26 @@ class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapp
         """
         The identifier this installation presents itself to Apple as.
 
-        Generated once and persisted with the rest of the account state. It must not be
-        regenerated: a session is bound to the machine identity that established it, and
-        an identity that changes per login makes every login look like a new machine --
-        which is the pattern two-factor authentication exists to detect.
+        Sent as `X-Mme-Device-Id`. Generated once and persisted with the rest of the
+        account state, or supplied at construction by a client that already introduced
+        itself to Apple. It must not be regenerated: a session is bound to the machine
+        identity that established it, and an identity that changes per login makes every
+        login look like a new machine -- which is the pattern two-factor authentication
+        exists to detect, and which fills a user's device list with entries they are
+        invited to remove.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def local_user_uuid(self) -> str:
+        """
+        The local user identifier, sent base64-encoded as `X-Apple-I-MD-LU`.
+
+        The other half of what :attr:`device_uuid` names, and it travels with it: a client
+        that supplies one supplies both. Readable so that a caller made responsible for
+        these can assert what actually goes out, rather than trusting that what it passed
+        is what is being sent.
         """
         raise NotImplementedError
 
@@ -608,6 +624,8 @@ class AsyncAppleAccount(BaseAppleAccount):
         *,
         state_info: AccountStateMapping | None = None,
         device_name: str | None = None,
+        uid: str | None = None,
+        devid: str | None = None,
     ) -> None:
         """
         Initialize the apple account.
@@ -615,12 +633,41 @@ class AsyncAppleAccount(BaseAppleAccount):
         :param anisette: An instance of :meth:`AsyncAnisetteProvider`.
         :param device_name: What this client registers as in the account's device list.
             :meth:`announce_device` is what sends it; setting this alone changes nothing.
+        :param uid: The local user identifier. Defaults to a fresh random one. See
+            :attr:`local_user_uuid`.
+
+            **It is base64-encoded on the way out**, so `X-Apple-I-MD-LU` carries
+            `base64(uid)` rather than `uid`. Pass the decoded value. A client aligning
+            with an exchange it already made should check which of the two that exchange
+            sent -- both conventions exist, and the `anisette` package sends the value
+            raw.
+        :param devid: The device identifier, sent as `X-Mme-Device-Id`, **uppercased**.
+            Defaults to a fresh random one. See :attr:`device_uuid`.
+
+            **Pass both or neither.** A client that introduced itself to Apple before this
+            account existed -- one that provisioned its own Anisette, say -- has to give
+            both to be the same installation it already was. One matching and one not is
+            worse than neither: it is a shape no real client produces.
+        :raises ValueError: If exactly one of `uid` and `devid` is given.
         """
         super().__init__()
 
+        if (uid is None) != (devid is None):
+            msg = (
+                "uid and devid are one identity: pass both or neither. "
+                "A client that matches one of them and mints the other is two devices "
+                "sharing a serial, which is worse than being one unfamiliar device."
+            )
+            raise ValueError(msg)
+
         self._anisette: BaseAnisetteProvider = anisette
-        self._uid: str = state_info["ids"]["uid"] if state_info else str(uuid.uuid4())
-        self._devid: str = state_info["ids"]["devid"] if state_info else str(uuid.uuid4())
+        # `state_info` wins over both, always. A restored account keeps the identity it was
+        # established under -- Apple binds a session to it, and swapping it because a
+        # caller passed something is how a working login turns into a second device.
+        self._uid: str = state_info["ids"]["uid"] if state_info else (uid or str(uuid.uuid4()))
+        self._devid: str = (
+            state_info["ids"]["devid"] if state_info else (devid or str(uuid.uuid4()))
+        )
 
         # TODO: combine, user/pass should be "all or nothing"  # noqa: TD002, TD003
         self._username: str | None = state_info["account"]["username"] if state_info else None
@@ -723,6 +770,12 @@ class AsyncAppleAccount(BaseAppleAccount):
     def device_uuid(self) -> str:
         """See :meth:`BaseAppleAccount.device_uuid`."""
         return self._devid
+
+    @property
+    @override
+    def local_user_uuid(self) -> str:
+        """See :meth:`BaseAppleAccount.local_user_uuid`."""
+        return self._uid
 
     @property
     @override
@@ -1682,9 +1735,21 @@ class AppleAccount(BaseAppleAccount):
         anisette: BaseAnisetteProvider,
         *,
         state_info: AccountStateMapping | None = None,
+        device_name: str | None = None,
+        uid: str | None = None,
+        devid: str | None = None,
     ) -> None:
         """See :meth:`AsyncAppleAccount.__init__`."""
-        self._asyncacc = AsyncAppleAccount(anisette=anisette, state_info=state_info)
+        # Every keyword the async account takes, passed straight through. A wrapper that
+        # accepts fewer is a wrapper whose users reach past it into `_asyncacc`, which is
+        # how identity fields end up being set by a workaround that breaks on a rename.
+        self._asyncacc = AsyncAppleAccount(
+            anisette=anisette,
+            state_info=state_info,
+            device_name=device_name,
+            uid=uid,
+            devid=devid,
+        )
 
         try:
             self._evt_loop = asyncio.get_running_loop()
@@ -1746,6 +1811,12 @@ class AppleAccount(BaseAppleAccount):
     def device_uuid(self) -> str:
         """See :meth:`AsyncAppleAccount.device_uuid`."""
         return self._asyncacc.device_uuid
+
+    @property
+    @override
+    def local_user_uuid(self) -> str:
+        """See :meth:`AsyncAppleAccount.local_user_uuid`."""
+        return self._asyncacc.local_user_uuid
 
     @property
     @override

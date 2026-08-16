@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 from dataclasses import replace
+
+import pytest
 
 from findmy.cloudkit.client import _ClientIdentity
 from findmy.reports.account import (
     _ACCOUNTSD_BUNDLE,
     _GSA_USER_AGENT,
     _ICLOUD_HELPER,
+    AppleAccount,
     AsyncAppleAccount,
 )
 from findmy.reports.anisette import (
@@ -33,6 +37,11 @@ OTHER = DeviceIdentity(
     cfnetwork="1404.0.5",
     darwin="22.2.0",
 )
+
+# Lower case on purpose: the header is uppercased on the way out, and a client aligning
+# with an exchange it already made needs that to be visible rather than surprising.
+A_UID = "8f0b3d64-1f7e-4a0b-9c2a-0b6f4d3e1a55"
+A_DEVID = "2c1f9b7e-5a34-4d18-8f6c-9e0d7a2b4c31"
 
 
 def a_provider(
@@ -185,6 +194,69 @@ def test_changing_one_field_keeps_the_rest() -> None:
 
     assert identity.platform == "<MacBookAir10,1> <Mac OS X;13.4.1;22F8>"
     assert identity.cfnetwork == CLIENT_IDENTITY.cfnetwork
+
+
+def test_supplied_ids_are_the_ones_that_go_out() -> None:
+    """Test that a client that already introduced itself stays that installation."""
+    account = AsyncAppleAccount(a_provider(), uid=A_UID, devid=A_DEVID)
+
+    assert account.local_user_uuid == A_UID
+    assert account.device_uuid == A_DEVID
+
+    headers = asyncio.run(account.get_anisette_headers())
+    # Uppercased, and base64 for the local user. Both are the library's doing, and a
+    # client aligning with an exchange it already made has to know which it sent.
+    assert headers["X-Mme-Device-Id"] == A_DEVID.upper()
+    assert headers["X-Apple-I-MD-LU"] == base64.b64encode(A_UID.encode()).decode()
+
+
+def test_saying_nothing_still_mints_a_fresh_pair() -> None:
+    """Test that the default did not change for anyone not asking."""
+    first = AsyncAppleAccount(a_provider())
+    second = AsyncAppleAccount(a_provider())
+
+    assert first.device_uuid != second.device_uuid
+    assert first.local_user_uuid != second.local_user_uuid
+
+
+def test_half_an_identity_is_refused_rather_than_completed_at_random() -> None:
+    """Test that one id without the other does not silently mint the other."""
+    # One field matching what was provisioned and one not reads as deliberate rather than
+    # accidental, and is a shape no real client produces. Refusing is the cheap half.
+    with pytest.raises(ValueError, match="both or neither"):
+        AsyncAppleAccount(a_provider(), uid=A_UID)
+
+    with pytest.raises(ValueError, match="both or neither"):
+        AsyncAppleAccount(a_provider(), devid=A_DEVID)
+
+
+def test_a_restored_account_keeps_the_ids_it_was_established_with() -> None:
+    """Test that state wins over anything a caller passes."""
+    # The session is bound to these. Letting an argument override what was restored is
+    # how a working login becomes a second device in somebody's list.
+    established = AsyncAppleAccount(a_provider(), uid=A_UID, devid=A_DEVID)
+    state = established.to_json()
+
+    restored = AsyncAppleAccount(
+        a_provider(),
+        state_info=state,
+        uid="00000000-0000-0000-0000-000000000000",
+        devid="11111111-1111-1111-1111-111111111111",
+    )
+
+    assert restored.local_user_uuid == A_UID
+    assert restored.device_uuid == A_DEVID
+
+
+def test_the_sync_account_passes_every_keyword_through() -> None:
+    """Test that the wrapper does not force a caller to reach past it."""
+    # A wrapper that accepts fewer keywords than what it wraps is a wrapper whose users
+    # write to `_asyncacc` directly, which is the workaround this replaces.
+    account = AppleAccount(a_provider(), uid=A_UID, devid=A_DEVID, device_name="Something")
+
+    assert account.local_user_uuid == A_UID
+    assert account.device_uuid == A_DEVID
+    assert account.device_name == "Something"
 
 
 def test_the_identity_and_the_serial_are_set_in_the_same_place() -> None:
