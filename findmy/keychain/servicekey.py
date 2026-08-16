@@ -285,16 +285,22 @@ def service_keys_from_der(payload: bytes) -> ServiceKeys:
 
     :raises ServiceKeyError: If the payload is neither form, or carries no usable key.
     """
+    # The descent is inside the guard, not just the first parse. An item whose outer TLV is
+    # well formed and whose *content* is not DER -- which is what an ordinary non-key item
+    # in this view looks like -- raises `DerError` several frames down, from
+    # `element.children()`. Guarding only `parse_one` let that escape as a `DerError`,
+    # which callers skipping unreadable items do not catch: one bad item in sixty-one
+    # killed an entire export, while the two before it were skipped correctly.
     try:
         element, _ = der.parse_one(payload)
+
+        if element.tag_class == der.CLASS_APPLICATION and element.tag_number == PRIVATE_KEY_V2_TAG:
+            return _from_v2(element)
+
+        return _from_v1(element)
     except der.DerError as e:
         msg = f"An item's v_Data is not DER at all: {e}"
         raise ServiceKeyError(msg) from None
-
-    if element.tag_class == der.CLASS_APPLICATION and element.tag_number == PRIVATE_KEY_V2_TAG:
-        return _from_v2(element)
-
-    return _from_v1(element)
 
 
 DER_SEQUENCE = 0x10

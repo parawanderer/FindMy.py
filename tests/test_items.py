@@ -628,6 +628,32 @@ def test_something_that_is_not_der_says_that_rather_than_guessing() -> None:
         service_keys_from_der(b"\xff\xff\xff\xff")
 
 
+def test_an_honest_wrapper_around_nonsense_is_still_reported_as_not_der() -> None:
+    # The outer TLV parses -- SEQUENCE, length 3, three bytes follow -- and its *content*
+    # is not DER, which is what an ordinary non-key item in this view looks like. The
+    # descent raises several frames down, and while that escaped as a raw `DerError` it
+    # was not caught by the callers whose job is to skip unreadable items: one such item
+    # in sixty-one aborted a real user's entire export, where the two before it were
+    # skipped correctly.
+    with pytest.raises(ServiceKeyError, match="not DER"):
+        service_keys_from_der(bytes([0x30, 0x03, 0x02, 0x7F, 0x41]))
+
+
+def test_an_unreadable_item_costs_that_item_and_not_the_run() -> None:
+    # The guarantee the exception type was in the way of. Asserted against the caller's
+    # own except clause, because reaching that loop otherwise needs a recovered peer and
+    # a live view -- and `DerError` stays in it even now the reader answers in its own
+    # vocabulary, since the two disagreeing again should cost an item, not an export.
+    import inspect  # noqa: PLC0415
+
+    from findmy.keychain.session import AsyncKeychainSession  # noqa: PLC0415
+
+    source = inspect.getsource(AsyncKeychainSession._pcs_keys_in)  # noqa: SLF001
+
+    assert "except (ItemError, ServiceKeyError, der.DerError)" in source
+    assert "continue" in source
+
+
 def test_a_p384_key_is_recognised_rather_than_rejected() -> None:
     # PCS is P-256 throughout, but reading the curve from the length rather than assuming
     # it means another curve is recognised instead of reported as malformed.

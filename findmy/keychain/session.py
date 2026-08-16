@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 from google.protobuf.message import DecodeError
 from typing_extensions import Self, override
 
+from findmy.cloudkit import der
 from findmy.cloudkit.client import AsyncCloudKitClient
 from findmy.cloudkit.constants import CUTTLEFISH_SERVICE
 from findmy.cloudkit.pcs import public_key_forms
@@ -601,7 +602,13 @@ class AsyncKeychainSession(Closable):
         for account, item in readable_items(contents, keyring).items():
             try:
                 found = service_keys_from_der(payload_of(item))
-            except (ItemError, ServiceKeyError) as e:
+            except (ItemError, ServiceKeyError, der.DerError) as e:
+                # `DerError` as well, deliberately, even though the reader now answers in
+                # its own vocabulary. Skipping an item it cannot read is this loop's whole
+                # job, and the cost of the two disagreeing about the type is not a worse
+                # message: it is a user's entire export dying on one unreadable item out
+                # of sixty-one. `pcs.py`'s key walk catches the same pair, for the same
+                # reason and after the same lesson.
                 logger.debug("Item for acct %s holds no key: %s", account[:8].hex(), e)
                 continue
 
