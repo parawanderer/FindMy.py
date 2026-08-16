@@ -21,6 +21,24 @@ from findmy import util
 
 logger = logging.getLogger(__name__)
 
+# The identity this client presents as. **These describe one real release and move
+# together**: the OS version, the build, the CFNetwork version and the Darwin version are
+# not independent, and Apple's own clients never contradict themselves. macOS 13.4.1 is
+# build 22F8, CFNetwork 1408.0.4, Darwin 22.5.0.
+#
+# They are parts rather than finished strings because the same identity has to appear in
+# more than one composite -- and a request whose client info claims one release while its
+# user agent claims another is a contradiction no real client produces.
+#
+# **Changing any of them changes the identity**, which invalidates existing sessions and
+# adds a device-list entry rather than renaming one. See :data:`CLIENT_SERIAL`.
+CLIENT_MODEL = "MacBookPro18,3"
+CLIENT_OS = "Mac OS X"
+CLIENT_OS_VERSION = "13.4.1"
+CLIENT_OS_BUILD = "22F8"
+CLIENT_CFNETWORK = "1408.0.4"
+CLIENT_DARWIN = "22.5.0"
+
 CLIENT_SERIAL = "0FINDMYPY001"
 """
 The serial this client presents as, in `X-Apple-I-SRL-NO`.
@@ -182,10 +200,37 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
             APP_BUNDLE_ID: The bundle ID of the app (e.g. com.apple.dt.Xcode)
             APP_VERSION: The version of the app (e.g. 3594.4.19)
         """
-        return (
-            "<MacBookPro18,3> <Mac OS X;13.4.1;22F8> "
-            "<com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>"
-        )
+        return f"{self._platform} <com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>"
+
+    @property
+    def _platform(self) -> str:
+        """The model and OS half that every composite string starts with."""
+        return f"<{CLIENT_MODEL}> <{CLIENT_OS};{CLIENT_OS_VERSION};{CLIENT_OS_BUILD}>"
+
+    @property
+    def client_akd(self) -> str:
+        """
+        The same identity, speaking as **akd** rather than as Xcode.
+
+        The trailing bundle says which Apple daemon is speaking, and Grand Slam endpoints
+        that authenticate with a heartbeat token expect `akd` -- so telling one of them
+        that Xcode is speaking, while the `User-Agent` beside it says akd, is a request
+        that contradicts itself.
+
+        Same platform as :attr:`client`, by construction rather than by transcription.
+        """
+        return f"{self._platform} <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+
+    @property
+    def akd_user_agent(self) -> str:
+        """
+        The user agent that goes with :attr:`client_akd`.
+
+        Built from the same identity, because the CFNetwork and Darwin versions have to
+        describe the release the client info claims. A fixed string here is how a request
+        ends up announcing macOS 10.14 and macOS 13.4.1 at once.
+        """
+        return f"akd/1.0 CFNetwork/{CLIENT_CFNETWORK} Darwin/{CLIENT_DARWIN}"
 
     async def get_headers(
         self,

@@ -1493,8 +1493,13 @@ class AsyncAppleAccount(BaseAppleAccount):
         headers = {
             "Content-Type": "text/x-xml-plist",
             "Accept": "*/*",
-            "User-Agent": "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0",
-            "X-MMe-Client-Info": self._anisette.client,
+            # The akd variant of both, and they have to agree: this endpoint is told
+            # which daemon is speaking by the client info's trailing bundle, and the user
+            # agent has to describe the same release the client info claims. Sending the
+            # Xcode variant beside an akd user agent -- or a Darwin 18 agent beside a
+            # macOS 13 client info -- is a request that contradicts itself.
+            "User-Agent": self._anisette.akd_user_agent,
+            "X-MMe-Client-Info": self._anisette.client_akd,
             "X-Apple-HB-Token": base64.b64encode(f"{adsid}:{heartbeat}".encode()).decode(),
             "X-Apple-I-UrlSwitch-Info": base64.b64encode(f"{adsid}:postdata".encode()).decode(),
             "X-Apple-I-Service-Type": "itunesstore",

@@ -209,3 +209,48 @@ def test_an_account_without_a_name_writes_none() -> None:
 
     assert account.device_name is None
     assert "device_name" not in account.to_json()["account"]
+
+
+def test_the_three_identity_strings_describe_one_release() -> None:
+    """Test that the client info and its user agent cannot contradict each other."""
+    # Stage 1 §2.2: the OS version, build, CFNetwork version and Darwin version describe
+    # one real release, and Apple's own clients never disagree with themselves. Composed
+    # from shared parts rather than transcribed, so this asserts the composition.
+    from findmy.reports.anisette import (  # noqa: PLC0415
+        CLIENT_CFNETWORK,
+        CLIENT_DARWIN,
+        CLIENT_MODEL,
+        CLIENT_OS_BUILD,
+        CLIENT_OS_VERSION,
+    )
+
+    provider = _a_provider()
+    platform = f"<{CLIENT_MODEL}> <Mac OS X;{CLIENT_OS_VERSION};{CLIENT_OS_BUILD}>"
+
+    assert provider.client.startswith(platform)
+    assert provider.client_akd.startswith(platform)
+    assert provider.akd_user_agent == f"akd/1.0 CFNetwork/{CLIENT_CFNETWORK} Darwin/{CLIENT_DARWIN}"
+
+
+def test_the_akd_variant_says_akd_is_speaking() -> None:
+    """Test that the akd client info names the right daemon."""
+    # The trailing bundle is what tells a Grand Slam endpoint which daemon is speaking.
+    provider = _a_provider()
+
+    assert provider.client_akd.endswith("<com.apple.AuthKit/1 (com.apple.akd/1.0)>")
+    assert "Xcode" not in provider.client_akd
+    # And the existing identity is untouched: changing it invalidates every session.
+    assert provider.client.endswith("<com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>")
+
+
+def test_the_announce_sends_the_akd_pair_and_not_the_xcode_one() -> None:
+    """Test that the announce's two identity headers are the akd variants."""
+    import inspect  # noqa: PLC0415
+
+    from findmy.reports.account import AsyncAppleAccount  # noqa: PLC0415
+
+    source = inspect.getsource(AsyncAppleAccount.announce_device)
+
+    assert "self._anisette.client_akd" in source
+    assert "self._anisette.akd_user_agent" in source
+    assert '"X-MMe-Client-Info": self._anisette.client,' not in source
