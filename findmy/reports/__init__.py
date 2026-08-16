@@ -4,6 +4,8 @@ from .account import AccountStateMapping, AppleAccount, AsyncAppleAccount, BaseA
 from .anisette import (
     AnisetteMapping,
     BaseAnisetteProvider,
+    DeviceIdentity,
+    DeviceIdentityMapping,
     LocalAnisetteMapping,
     LocalAnisetteProvider,
     RemoteAnisetteMapping,
@@ -37,6 +39,8 @@ __all__ = (
     "BaseAnisetteProvider",
     "BaseAppleAccount",
     "BaseSecondFactorMethod",
+    "DeviceIdentity",
+    "DeviceIdentityMapping",
     "LocalAnisetteMapping",
     "LocalAnisetteProvider",
     "LocationReport",

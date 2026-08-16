@@ -9,6 +9,7 @@ import locale
 import logging
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -38,6 +39,159 @@ CLIENT_OS_VERSION = "13.4.1"
 CLIENT_OS_BUILD = "22F8"
 CLIENT_CFNETWORK = "1408.0.4"
 CLIENT_DARWIN = "22.5.0"
+
+_XCODE_BUNDLE = "com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)"
+_AKD_BUNDLE = "com.apple.AuthKit/1 (com.apple.akd/1.0)"
+
+
+class DeviceIdentityMapping(TypedDict):
+    """JSON mapping representing a :class:`DeviceIdentity`."""
+
+    model: str
+    os_name: str
+    os_version: str
+    os_build: str
+    cfnetwork: str
+    darwin: str
+
+
+@dataclass(frozen=True)
+class DeviceIdentity:
+    """
+    The device a client claims to be, in every header that names one.
+
+    Requests carry this identity in more than one composite string -- the client info a
+    request is made under, and the user agent beside it -- and **Apple's own clients never
+    contradict themselves** about which machine they are. So it is one value, held in
+    parts, and every string that needs a part composes it from here rather than
+    transcribing one.
+
+    A client that produces its own Anisette has an identity already -- a native ADI
+    implementation initialises with a client-info string of its own -- and this is how the
+    two halves are made to agree. Pass it to a provider:
+
+    >>> RemoteAnisetteProvider(url, identity=DeviceIdentity(
+    ...     model="MacBookPro13,2",
+    ...     os_name="macOS",
+    ...     os_version="13.1",
+    ...     os_build="22C65",
+    ...     cfnetwork="1404.0.5",
+    ...     darwin="22.2.0",
+    ... ))
+
+    Every field is required, deliberately. **The six describe one real release**: macOS
+    13.4.1 is build 22F8, CFNetwork 1408.0.4, Darwin 22.5.0, and a partial identity --
+    a new model and OS beside the old CFNetwork -- is the contradiction this class exists
+    to prevent. Nothing here validates that they correspond, because nothing here knows
+    Apple's release table; stating all six is what makes the omission visible instead.
+
+    To change some of it, say so:
+
+    >>> replace(CLIENT_IDENTITY, model="MacBookAir10,1")
+
+    .. warning::
+        **Changing the identity changes the login identity.** Apple binds a session to
+        it, so an account stored under a different one may need signing in again, and the
+        old device-list entry stays until it is removed by hand -- a changed identity adds
+        an entry rather than editing one. It is not a per-request detail; set it once,
+        before first login, and leave it.
+    """
+
+    model: str
+    """The hardware model, e.g. `MacBookPro18,3`. First group of the client info."""
+
+    os_name: str
+    """The OS name, e.g. `Mac OS X` or `iPhone OS`. Apple spells these exactly."""
+
+    os_version: str
+    """The OS release, e.g. `13.4.1`."""
+
+    os_build: str
+    """The build of that release, e.g. `22F8`."""
+
+    cfnetwork: str
+    """The CFNetwork version of that release. Appears only in user agents."""
+
+    darwin: str
+    """The Darwin (kernel) version of that release. Appears only in user agents."""
+
+    @property
+    def platform(self) -> str:
+        """
+        The `<model> <os;version;build>` prefix every client-info string starts with.
+
+        What is left when the bundle -- the part saying which Apple daemon is speaking --
+        is stripped off. Clients that address a service as some other daemon keep this and
+        replace the bundle.
+        """
+        return f"<{self.model}> <{self.os_name};{self.os_version};{self.os_build}>"
+
+    def client_info(self, bundle: str) -> str:
+        """
+        Build a client-info string for a request made as `bundle`.
+
+        :param bundle: The trailing group, without its angle brackets, naming the
+            framework and daemon speaking -- e.g. `com.apple.AuthKit/1 (com.apple.akd/1.0)`.
+        """
+        return f"{self.platform} <{bundle}>"
+
+    def user_agent(self, product: str) -> str:
+        """
+        Build a user agent for a request made as `product`.
+
+        :param product: The leading token, e.g. `akd/1.0` or `com.apple.iCloudHelper/282`.
+            The CFNetwork and Darwin versions after it describe the release
+            :attr:`platform` claims, which is the whole reason they are not written out at
+            each call site.
+        """
+        return f"{product} CFNetwork/{self.cfnetwork} Darwin/{self.darwin}"
+
+    def to_json(self) -> DeviceIdentityMapping:
+        """Serialize to a JSON mapping."""
+        return {
+            "model": self.model,
+            "os_name": self.os_name,
+            "os_version": self.os_version,
+            "os_build": self.os_build,
+            "cfnetwork": self.cfnetwork,
+            "darwin": self.darwin,
+        }
+
+    @classmethod
+    def from_json(cls, val: DeviceIdentityMapping) -> DeviceIdentity:
+        """
+        Deserialize from a JSON mapping.
+
+        Missing fields fall back to the library's own identity, so a mapping written by an
+        older version stays readable -- but a stored identity is an identity a session is
+        bound to, and :meth:`to_json` writes all six.
+        """
+        return cls(
+            model=val.get("model", CLIENT_MODEL),
+            os_name=val.get("os_name", CLIENT_OS),
+            os_version=val.get("os_version", CLIENT_OS_VERSION),
+            os_build=val.get("os_build", CLIENT_OS_BUILD),
+            cfnetwork=val.get("cfnetwork", CLIENT_CFNETWORK),
+            darwin=val.get("darwin", CLIENT_DARWIN),
+        )
+
+
+CLIENT_IDENTITY = DeviceIdentity(
+    model=CLIENT_MODEL,
+    os_name=CLIENT_OS,
+    os_version=CLIENT_OS_VERSION,
+    os_build=CLIENT_OS_BUILD,
+    cfnetwork=CLIENT_CFNETWORK,
+    darwin=CLIENT_DARWIN,
+)
+"""
+The identity this client presents as when a caller does not supply one.
+
+**It does not move.** Every session already established is bound to it, so changing this
+default would silently change the identity of every account that did not ask for one --
+which costs a sign-in and leaves an unrecognisable entry in a device list. A client that
+wants a different identity passes one; see :class:`DeviceIdentity`.
+"""
 
 CLIENT_SERIAL = "0FINDMYPY001"
 """
@@ -74,6 +228,15 @@ class RemoteAnisetteMapping(TypedDict, total=False):
     would add a device-list entry rather than reusing the one it had.
     """
 
+    identity: DeviceIdentityMapping
+    """
+    The device this provider claims to be, when it is not the library's own.
+
+    Written only when it differs, for the same reason as the serial -- and with more at
+    stake, since it is the larger half of what Apple binds a session to. A restored
+    account that quietly reverted to the default would be a different machine.
+    """
+
     allow_unverified_https: bool
     """
     Only written when it is true, so existing files stay valid and unchanged.
@@ -92,6 +255,9 @@ class LocalAnisetteMapping(TypedDict):
 
     serial: NotRequired[str]
     """The serial this provider presents as, written only when it is not the default."""
+
+    identity: NotRequired[DeviceIdentityMapping]
+    """The device this provider claims to be, written only when it is not the default."""
 
 
 AnisetteMapping = RemoteAnisetteMapping | LocalAnisetteMapping
@@ -118,10 +284,18 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
     Generously derived from https://github.com/nythepegasus/grandslam/blob/main/src/grandslam/gsa.py#L41.
     """
 
-    def __init__(self, *, serial: str = CLIENT_SERIAL) -> None:
+    def __init__(
+        self,
+        *,
+        serial: str = CLIENT_SERIAL,
+        identity: DeviceIdentity = CLIENT_IDENTITY,
+    ) -> None:
         """
         Initialize the provider.
 
+        :param identity: What device this client claims to be; see :class:`DeviceIdentity`.
+            The same argument as the serial, one field over -- and the same consequence for
+            changing it once an account exists.
         :param serial: What this client presents as its device serial. Set it once, here:
             it is part of an identity rather than a per-request detail, and a path that
             sends a different one **registers a second device** rather than failing.
@@ -129,6 +303,17 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         super().__init__()
 
         self._serial = serial
+        self._identity = identity
+
+    @property
+    def identity(self) -> DeviceIdentity:
+        """
+        The device this provider claims to be, in every header that names one.
+
+        Read by everything that sends a client info or a user agent -- here and on the
+        account -- so that no two of them can describe different machines.
+        """
+        return self._identity
 
     @property
     def serial(self) -> str:
@@ -200,12 +385,7 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
             APP_BUNDLE_ID: The bundle ID of the app (e.g. com.apple.dt.Xcode)
             APP_VERSION: The version of the app (e.g. 3594.4.19)
         """
-        return f"{self._platform} <com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>"
-
-    @property
-    def _platform(self) -> str:
-        """The model and OS half that every composite string starts with."""
-        return f"<{CLIENT_MODEL}> <{CLIENT_OS};{CLIENT_OS_VERSION};{CLIENT_OS_BUILD}>"
+        return self._identity.client_info(_XCODE_BUNDLE)
 
     @property
     def client_akd(self) -> str:
@@ -219,7 +399,7 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
 
         Same platform as :attr:`client`, by construction rather than by transcription.
         """
-        return f"{self._platform} <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        return self._identity.client_info(_AKD_BUNDLE)
 
     @property
     def akd_user_agent(self) -> str:
@@ -230,7 +410,7 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         describe the release the client info claims. A fixed string here is how a request
         ends up announcing macOS 10.14 and macOS 13.4.1 at once.
         """
-        return f"akd/1.0 CFNetwork/{CLIENT_CFNETWORK} Darwin/{CLIENT_DARWIN}"
+        return self._identity.user_agent("akd/1.0")
 
     async def get_headers(
         self,
@@ -308,6 +488,7 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
         server_url: str,
         *,
         serial: str = CLIENT_SERIAL,
+        identity: DeviceIdentity = CLIENT_IDENTITY,
         allow_unverified_https: bool = False,
     ) -> None:
         """
@@ -316,6 +497,8 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
         :param server_url: Where to fetch Anisette headers from.
         :param serial: What this client presents as its device serial; see
             :attr:`BaseAnisetteProvider.serial`.
+        :param identity: What device this client claims to be; see
+            :class:`DeviceIdentity`.
         :param allow_unverified_https: Skip certificate verification for **this server
             only**. Off by default, and the only switch of its kind in the library.
 
@@ -328,7 +511,7 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
             Turning it on means anything on the network path to that server can read and
             alter the Anisette data your logins are built from.
         """
-        super().__init__(serial=serial)
+        super().__init__(serial=serial, identity=identity)
 
         self._server_url = server_url
         self._allow_unverified_https = allow_unverified_https
@@ -348,6 +531,8 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
         }
         if self._serial != CLIENT_SERIAL:
             state["serial"] = self._serial
+        if self._identity != CLIENT_IDENTITY:
+            state["identity"] = self._identity.to_json()
         if self._allow_unverified_https:
             state["allow_unverified_https"] = True
 
@@ -365,9 +550,12 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
 
         server_url = val["url"]
 
+        identity = val.get("identity")
+
         return cls(
             server_url,
             serial=val.get("serial", CLIENT_SERIAL),
+            identity=DeviceIdentity.from_json(identity) if identity else CLIENT_IDENTITY,
             allow_unverified_https=val.get("allow_unverified_https", False),
         )
 
@@ -434,14 +622,17 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
         state_blob: BytesIO | None = None,
         libs_path: str | Path | None = None,
         serial: str = CLIENT_SERIAL,
+        identity: DeviceIdentity = CLIENT_IDENTITY,
     ) -> None:
         """
         Initialize the provider.
 
         :param serial: What this client presents as its device serial; see
             :attr:`BaseAnisetteProvider.serial`.
+        :param identity: What device this client claims to be; see
+            :class:`DeviceIdentity`.
         """
-        super().__init__(serial=serial)
+        super().__init__(serial=serial, identity=identity)
 
         if isinstance(libs_path, str):
             libs_path = Path(libs_path)
@@ -522,6 +713,8 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
         }
         if self._serial != CLIENT_SERIAL:
             state["serial"] = self._serial
+        if self._identity != CLIENT_IDENTITY:
+            state["identity"] = self._identity.to_json()
 
         return util.files.save_and_return_json(state, dst)
 
@@ -541,10 +734,13 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
         prov_data = val["prov_data"]
         state_blob = None if prov_data is None else BytesIO(base64.b64decode(prov_data))
 
+        identity = val.get("identity")
+
         return cls(
             state_blob=state_blob,
             libs_path=libs_path,
             serial=val.get("serial", CLIENT_SERIAL),
+            identity=DeviceIdentity.from_json(identity) if identity else CLIENT_IDENTITY,
         )
 
     @override

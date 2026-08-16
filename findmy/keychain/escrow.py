@@ -104,7 +104,10 @@ fails internally rather than saying what is missing.
 _CONTENT_TYPE = "application/x-apple-plst"
 """Note: not the text/x-xml-plist that Grand Slam uses."""
 
-_USER_AGENT = "com.apple.sbd/638.100.48 CFNetwork/1408.0.4 Darwin/22.5.0"
+# Which daemon the escrow proxy is addressed as: secure backup, in both spellings it
+# needs. The device these describe is not written here -- it comes from the account's
+# identity, so a client that claims to be something else claims it here too.
+_SBD_PRODUCT = "com.apple.sbd/638.100.48"
 _CLIENT_INFO_BUNDLE = "com.apple.AuthKit/1 (com.apple.sbd/638.100.48)"
 
 
@@ -597,14 +600,12 @@ class AsyncEscrowProxy(Closable):
         await self._http.close()
 
     async def _headers(self) -> dict[str, str]:
-        client_info = self._account.client_info
-        groups = [part.split(">", 1)[0] for part in client_info.split("<") if ">" in part]
-        prefix = "".join(f"<{part}> " for part in groups[:2])
+        identity = self._account.identity
 
         headers = {
             "Content-Type": _CONTENT_TYPE,
-            "User-Agent": _USER_AGENT,
-            "X-Mme-Client-Info": f"{prefix}<{_CLIENT_INFO_BUNDLE}>",
+            "User-Agent": identity.user_agent(_SBD_PRODUCT),
+            "X-Mme-Client-Info": identity.client_info(_CLIENT_INFO_BUNDLE),
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "X-Apple-I-Locale": "en_US",

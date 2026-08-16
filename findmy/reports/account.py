@@ -69,12 +69,31 @@ if TYPE_CHECKING:
     from findmy.keys import HasHashedPublicKey
     from findmy.util.types import MaybeCoro
 
-    from .anisette import BaseAnisetteProvider
+    from .anisette import BaseAnisetteProvider, DeviceIdentity
 
 logger = logging.getLogger(__name__)
 
 srp.rfc5054_enable()
 srp.no_username_in_x()
+
+# Which Apple daemon a request claims to be, in the trailing group of a client info and
+# the leading token of a user agent. Only the bundle differs between them -- the device
+# is one device, and comes from :attr:`BaseAppleAccount.identity`.
+_ACCOUNTSD_BUNDLE = "com.apple.AOSKit/282 (com.apple.accountsd/113)"
+_ICLOUD_HELPER = "com.apple.iCloudHelper/282"
+
+_GSA_USER_AGENT = "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"
+"""
+The user agent Grand Slam authentication is performed under.
+
+**Deliberately not composed from the identity**, and the one string here that does not
+follow it. It describes macOS 10.14 while the client info beside it describes whatever the
+identity claims, which is a contradiction -- and it is left alone because it is on the
+authentication path. Every session this library has established was established under it;
+a change here cannot be tested without a live account, and being wrong means nobody can
+log in. It is named here rather than inlined so that it is one decision, visible, rather
+than a constant somebody tidies away by accident.
+"""
 
 
 class _AccountInfo(TypedDict):
@@ -301,6 +320,24 @@ class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapp
 
         Names the model, OS release and bundle this client claims to be. Its parts must be
         internally consistent and stable across logins.
+
+        This is one composite of the identity; :attr:`identity` is the identity itself,
+        and is what a caller reads to build another.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def identity(self) -> DeviceIdentity:
+        """
+        The device this account claims to be, in every header that names one.
+
+        Set on the Anisette provider, which is where it is stored and serialized, and read
+        from there by everything that sends a client info or a user agent -- so one value
+        describes one machine no matter which request carries it.
+
+        A path that composes its own does not fail. It contradicts the others, which is
+        what a real client never does.
         """
         raise NotImplementedError
 
@@ -692,6 +729,12 @@ class AsyncAppleAccount(BaseAppleAccount):
     def client_info(self) -> str:
         """See :meth:`BaseAppleAccount.client_info`."""
         return self._anisette.client
+
+    @property
+    @override
+    def identity(self) -> DeviceIdentity:
+        """See :meth:`BaseAppleAccount.identity`."""
+        return self._anisette.identity
 
     @property
     @override
@@ -1385,9 +1428,11 @@ class AsyncAppleAccount(BaseAppleAccount):
 
         headers = {
             "X-Apple-ADSID": self._login_state_data["adsid"],
-            "User-Agent": "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0",
-            "X-Mme-Client-Info": "<MacBookPro18,3> <Mac OS X;13.4.1;22F8>"
-            " <com.apple.AOSKit/282 (com.apple.accountsd/113)>",
+            # Composed rather than written out: a second copy of the identity here is a
+            # second device the moment either copy moves. Speaking as accountsd, which is
+            # the daemon that logs into the mobileme delegate.
+            "User-Agent": self.identity.user_agent(_ICLOUD_HELPER),
+            "X-Mme-Client-Info": self.identity.client_info(_ACCOUNTSD_BUNDLE),
         }
         headers.update(await self.get_anisette_headers())
 
@@ -1495,7 +1540,16 @@ class AsyncAppleAccount(BaseAppleAccount):
         headers = {
             "Content-Type": "text/x-xml-plist",
             "Accept": "*/*",
-            "User-Agent": "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0",
+            # The one user agent in the library that is **not** composed from the
+            # identity, and the only place two headers of one request disagree: this
+            # claims Darwin 18.7.0, which is macOS 10.14, beside a client info claiming
+            # 13.4.1. It is transcribed from an observed akd build and has authenticated
+            # every session this library has ever established, which is exactly why it is
+            # still here -- changing the working authentication path to tidy it is an
+            # experiment that can only be run against a live account, and a failed one
+            # locks people out. A caller that sets its own identity should know this
+            # header does not follow it. See `_GSA_USER_AGENT`.
+            "User-Agent": _GSA_USER_AGENT,
             "X-MMe-Client-Info": self._anisette.client,
         }
 
@@ -1698,6 +1752,12 @@ class AppleAccount(BaseAppleAccount):
     def client_info(self) -> str:
         """See :meth:`AsyncAppleAccount.client_info`."""
         return self._asyncacc.client_info
+
+    @property
+    @override
+    def identity(self) -> DeviceIdentity:
+        """See :meth:`AsyncAppleAccount.identity`."""
+        return self._asyncacc.identity
 
     @property
     @override

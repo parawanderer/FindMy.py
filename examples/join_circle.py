@@ -46,7 +46,7 @@ from _login import get_account_async  # pyright: ignore [reportMissingImports]
 from findmy.errors import UnhandledProtocolError
 from findmy.keychain import AsyncKeychainSession, DeviceDescription, RecoveryOptions
 from findmy.keychain.peers import check_peer_identifiers
-from findmy.reports.anisette import CLIENT_SERIAL
+from findmy.reports.anisette import CLIENT_IDENTITY, CLIENT_SERIAL
 
 ANISETTE_SERVER = None
 ANISETTE_LIBS_PATH = "ani_libs.bin"
@@ -68,7 +68,9 @@ ACCOUNT_STORE = "account.json"
 # listing will not tell those apart.
 DEVICE = DeviceDescription(
     name="FindMy.py",
-    model="MacBookPro18,3",
+    # The model the login claims, read rather than repeated: a record whose metadata named
+    # a different Mac from the one that wrote it is a record nobody can match to a device.
+    model=CLIENT_IDENTITY.model,
     # The same serial the login presents, so the escrow listing and the account's device
     # list name this client identically rather than as two synthetic devices.
     serial=CLIENT_SERIAL,
@@ -78,7 +80,7 @@ DEVICE = DeviceDescription(
     model_class="Mac",
     platform="macOS",
 )
-OS_VERSION = "13.4.1"
+OS_VERSION = CLIENT_IDENTITY.os_version
 
 
 def confirm(prompt: str, expected: str) -> bool:

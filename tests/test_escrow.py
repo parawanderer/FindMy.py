@@ -19,10 +19,7 @@ from findmy.keychain.escrow import (
     join_recovery_options,
     parse_keyvault_message,
 )
-
-FINDMY_CLIENT_INFO = (
-    "<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>"
-)
+from findmy.reports.anisette import CLIENT_IDENTITY, DeviceIdentity
 
 
 class FakeResponse:
@@ -59,16 +56,20 @@ class FakeHttp:
 
 
 class FakeAccount:
-    def __init__(self) -> None:
-        self.client_info = FINDMY_CLIENT_INFO
+    def __init__(self, identity: DeviceIdentity = CLIENT_IDENTITY) -> None:
+        self.client_info = identity.client_info("com.apple.AOSKit/282 (com.apple.dt.Xcode/1)")
+        self.identity = identity
         self.account_name = "someone@example.com"
 
     async def get_anisette_headers(self) -> dict[str, str]:
         return {"X-Apple-I-MD": "otp"}
 
 
-def make_proxy(responses: list[FakeResponse]) -> AsyncEscrowProxy:
-    proxy = AsyncEscrowProxy(FakeAccount(), escrow_host("24"), "the-pet")  # pyright: ignore [reportArgumentType]
+def make_proxy(
+    responses: list[FakeResponse],
+    identity: DeviceIdentity = CLIENT_IDENTITY,
+) -> AsyncEscrowProxy:
+    proxy = AsyncEscrowProxy(FakeAccount(identity), escrow_host("24"), "the-pet")  # pyright: ignore [reportArgumentType]
     proxy._http = FakeHttp(responses)  # noqa: SLF001
     return proxy
 
@@ -158,6 +159,42 @@ async def test_the_content_type_is_the_unusual_apple_one() -> None:
     headers = proxy._http.calls[0]["headers"]  # noqa: SLF001
     assert headers["Content-Type"] == "application/x-apple-plst"
     assert "sbd" in headers["X-Mme-Client-Info"]
+
+
+@pytest.mark.asyncio
+async def test_the_proxy_claims_the_device_the_account_claims() -> None:
+    # The escrow proxy is addressed as secure backup, on the device the account logged in
+    # as. Composing a device here instead would put a second one in the same session.
+    identity = DeviceIdentity(
+        model="MacBookPro13,2",
+        os_name="macOS",
+        os_version="13.1",
+        os_build="22C65",
+        cfnetwork="1404.0.5",
+        darwin="22.2.0",
+    )
+    proxy = make_proxy([listing_response([])], identity)
+    await proxy.list_records()
+
+    headers = proxy._http.calls[0]["headers"]  # noqa: SLF001
+    assert headers["X-Mme-Client-Info"] == (
+        "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.sbd/638.100.48)>"
+    )
+    assert headers["User-Agent"] == "com.apple.sbd/638.100.48 CFNetwork/1404.0.5 Darwin/22.2.0"
+
+
+@pytest.mark.asyncio
+async def test_the_default_identity_sends_the_headers_it_always_sent() -> None:
+    # Transcribed from the constants this replaced: an escrow record is written under
+    # this identity, and a record listing shows what wrote it.
+    proxy = make_proxy([listing_response([])])
+    await proxy.list_records()
+
+    headers = proxy._http.calls[0]["headers"]  # noqa: SLF001
+    assert headers["X-Mme-Client-Info"] == (
+        "<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AuthKit/1 (com.apple.sbd/638.100.48)>"
+    )
+    assert headers["User-Agent"] == "com.apple.sbd/638.100.48 CFNetwork/1408.0.4 Darwin/22.5.0"
 
 
 def test_an_empty_pet_is_refused_up_front() -> None:
