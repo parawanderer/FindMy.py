@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, TypedDict, cast
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import aiohttp
 from aiohttp import BasicAuth, ClientSession, ClientTimeout
@@ -14,6 +15,9 @@ from typing_extensions import Unpack, override
 from .abc import Closable
 from .parsers import decode_plist
 from .tls import tls_setting
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +40,16 @@ class _HttpRequestOptions(_RequestOptions, total=False):
 class HttpResponse:
     """Response of a request made by :meth:`HttpSession`."""
 
-    def __init__(self, status_code: int, content: bytes) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        content: bytes,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         """Initialize the response."""
         self._status_code = status_code
         self._content = content
+        self._headers: Mapping[str, str] = headers or {}
 
     @property
     def status_code(self) -> int:
@@ -55,6 +65,17 @@ class HttpResponse:
     def content(self) -> bytes:
         """Raw response body, for responses that are not text."""
         return self._content
+
+    @property
+    def headers(self) -> Mapping[str, str]:
+        """
+        The response's headers.
+
+        Kept because a rejection often explains itself here rather than in the body --
+        Apple's authentication endpoints in particular -- and an error message assembled
+        without them can only report the status code.
+        """
+        return self._headers
 
     def text(self) -> str:
         """Response content as a UTF-8 encoded string."""
@@ -155,7 +176,7 @@ class HttpSession(Closable):
                     raise_for_status=auto_retry,
                     **options,
                 ) as r:
-                    return HttpResponse(r.status, await r.content.read())
+                    return HttpResponse(r.status, await r.content.read(), dict(r.headers))
             except aiohttp.ClientError as e:  # noqa: PERF203
                 if not auto_retry or retry_count > 3:
                     raise e from None

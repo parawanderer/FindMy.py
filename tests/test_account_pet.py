@@ -254,3 +254,65 @@ def test_the_announce_sends_the_akd_pair_and_not_the_xcode_one() -> None:
     assert "self._anisette.client_akd" in source
     assert "self._anisette.akd_user_agent" in source
     assert '"X-MMe-Client-Info": self._anisette.client,' not in source
+
+
+class _Refusal:
+    """A rejected response, standing in for whatever Grand Slam sends back."""
+
+    def __init__(self, status: int, content: bytes, headers: dict | None = None) -> None:
+        self.status_code = status
+        self._content = content
+        self.headers = headers or {}
+
+    @property
+    def ok(self) -> bool:
+        return False
+
+    @property
+    def content(self) -> bytes:
+        return self._content
+
+    def text(self) -> str:
+        return self._content.decode("utf-8", errors="replace")
+
+    def plist(self) -> dict:
+        import plistlib  # noqa: PLC0415
+
+        return plistlib.loads(self._content)
+
+
+def test_a_refused_announce_reports_the_status_grand_slam_gave() -> None:
+    """Test that the nested error code and message reach the exception."""
+    import plistlib  # noqa: PLC0415
+
+    from findmy.reports.account import _describe_announce_failure  # noqa: PLC0415
+
+    body = plistlib.dumps({"Response": {"Status": {"ec": -20101, "em": "Bad token"}}})
+    described = _describe_announce_failure(_Refusal(401, body))
+
+    assert "HTTP 401" in described
+    assert "-20101" in described
+    assert "Bad token" in described
+
+
+def test_a_refusal_that_is_not_a_plist_still_reports_what_arrived() -> None:
+    """Test that an HTML error page is not swallowed."""
+    from findmy.reports.account import _describe_announce_failure  # noqa: PLC0415
+
+    described = _describe_announce_failure(_Refusal(401, b"<html>go away</html>"))
+
+    assert "go away" in described
+
+
+def test_a_refusal_with_an_empty_body_reports_its_headers() -> None:
+    """Test that a bodiless 401 still says whatever the headers said."""
+    # This is the case the change exists for: a status code alone reports that something
+    # was refused and nothing about why, which costs a whole run to find out.
+    from findmy.reports.account import _describe_announce_failure  # noqa: PLC0415
+
+    described = _describe_announce_failure(
+        _Refusal(401, b"", {"WWW-Authenticate": 'X-Apple-HB realm="gsa"'}),
+    )
+
+    assert "empty body" in described
+    assert "X-Apple-HB" in described

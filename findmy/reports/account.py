@@ -161,6 +161,47 @@ def _extract_phone_numbers(html: str) -> list[dict]:
     return data.get("direct", {}).get("phoneNumberVerification", {}).get("trustedPhoneNumbers", [])
 
 
+# Headers a Grand Slam rejection tends to explain itself in. A 401 here carries no body
+# worth the name on some paths, and the reason is in a header instead -- so an error
+# assembled from the status code alone reports that something was refused and nothing
+# about why, which costs a whole run to find out.
+_EXPLANATORY_HEADERS = ("www-authenticate", "x-apple-i-request-error", "x-apple-i-error")
+
+
+def _describe_announce_failure(resp: util.http.HttpResponse) -> str:
+    """
+    Assemble everything the server said about a rejected announce.
+
+    Grand Slam answers with a plist even when it refuses, and the useful part is nested:
+    `Response.Status` carries an error code (`ec`) and a message (`em`). A rejection that
+    is not a plist -- an HTML error page, an empty body -- falls back to raw text, and the
+    headers are reported either way.
+    """
+    parts = [f"HTTP {resp.status_code}"]
+
+    try:
+        body: Any = resp.plist()
+    except Exception:  # noqa: BLE001 -- any failure here just means it is not a plist
+        body = None
+
+    if isinstance(body, dict):
+        status = body.get("Response", {}).get("Status", body.get("Status", body))
+        parts.append(f"body {status!r}" if status else f"body {body!r}")
+    else:
+        text = resp.text().strip() if resp.content else ""
+        parts.append(f"body {text[:500]!r}" if text else "an empty body")
+
+    explanatory = {
+        name: value
+        for name, value in resp.headers.items()
+        if name.lower() in _EXPLANATORY_HEADERS
+    }
+    if explanatory:
+        parts.append(f"headers {explanatory!r}")
+
+    return "Announcing the device was refused: " + ", ".join(parts)
+
+
 class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapping], ABC):
     """Base class for an Apple account."""
 
@@ -1555,8 +1596,15 @@ class AsyncAppleAccount(BaseAppleAccount):
             data=plistlib.dumps(body),
         )
         if not resp.ok:
-            msg = f"Announcing the device failed with HTTP {resp.status_code}"
-            raise UnhandledProtocolError(msg)
+            # The whole reply at DEBUG, because the exception truncates and this is the
+            # one shot at understanding a refusal without another round trip.
+            logger.debug(
+                "postdata refused with HTTP %d; headers %r; body %r",
+                resp.status_code,
+                dict(resp.headers),
+                resp.content[:2000],
+            )
+            raise UnhandledProtocolError(_describe_announce_failure(resp))
 
     @override
     async def get_anisette_headers(
