@@ -1,0 +1,10 @@
+keyvault framing
+  bytes  101
+  sha256 a2e97e5147dc5e6d2b93ef5b7a4649409b7931b54f4bb559a850cff277056787
+  structure:
+  total 101 (actual 101)
+  header (24) sha256 1d64add2a6388367
+  offsets [0, 14, 34, 57]
+    section 0: declares 10, occupies 14, sha256 730e938abe361240
+    section 1: declares 4, occupies 20, padded by 12, sha256 63479ad69a090b25
+    section 2: declares 19, occupies 23, sha256 7b6fec45398436d0

@@ -1,0 +1,10 @@
+location report, 88-byte form
+  bytes  88
+  sha256 8d75369459be66a336b2aaa1ce915826c2b47f13600e6076a21d922f34c8e545
+  structure:
+  timestamp    2026-01-01T12:30:45+00:00
+  confidence   2
+  ephemeral    (57) sha256 ca569dafa2166423
+  ciphertext   (10) sha256 128c93fed7f08a5d
+  tag          (16) sha256 36e703be4fb31b39
+  decrypts to  52.379189, 4.899431 +/-12m status 3

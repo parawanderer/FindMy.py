@@ -1,0 +1,7 @@
+escrow record (§4.5.3)
+  bytes  223
+  sha256 899ce388101950073a60532c7380c0df7deb11fd3ed216cd3022c44508717485
+  structure:
+  BackupVersion: str (1) '1'
+  BottledPeerEntropy: bytes (72) sha256 107de2bc788e1102
+  com.apple.securebackup.timestamp: str (19) '2026-01-01 12:30:45'

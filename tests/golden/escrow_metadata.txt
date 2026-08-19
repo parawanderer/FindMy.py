@@ -1,0 +1,22 @@
+escrow metadata (§4.5.2)
+  bytes  719
+  sha256 6ff539b20cd8ebe91443a3ab647389c25c3672913869e391ee960b8640183b1d
+  structure:
+  ClientMetadata: dict (10)
+    SecureBackupMetadataTimestamp: str (19) '2026-01-01 12:30:45'
+    SecureBackupNumericPassphraseLength: number 6
+    SecureBackupUsesComplexPassphrase: number 1
+    SecureBackupUsesNumericPassphrase: bool True
+    device_mid: str (3) 'MID'
+    device_model: str (10) 'LinuxPC1,1'
+    device_model_class: str (2) 'PC'
+    device_model_version: str (0) ''
+    device_name: str (11) 'A Linux box'
+    device_platform: str (5) 'linux'
+  SecureBackupUsesMultipleiCSCs: bool True
+  bottleID: str (36) '4A1E5B9C-0000-4000-8000-000000000000'
+  build: str (6) '24A335'
+  com.apple.securebackup.timestamp: str (19) '2026-01-01 12:30:45'
+  escrowedSPKI: bytes (65) sha256 9bda95bda1ef8f1b
+  passcodeGeneration: number 13
+  serial: str (12) 'X0X0X0X0X0X0'

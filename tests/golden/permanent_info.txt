@@ -1,0 +1,10 @@
+peer permanent info (signed bytes only; ECDSA is randomised)
+  bytes  233
+  sha256 728c1bbd30b0c2f8228d02821ec4e98fc96bd114e71ac99d189956fd2d144e98
+  structure:
+  field 1 (varint) = 1
+  field 2 (bytes) (97) sha256 8bd9c1272e4aa3f0
+  field 3 (bytes) (97) sha256 673a090a973a49dc
+  field 4 (bytes) (9) 'MACHINE-1'
+  field 5 (bytes) (14) 'MacBookPro18,3'
+  field 6 (varint) = 1767270645

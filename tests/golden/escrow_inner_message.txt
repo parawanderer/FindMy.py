@@ -1,0 +1,13 @@
+escrow inner message (§4.5.1)
+  bytes  724
+  sha256 ad4382b397b44cb501fc0cfb95b3a09f2324f71462da6389ca4a4d4ac08ea5d6
+  structure:
+  total 724 (actual 724)
+  header (16) sha256 89f2190136dcdf88
+  offsets [0, 16, 84, 344, 572, 652, 676]
+    section 0: declares 10, occupies 16, padded by 2, sha256 c775e7b757ede630
+    section 1: declares 64, occupies 68, sha256 b1bcccf15ed0a0bd
+    section 2: declares 256, occupies 260, sha256 aab291fa4641602d
+    section 3: declares 224, occupies 228, sha256 ad94432b780bc27c
+    section 4: declares 73, occupies 80, padded by 3, sha256 0236bf42f9303b61
+    section 5: declares 19, occupies 24, padded by 1, sha256 3914e95c2b80a8fe
