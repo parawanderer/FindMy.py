@@ -21,6 +21,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TIMEOUT = 5
+"""
+Seconds any one request may take, start to finish.
+
+Ample for Apple's own hosts on an ordinary connection, and **not always ample for the
+login**: a self-hosted Anisette server, a slow link or a machine generating Anisette
+locally can all take longer than this, and the failure is a bare timeout partway through a
+sign-in rather than anything naming a cause. Callers that need longer say so; see
+:class:`~findmy.reports.account.AsyncAppleAccount`.
+"""
+
 
 class _RequestOptions(TypedDict, total=False):
     json: dict[str, Any] | None
@@ -98,10 +109,11 @@ class HttpResponse:
 class HttpSession(Closable):
     """Asynchronous HTTP session manager. For internal use only."""
 
-    def __init__(self, *, verify_tls: bool = True) -> None:
+    def __init__(self, *, verify_tls: bool = True, timeout: float = DEFAULT_TIMEOUT) -> None:
         """
         Initialize the session.
 
+        :param timeout: Seconds any one request may take; see :data:`DEFAULT_TIMEOUT`.
         :param verify_tls: Whether to verify server certificates. **Leave this alone.**
             Every Apple host this library talks to verifies against
             :func:`~findmy.util.tls.apple_trust_context`, and turning this off makes each
@@ -115,6 +127,12 @@ class HttpSession(Closable):
         self._session: ClientSession | None = None
         self._closed: bool = False
         self._ssl = tls_setting(verify=verify_tls)
+        self._timeout = timeout
+
+    @property
+    def timeout(self) -> float:
+        """Seconds any one request through this session may take."""
+        return self._timeout
 
     async def _get_session(self) -> ClientSession:
         if self._closed:
@@ -125,7 +143,7 @@ class HttpSession(Closable):
             return self._session
 
         logger.debug("Creating aiohttp session")
-        self._session = ClientSession(timeout=ClientTimeout(total=5))
+        self._session = ClientSession(timeout=ClientTimeout(total=self._timeout))
         return self._session
 
     @override
@@ -177,7 +195,19 @@ class HttpSession(Closable):
                     **options,
                 ) as r:
                     return HttpResponse(r.status, await r.content.read(), dict(r.headers))
-            except aiohttp.ClientError as e:  # noqa: PERF203
+            except TimeoutError as e:  # noqa: PERF203
+                # `aiohttp` raises this rather than a `ClientError`, so it is neither
+                # retried nor described: a login that outran the clock arrives as a bare
+                # `TimeoutError` naming nothing. Say what did not answer and what the
+                # limit was, because the fix is a caller's argument and nothing else here
+                # can suggest it.
+                msg = (
+                    f"{method} {url} did not answer within {self._timeout}s. "
+                    f"If this is a slow connection or a self-hosted Anisette server, "
+                    f"the timeout is a parameter -- see AsyncAppleAccount(timeout=...)."
+                )
+                raise TimeoutError(msg) from e
+            except aiohttp.ClientError as e:
                 if not auto_retry or retry_count > 3:
                     raise e from None
 

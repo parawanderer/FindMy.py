@@ -618,7 +618,7 @@ class AsyncAppleAccount(BaseAppleAccount):
     # reports endpoints
     _ENDPOINT_REPORTS_FETCH = "https://gateway.icloud.com/findmyservice/v2/fetch"
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- all keyword-only, and each is a separate decision
         self,
         anisette: BaseAnisetteProvider,
         *,
@@ -626,11 +626,26 @@ class AsyncAppleAccount(BaseAppleAccount):
         device_name: str | None = None,
         uid: str | None = None,
         devid: str | None = None,
+        timeout: float = util.http.DEFAULT_TIMEOUT,
     ) -> None:
         """
         Initialize the apple account.
 
         :param anisette: An instance of :meth:`AsyncAnisetteProvider`.
+        :param timeout: Seconds any one request this account makes may take.
+
+            **Raise it for a slow sign-in.** Logging in is several round trips -- two SRP
+            exchanges with Grand Slam, then the mobileme delegate -- and each is measured
+            against this separately. The default suits Apple's own hosts on an ordinary
+            connection; a congested link, a machine that suspends mid-request, or a
+            self-hosted Anisette server that generates its data on demand can all exceed
+            it, and what a user sees is a sign-in that fails partway through for no
+            stated reason.
+
+            It is not persisted with the account: it describes the machine and the
+            network, not the session, and a restored account should take whatever the
+            program running it now thinks is reasonable. Note that an Anisette provider
+            keeps its own -- this one does not reach the fetch that provider makes.
         :param device_name: What this client registers as in the account's device list.
             :meth:`announce_device` is what sends it; setting this alone changes nothing.
         :param uid: The local user identifier. Defaults to a fresh random one. See
@@ -690,7 +705,7 @@ class AsyncAppleAccount(BaseAppleAccount):
             state_info["account"]["info"] if state_info else None
         )
 
-        self._http: util.http.HttpSession = util.http.HttpSession()
+        self._http: util.http.HttpSession = util.http.HttpSession(timeout=timeout)
         self._reports: LocationReportsFetcher = LocationReportsFetcher(self)
         self._closed: bool = False
 
@@ -1734,7 +1749,7 @@ class AppleAccount(BaseAppleAccount):
     Uses :meth:`AsyncappleAccount` internally.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- all keyword-only, and each is a separate decision
         self,
         anisette: BaseAnisetteProvider,
         *,
@@ -1742,6 +1757,7 @@ class AppleAccount(BaseAppleAccount):
         device_name: str | None = None,
         uid: str | None = None,
         devid: str | None = None,
+        timeout: float = util.http.DEFAULT_TIMEOUT,
     ) -> None:
         """See :meth:`AsyncAppleAccount.__init__`."""
         # Every keyword the async account takes, passed straight through. A wrapper that
@@ -1753,6 +1769,7 @@ class AppleAccount(BaseAppleAccount):
             device_name=device_name,
             uid=uid,
             devid=devid,
+            timeout=timeout,
         )
 
         try:

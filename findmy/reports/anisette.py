@@ -237,6 +237,14 @@ class RemoteAnisetteMapping(TypedDict, total=False):
     account that quietly reverted to the default would be a different machine.
     """
 
+    timeout: float
+    """
+    Seconds a fetch from this server may take, when it is not the library's default.
+
+    Written only when it differs. A provider is reconstructed from this, so a saved setup
+    that needed longer would otherwise start failing again the next time it is loaded.
+    """
+
     allow_unverified_https: bool
     """
     Only written when it is true, so existing files stay valid and unchanged.
@@ -490,11 +498,23 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
         serial: str = CLIENT_SERIAL,
         identity: DeviceIdentity = CLIENT_IDENTITY,
         allow_unverified_https: bool = False,
+        timeout: float = util.http.DEFAULT_TIMEOUT,
     ) -> None:
         """
         Initialize the provider with URL to te remote server.
 
         :param server_url: Where to fetch Anisette headers from.
+        :param timeout: Seconds the fetch from this server may take.
+
+            **Separate from the account's, and often the one that matters.** This fetch
+            happens inside a login, so a server that is slow to generate its data fails
+            the sign-in rather than itself -- and raising the account's timeout does
+            nothing for it, because the request is made here. Public servers are shared
+            and can be slow; one you host yourself may be generating on demand.
+
+            Persisted, for the reason the certificate switch is: a provider is
+            reconstructed from its saved state, and reverting to the default would turn a
+            working setup back into a failing one on the next run.
         :param serial: What this client presents as its device serial; see
             :attr:`BaseAnisetteProvider.serial`.
         :param identity: What device this client claims to be; see
@@ -515,8 +535,12 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
 
         self._server_url = server_url
         self._allow_unverified_https = allow_unverified_https
+        self._timeout = timeout
 
-        self._http = util.http.HttpSession(verify_tls=not allow_unverified_https)
+        self._http = util.http.HttpSession(
+            verify_tls=not allow_unverified_https,
+            timeout=timeout,
+        )
 
         self._anisette_data: dict[str, str] | None = None
         self._anisette_data_expires_at: float = 0
@@ -533,6 +557,8 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
             state["serial"] = self._serial
         if self._identity != CLIENT_IDENTITY:
             state["identity"] = self._identity.to_json()
+        if self._timeout != util.http.DEFAULT_TIMEOUT:
+            state["timeout"] = self._timeout
         if self._allow_unverified_https:
             state["allow_unverified_https"] = True
 
@@ -557,6 +583,7 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
             serial=val.get("serial", CLIENT_SERIAL),
             identity=DeviceIdentity.from_json(identity) if identity else CLIENT_IDENTITY,
             allow_unverified_https=val.get("allow_unverified_https", False),
+            timeout=val.get("timeout", util.http.DEFAULT_TIMEOUT),
         )
 
     @property
