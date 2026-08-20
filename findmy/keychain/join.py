@@ -19,19 +19,25 @@ sends lives. What is here can be exercised offline in full.
 
 from __future__ import annotations
 
+import base64
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, runtime_checkable
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from google.protobuf.message import DecodeError
+from typing_extensions import override
 
 from findmy.cloudkit.proto import cuttlefish_pb2 as cf
 from findmy.errors import UnhandledProtocolError
+from findmy.util.abc import Serializable
+from findmy.util.files import read_data_json, save_and_return_json
 
 if TYPE_CHECKING:
+    import io
     from collections.abc import Sequence
+    from pathlib import Path
 
     from .peers import Peer, PeerDirectory
 
@@ -513,6 +519,167 @@ class NewIdentity:
     encryption_key: ec.EllipticCurvePrivateKey
     permanent: SignedBlob
     peer_id: str
+
+
+@runtime_checkable
+class PeerIdentity(Protocol):
+    """
+    What the reading path actually needs of a peer: an identifier and two private keys.
+
+    Two things satisfy this and they arrive very differently.
+    :class:`~findmy.keychain.session.RecoveredPeer` comes from opening somebody else's
+    escrow record with their passcode; :class:`JoinedPeer` is this client's own membership,
+    kept from a join. **Everything downstream treats them alike**, because nothing
+    downstream asks where an identity came from -- a share is wrapped to a public key and
+    does not care which device holds the private half.
+
+    Stated as a protocol rather than a base class so that neither has to inherit from the
+    other. A recovered peer is not a kind of joined peer, nor the reverse.
+    """
+
+    @property
+    def peer_id(self) -> str:
+        """The identifier the circle knows this peer by."""
+        ...
+
+    def signing_key(self) -> ec.EllipticCurvePrivateKey:
+        """Return the key that signs on this peer's behalf."""
+        ...
+
+    def encryption_key(self) -> ec.EllipticCurvePrivateKey:
+        """Return the key a share addressed to this peer is wrapped to."""
+        ...
+
+
+class JoinedPeerMapping(TypedDict):
+    """JSON mapping representing a :class:`JoinedPeer`."""
+
+    type: Literal["joinedPeer"]
+    peer_id: str
+    signing_key: str
+    encryption_key: str
+
+
+@dataclass(frozen=True)
+class JoinedPeer(Serializable[JoinedPeerMapping]):
+    """
+    A membership this client already holds, in the form the reading path accepts.
+
+    **This is what makes a join worth having.** :meth:`AsyncKeychainSession.join` spends a
+    passcode once and puts a peer of this client's own in the circle; without something to
+    keep, the next run has no way back to that peer and has to recover somebody else's
+    identity with a passcode again. Keep this, hand it back, and "once" means once.
+
+    It is three values -- the identifier and the two private keys -- because that is all
+    the reading path ever asks of a peer. Everything else a recovery produces describes
+    where the identity *came from*, and nothing downstream reads it.
+
+    .. warning::
+        **These are the private keys of a member of the user's trust circle**, and
+        :meth:`to_json` writes them in the clear. Anything holding this file can read the
+        account's keychain for as long as the peer remains in the circle. It belongs in
+        whatever the surrounding application uses for secrets, not beside a config file.
+        This is the most sensitive thing this library serializes.
+
+    .. note::
+        **The bottle entropy is not part of this and is not a substitute for it.** The
+        entropy recovers this peer *through escrow*, under the passcode the record was
+        enrolled with -- the slow way back, for when these keys are lost. Keys held
+        directly are the fast way, and neither replaces the other: keep the entropy so the
+        peer can be recovered if this is destroyed, and keep this so it does not have to
+        be.
+    """
+
+    peer_id: str
+    """The identifier the circle knows this peer by, and shares are addressed to."""
+
+    signing: ec.EllipticCurvePrivateKey
+    """What signs a voucher, if this peer ever sponsors another."""
+
+    encryption: ec.EllipticCurvePrivateKey
+    """What key shares are wrapped to. The one that actually opens the keychain."""
+
+    @classmethod
+    def of(cls, identity: NewIdentity) -> JoinedPeer:
+        """Take the keeping-worthy part of a fresh identity, from :attr:`JoinOutcome.identity`."""
+        return cls(
+            peer_id=identity.peer_id,
+            signing=identity.signing_key,
+            encryption=identity.encryption_key,
+        )
+
+    def signing_key(self) -> ec.EllipticCurvePrivateKey:
+        """See :meth:`PeerIdentity.signing_key`."""
+        return self.signing
+
+    def encryption_key(self) -> ec.EllipticCurvePrivateKey:
+        """See :meth:`PeerIdentity.encryption_key`."""
+        return self.encryption
+
+    @override
+    def to_json(self, dst: str | Path | io.TextIOBase | None = None, /) -> JoinedPeerMapping:
+        """
+        Serialize, **writing the private keys in the clear**.
+
+        See :meth:`Serializable.to_json`, and this class's warning about where the result
+        belongs.
+        """
+        return save_and_return_json(
+            {
+                "type": "joinedPeer",
+                "peer_id": self.peer_id,
+                "signing_key": _private_key_b64(self.signing),
+                "encryption_key": _private_key_b64(self.encryption),
+            },
+            dst,
+        )
+
+    @classmethod
+    @override
+    def from_json(
+        cls,
+        val: str | Path | io.TextIOBase | io.BufferedIOBase | JoinedPeerMapping,
+        /,
+    ) -> JoinedPeer:
+        """See :meth:`Serializable.from_json`."""
+        val = read_data_json(val)
+
+        if val.get("type") != "joinedPeer":
+            msg = f"Not a joined peer: {val.get('type')!r}"
+            raise ValueError(msg)
+
+        try:
+            return cls(
+                peer_id=val["peer_id"],
+                signing=_private_key_from_b64(val["signing_key"]),
+                encryption=_private_key_from_b64(val["encryption_key"]),
+            )
+        except KeyError as e:
+            msg = f"Failed to restore a joined peer: {e}"
+            raise ValueError(msg) from None
+
+
+def _private_key_b64(key: ec.EllipticCurvePrivateKey) -> str:
+    """Render a private key as base64 PKCS#8 DER, unencrypted."""
+    return base64.b64encode(
+        key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ),
+    ).decode()
+
+
+def _private_key_from_b64(value: str) -> ec.EllipticCurvePrivateKey:
+    """Read a key written by :func:`_private_key_b64`, insisting it is an EC one."""
+    key = serialization.load_der_private_key(base64.b64decode(value), password=None)
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        # A peer's keys are P-384 and nothing else can stand in for them: an RSA key here
+        # would fail much later, inside an exchange, as something that reads like a
+        # protocol error.
+        msg = f"A peer's keys are elliptic-curve; this is {type(key).__name__}"
+        raise TypeError(msg)
+    return key
 
 
 def generate_identity(*, machine_id: str, model_id: str, creation_time: int) -> NewIdentity:

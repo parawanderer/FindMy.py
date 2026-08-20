@@ -37,8 +37,10 @@ from .escrow import (
     parse_keyvault_message,
 )
 from .join import (
+    JoinedPeer,
     JoinError,
     NewIdentity,
+    PeerIdentity,
     SignedBlob,
     TrustSet,
     generate_identity,
@@ -87,9 +89,11 @@ __all__ = (
     "EscrowRecord",
     "JoinError",
     "JoinOutcome",
+    "JoinedPeer",
     "KeyShare",
     "KeychainSessionError",
     "NewIdentity",
+    "PeerIdentity",
     "PinnedRoots",
     "RecoveredPeer",
     "RecoveryChallenge",

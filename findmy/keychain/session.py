@@ -83,7 +83,9 @@ from .items import (
     service_key_item,
 )
 from .join import (
+    JoinedPeer,
     NewIdentity,
+    PeerIdentity,
     TrustSet,
     generate_identity,
     make_dynamic_info,
@@ -440,7 +442,7 @@ class AsyncKeychainSession(Closable):
             raise KeychainSessionError(msg)
         return sealed
 
-    async def key_shares(self, peer: RecoveredPeer) -> list[KeyShare]:
+    async def key_shares(self, peer: PeerIdentity) -> list[KeyShare]:
         """
         Fetch and unwrap the key shares a recovered peer is entitled to.
 
@@ -451,7 +453,8 @@ class AsyncKeychainSession(Closable):
 
         Read-only, and needs no passcode beyond the one recovery already spent.
 
-        :param peer: A peer from :meth:`recover`.
+        :param peer: A peer from :meth:`recover`, or a :class:`~findmy.keychain.join.JoinedPeer`
+            kept from a previous :meth:`join`.
         """
         directory = await self.peer_directory()
         entries = await fetch_recoverable_shares(self._cuttlefish, peer.peer_id)
@@ -478,7 +481,7 @@ class AsyncKeychainSession(Closable):
 
     async def service_keys(
         self,
-        peer: RecoveredPeer,
+        peer: PeerIdentity,
         *,
         view: str = VIEW_MANATEE,
         shares: list[KeyShare] | None = None,
@@ -496,7 +499,8 @@ class AsyncKeychainSession(Closable):
 
         Read-only throughout, and needs no passcode beyond the one :meth:`recover` spent.
 
-        :param peer: A peer from :meth:`recover`.
+        :param peer: A peer from :meth:`recover`, or a :class:`~findmy.keychain.join.JoinedPeer`
+            kept from a previous :meth:`join`.
         :param view: The keychain view to read. `Manatee` holds Find My's keys.
         :param shares: Shares already fetched by :meth:`key_shares`, to avoid asking for
             them twice. They are the same for every view, so a caller reading two views
@@ -514,7 +518,7 @@ class AsyncKeychainSession(Closable):
 
     async def _view_keyring(
         self,
-        peer: RecoveredPeer,
+        peer: PeerIdentity,
         view: str,
         shares: list[KeyShare] | None,
     ) -> ViewKeyring:
@@ -539,7 +543,7 @@ class AsyncKeychainSession(Closable):
 
     async def pcs_keys(
         self,
-        peer: RecoveredPeer,
+        peer: PeerIdentity,
         *,
         views: Sequence[str] = (VIEW_MANATEE, VIEW_PROTECTED_CLOUD_STORAGE),
         shares: list[KeyShare] | None = None,
@@ -557,7 +561,8 @@ class AsyncKeychainSession(Closable):
         Reading them all costs a decryption per item and needs no further round trip: the
         zone was fetched once already.
 
-        :param peer: A peer from :meth:`recover`.
+        :param peer: A peer from :meth:`recover`, or a :class:`~findmy.keychain.join.JoinedPeer`
+            kept from a previous :meth:`join`.
         :param views: The keychain views to read. **Both by default**, because Stage 5 §2
             says both must be synced before decryption can begin -- reading only the one
             that "holds these keys" is a reading of that sentence, and the cheaper mistake
@@ -577,7 +582,7 @@ class AsyncKeychainSession(Closable):
 
     async def _pcs_keys_or_none(
         self,
-        peer: RecoveredPeer,
+        peer: PeerIdentity,
         view: str,
         shares: list[KeyShare],
     ) -> list[ec.EllipticCurvePrivateKey]:
@@ -590,7 +595,7 @@ class AsyncKeychainSession(Closable):
 
     async def _pcs_keys_in(
         self,
-        peer: RecoveredPeer,
+        peer: PeerIdentity,
         view: str,
         shares: list[KeyShare],
     ) -> list[ec.EllipticCurvePrivateKey]:
@@ -705,7 +710,7 @@ class AsyncKeychainSession(Closable):
 
     async def join(
         self,
-        peer: RecoveredPeer,
+        peer: PeerIdentity,
         *,
         passcode: str,
         device: DeviceDescription,
@@ -737,7 +742,8 @@ class AsyncKeychainSession(Closable):
         listed by :meth:`recovery_options` and removable by :meth:`delete_record`. One is
         permanent, the other is tidy-up.
 
-        :param peer: A peer from :meth:`recover`. It sponsors the new identity and its
+        :param peer: A peer from :meth:`recover`, or a :class:`~findmy.keychain.join.JoinedPeer`
+            kept from a previous :meth:`join`. It sponsors the new identity and its
             shares are what get re-addressed.
         :param passcode: The passcode **the new record** will be recoverable with. Not the
             one that recovered `peer`, unless you mean them to be the same. Used inside
@@ -944,6 +950,22 @@ class JoinOutcome:
     `CuttlefishChanges` that `fetchChanges` returns, so it goes through the path that
     already exists rather than a second reading of what a change is.
     """
+
+    @property
+    def peer(self) -> JoinedPeer:
+        """
+        The membership to keep, in the form the reading path takes.
+
+        **This is the point of having joined.** Persist it -- somewhere that holds
+        secrets, see :class:`~findmy.keychain.join.JoinedPeer` -- and every later run reads
+        the keychain as this client, with no passcode and no borrowed identity:
+
+            keys = await session.pcs_keys(JoinedPeer.from_json(stored))
+
+        Without it a join costs a passcode, leaves a permanent peer and an escrow record,
+        and buys nothing that recovery did not already give.
+        """
+        return JoinedPeer.of(self.identity)
 
     @property
     def sync_token(self) -> str | None:

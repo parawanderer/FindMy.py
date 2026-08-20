@@ -1,6 +1,6 @@
 # Tests
 
-775 tests, no account, no network, no fixtures on disk except `golden/`.
+787 tests, no account, no network, no fixtures on disk except `golden/`.
 
 ```bash
 python -m pytest tests/ -q                       # everything
@@ -52,6 +52,7 @@ UPDATE_GOLDEN=1 python -m pytest tests/test_golden.py   # rewrite the transcript
 | `test_icloud.py` | 14 | Wiring only, over sentinel fakes. Says so in its docstring. |
 | `test_location_reports.py` | 13 | The last hop: encrypted payload → latitude and longitude. Both payload shapes; signed coordinates. |
 | `test_golden.py` | 9 | Freezes the transcripts below. |
+| `test_joined_peer.py` | 12 | Resuming as a peer that already joined: what is kept, and that the reading path asks for nothing more. |
 | `test_timeouts.py` | 9 | How long a request may take, and what it says when it does not. Drives a local server that never answers. |
 
 ## `golden/`

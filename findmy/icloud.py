@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from findmy.accessory import FindMyAccessory
     from findmy.cloudkit.records import CloudKitRecord
     from findmy.keychain.escrow import EscrowRecord, RecoveryOptions
+    from findmy.keychain.join import PeerIdentity
     from findmy.reports.account import AsyncAppleAccount
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,38 @@ class AsyncFindMyClient(Closable):
         :returns: The keys, which are also kept for :meth:`accessories`.
         """
         peer = await self._session.recover(record, passcode)
+        keys = await self._session.pcs_keys(peer, views=views)
+
+        self.use_keys(keys)
+        return keys
+
+    async def resume(
+        self,
+        peer: PeerIdentity,
+        *,
+        views: Sequence[str] = (VIEW_MANATEE, VIEW_PROTECTED_CLOUD_STORAGE),
+    ) -> list[ec.EllipticCurvePrivateKey]:
+        """
+        Read the keychain as a peer this client already holds, with no passcode.
+
+        The counterpart to :meth:`unlock` for a client that has joined: hand back the
+        :class:`~findmy.keychain.join.JoinedPeer` from :attr:`JoinOutcome.peer` and the
+        keys arrive addressed to this client itself.
+
+        **Prefer this to keeping what :meth:`unlock` returned, once there is a membership
+        to resume from.** Kept keys are a snapshot; this is a subscription. The keychain's
+        keys roll -- notably when the circle's membership changes -- and a client holding
+        only old keys goes quietly stale, decrypting nothing new while looking fine. A
+        member fetches whatever the current shares hold, every time.
+
+        Read-only, and needs no passcode: a share is wrapped to the receiving peer's
+        encryption key, and this peer holds it.
+
+        :param peer: A membership kept from :meth:`AsyncKeychainSession.join`, or any
+            recovered peer.
+        :param views: Which keychain views to read.
+        :returns: The keys, which are also kept for :meth:`accessories`.
+        """
         keys = await self._session.pcs_keys(peer, views=views)
 
         self.use_keys(keys)
