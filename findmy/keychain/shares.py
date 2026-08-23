@@ -682,8 +682,10 @@ async def fetch_recoverable_shares(
     the answer is wrapped to a key escrow recovery already yielded.
 
     :param client: A CloudKit client on the keychain container.
-    :param peer_id: The recovered peer's identifier, which its escrow record's label
-        already carries.
+    :param peer_id: The recovered peer's identifier **as the trust circle knows it**.
+        Not the escrow record's label suffix, which is only sometimes the same string --
+        asking under the other one returns every view's key set and no shares at all, with
+        no error to say so. See :attr:`~findmy.keychain.session.RecoveredPeer.peer_id`.
     """
     request = cf.FetchRecoverableTlkSharesRequest(for_peer=peer_id)
 

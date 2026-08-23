@@ -868,3 +868,156 @@ async def test_joining_refuses_a_sponsor_the_circle_does_not_contain(
 
     # And nothing was enrolled or sent on the way to finding out.
     assert calls == []
+
+
+# --------------------------------------------------------------------------------------
+# Driven end to end: which id reaches the wire, and whether the share then opens (#140)
+# --------------------------------------------------------------------------------------
+
+CIRCLE_ID = "SHA256:the-hash-cuttlefish-knows="
+LABEL_ID = "CBEEDA4C-0000-4000-8000-000000000000"
+SENDER_ID = "SHA256:the-sender="
+
+
+class SharesCuttlefish:
+    """A Cuttlefish that answers one share listing and remembers what it was asked."""
+
+    def __init__(self, entry: bytes) -> None:
+        self.asked_for: list[str] = []
+        self._entry = entry
+
+    async def function_invoke(self, service: str, method: str, payload: bytes) -> bytes:  # noqa: ARG002
+        from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+
+        request = cf.FetchRecoverableTlkSharesRequest()
+        request.ParseFromString(payload)
+        self.asked_for.append(request.for_peer)
+
+        return cf.FetchRecoverableTlkSharesResponse(shares=[self._entry]).SerializeToString()
+
+    async def close(self) -> None:
+        return
+
+
+def a_share_listing(receiver: str, key, payload: bytes = b"the view key") -> bytes:  # noqa: ANN001
+    """Build the one entry a share fetch returns, really wrapped to `key`."""
+    from findmy.cloudkit.proto import cuttlefish_pb2 as cf  # noqa: PLC0415
+    from test_shares import a_record, sfies_archive  # noqa: PLC0415
+
+    record = a_record(
+        sender=SENDER_ID,
+        receiver=receiver,
+        wrappedkey=sfies_archive(key.public_key(), payload),
+        curve=1,
+        epoch=1,
+        version=1,
+    )
+    return cf.RecoverableTlkShare(
+        service="Manatee",
+        share=cf.RecordWrapper(record=record.SerializeToString()),
+    ).SerializeToString()
+
+
+def _a_share_reading_session(monkeypatch: pytest.MonkeyPatch, receiver: str):  # noqa: ANN202
+    """Build a session whose only answer is one share, addressed to `receiver`."""
+    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+
+    key = ec.generate_private_key(ec.SECP384R1())
+    cuttlefish = SharesCuttlefish(a_share_listing(receiver, key))
+    session = AsyncKeychainSession(
+        FakeAccount(),  # pyright: ignore [reportArgumentType]
+        FakeClient(),  # pyright: ignore [reportArgumentType]
+        cuttlefish,  # pyright: ignore [reportArgumentType]
+        FakeClient(),  # pyright: ignore [reportArgumentType]
+        FakeProxy([]),  # pyright: ignore [reportArgumentType]
+    )
+
+    circle = a_directory(SENDER_ID, CIRCLE_ID)
+
+    async def directory(_: object):  # noqa: ANN202
+        return circle
+
+    monkeypatch.setattr("findmy.keychain.session.fetch_peer_directory", directory)
+
+    return session, cuttlefish, key
+
+
+class OneKeyBottle:
+    """An opened bottle standing in for one whose two keys are the same key."""
+
+    def __init__(self, key) -> None:  # noqa: ANN001
+        self._key = key
+
+    def signing(self):  # noqa: ANN202
+        return self._key
+
+    def encryption(self):  # noqa: ANN202
+        return self._key
+
+
+def a_divergent_peer(key, cuttlefish_peer_id: str | None) -> RecoveredPeer:  # noqa: ANN001
+    """Build a **real** recovered peer whose escrow label and circle id differ.
+
+    Deliberately the real class rather than a stand-in with its own `peer_id`: the
+    property is half of what is under test here, and a fake reimplementing it would keep
+    passing after the property regressed.
+    """
+    return RecoveredPeer(
+        record=a_record(label=f"com.apple.icdp.record.{LABEL_ID}"),
+        fields={},
+        salt="the-adsid",
+        keys=None,  # pyright: ignore [reportArgumentType]
+        bottle=OneKeyBottle(key),  # pyright: ignore [reportArgumentType]
+        cuttlefish_peer_id=cuttlefish_peer_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_share_fetch_asks_for_the_peer_the_circle_knows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test the id that actually reaches the wire, rather than the code that builds it."""
+    # The bug in one assertion: `FetchRecoverableTlkShares` was asked for the escrow
+    # label's suffix, which on some accounts names no peer. Apple answers that with every
+    # view's key set and no shares -- no error -- so nothing downstream can tell.
+    session, cuttlefish, key = _a_share_reading_session(monkeypatch, receiver=CIRCLE_ID)
+
+    await session.key_shares(a_divergent_peer(key, CIRCLE_ID))
+
+    assert cuttlefish.asked_for == [CIRCLE_ID]
+    assert LABEL_ID not in cuttlefish.asked_for
+
+
+@pytest.mark.asyncio
+async def test_a_share_for_that_peer_opens_all_the_way_to_its_key_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test the whole hop: fetch, receiver check, unwrap, plaintext."""
+    session, _, key = _a_share_reading_session(monkeypatch, receiver=CIRCLE_ID)
+
+    shares = await session.key_shares(a_divergent_peer(key, CIRCLE_ID))
+
+    assert len(shares) == 1
+    assert shares[0].error is None
+    assert shares[0].plaintext == b"the view key"
+    assert shares[0].service == "Manatee"
+
+
+@pytest.mark.asyncio
+async def test_fixing_only_the_fetch_would_retrieve_the_share_and_reject_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test the trap the reporter names: 0/21 unwrapped, with the fetch already correct."""
+    # `key_shares` uses the same property twice -- once to ask, once as `expected_receiver`
+    # -- so correcting the fetch alone yields every share and then refuses all of them as
+    # addressed to someone else. Standing in for that here by handing the peer no circle
+    # id, which is exactly what it had before this was fixed.
+    session, cuttlefish, key = _a_share_reading_session(monkeypatch, receiver=CIRCLE_ID)
+
+    shares = await session.key_shares(a_divergent_peer(key, cuttlefish_peer_id=None))
+
+    assert cuttlefish.asked_for == [LABEL_ID]
+    assert len(shares) == 1
+    assert shares[0].plaintext is None
+    assert shares[0].error is not None
+    assert "not the recovered peer" in shares[0].error

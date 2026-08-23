@@ -1,6 +1,6 @@
 # Tests
 
-794 tests, no account, no network, no fixtures on disk except `golden/`.
+797 tests, no account, no network, no fixtures on disk except `golden/`.
 
 ```bash
 python -m pytest tests/ -q                       # everything
@@ -42,7 +42,7 @@ UPDATE_GOLDEN=1 python -m pytest tests/test_golden.py   # rewrite the transcript
 | `test_cloudkit.py` | 43 | CloudKit transport and records (Stage 4). Protobuf framing, request shapes. |
 | `test_enrolment.py` | 42 | Escrow enrolment (§4.5): pinned roots, the blob, the metadata spellings. Mints its own CA. |
 | `test_bottle.py` | 31 | A bottled peer's key derivation (§6.7 step 2). |
-| `test_session.py` | 32 | The session facade: ordering, that a join is never retried, and which of a peer's ids the circle answers to (#140). |
+| `test_session.py` | 35 | The session facade: ordering, that a join is never retried, and which of a peer's ids the circle answers to (#140). |
 | `test_recovery.py` | 24 | Escrow recovery (§6.1–§6.5). The exchange itself needs a real passcode; this is everything around it. |
 | `test_peers.py` | 24 | The trust-circle directory (§5.3): identifiers, signatures, vouchers. |
 | `test_terms.py` | 22 | The terms-of-service flow (Stage 2 §5.2). |
