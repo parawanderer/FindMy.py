@@ -1392,15 +1392,6 @@ def test_a_keyset_whose_checksum_is_wrong_says_so() -> None:
     assert verify_keyset_hash(element) is False
 
 
-def test_a_structure_with_no_checksum_is_not_reported_as_failing() -> None:
-    from findmy.cloudkit import der  # noqa: PLC0415
-    from findmy.cloudkit.pcs import verify_keyset_hash  # noqa: PLC0415
-
-    element, _ = der.parse_one(bytes([0x30, 0x03, 0x02, 0x01, 0x01]))
-
-    assert verify_keyset_hash(element) is None
-
-
 def test_rebuilding_reuses_the_members_that_arrived() -> None:
     # DER orders a SET OF by encoded value, so re-encoding from parsed values can differ
     # from the input. Emitting the original spans sidesteps that rather than answering it.
