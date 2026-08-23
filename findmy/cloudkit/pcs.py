@@ -742,9 +742,26 @@ def build_signed_data(protection: ShareProtection, signature: ObjectSignature) -
     )
 
 
-def verify_protection_signature(protection: ShareProtection, master_key: bytes) -> bool:
+SIGNATURE_ABSENT = "the structure carries no signature data at all"
+SIGNATURE_UNPARSEABLE = "its signature data would not parse"
+SIGNATURE_WRONG_SIGNER = "every signature names a signer other than this record's master EC key"
+SIGNATURE_REJECTED = (
+    "the signature parsed, named the right key, and did not verify over the signed data"
+)
+"""
+Why a protection structure's signature check came back negative.
+
+**Four causes, and they lead in four directions**, which is why the caller reports which
+one rather than one sentence covering all of them. Absent is a structure that was never
+signed. Unparseable is this module's reading of the signature *container*. Wrong-signer is
+a key question. Only the fourth is evidence about the layout of the signed data -- and that
+was the diagnosis the single message used to offer for all four.
+"""
+
+
+def describe_protection_signature(protection: ShareProtection, master_key: bytes) -> str | None:
     """
-    Verify a protection structure's own signature under the master EC key.
+    Verify a protection structure's own signature, and say what went wrong if it did.
 
     ECDSA over SHA-256, against the key derived by
     :func:`derive_master_ec_private_key` -- which is what makes that derivation's
@@ -753,17 +770,17 @@ def verify_protection_signature(protection: ShareProtection, master_key: bytes) 
     Falls back to the "past" signature if the first fails: that is key rotation, not
     corruption.
 
-    :returns: Whether either signature verified. False also when the structure carries no
-        signature data to check.
+    :returns: None when a signature verified, otherwise one of :data:`SIGNATURE_ABSENT`,
+        :data:`SIGNATURE_UNPARSEABLE`, :data:`SIGNATURE_WRONG_SIGNER` or
+        :data:`SIGNATURE_REJECTED`.
     """
     if not protection.signature_data.data:
-        return False
+        return SIGNATURE_ABSENT
 
     try:
         object_signature = ObjectSignature.from_der(protection.signature_data.data)
     except (PCSError, der.DerError):
-        logger.warning("Could not parse the protection structure's signature data")
-        return False
+        return SIGNATURE_UNPARSEABLE
 
     public_key = ec.derive_private_key(
         derive_master_ec_private_key(master_key),
@@ -776,23 +793,30 @@ def verify_protection_signature(protection: ShareProtection, master_key: bytes) 
     if object_signature.signature2 is not None:
         candidates.append(object_signature.signature2)
 
+    considered = 0
     for candidate in candidates:
         # A non-empty keyid is the signer's compressed public key. Checking it first names
         # the wrong key immediately, where a failed verification does not.
         if candidate.key_id and candidate.key_id != compress_public_key(public_key):
-            logger.warning(
-                "Signature names a signer that is not the master EC key derived from this"
-                " record's master key",
-            )
             continue
 
+        considered += 1
         try:
             public_key.verify(candidate.signature, signed, ec.ECDSA(hashes.SHA256()))
         except InvalidSignature:
             continue
-        return True
+        return None
 
-    return False
+    return SIGNATURE_REJECTED if considered else SIGNATURE_WRONG_SIGNER
+
+
+def verify_protection_signature(protection: ShareProtection, master_key: bytes) -> bool:
+    """
+    Verify a protection structure's own signature under the master EC key.
+
+    See :func:`describe_protection_signature`, which says *why* when this is False.
+    """
+    return describe_protection_signature(protection, master_key) is None
 
 
 def verify_protection_hmac(protection: ShareProtection, master_key: bytes) -> bool:
@@ -948,13 +972,19 @@ def unwrap_protection(
     # to fail: there is nothing to verify against in that case.
     signature_verified: bool | None = None
     if not share_key.read_only:
-        signature_verified = verify_protection_signature(protection, master_key)
-        if not signature_verified:
-            message = (
-                "Protection structure's signature did not verify under the master EC key."
-                " The key id matched, so this is more likely a misreading of the signed"
-                " data's layout than a wrong key."
-            )
+        reason = describe_protection_signature(protection, master_key)
+        signature_verified = reason is None
+        if reason is not None:
+            # The layout diagnosis belongs to exactly one of the four causes. Offering it
+            # for all of them -- which the single message used to do -- sends somebody
+            # reading a log for an unsigned structure looking for a parsing bug that is
+            # not there.
+            message = f"Protection structure's signature was not confirmed: {reason}."
+            if reason == SIGNATURE_REJECTED:
+                message += (
+                    " The key id matched, so this is more likely a misreading of the"
+                    " signed data's layout than a wrong key."
+                )
             if require_signature:
                 raise PCSError(message)
             logger.warning(message)

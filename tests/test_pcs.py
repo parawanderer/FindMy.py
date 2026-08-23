@@ -1513,3 +1513,53 @@ def test_a_structure_with_no_checksum_is_not_reported_as_failing() -> None:
 
     assert keyset_hash_framing(element) is None
     assert verify_keyset_hash(element) is None
+
+
+# --------------------------------------------------------------------------------------
+# Why a signature check came back negative
+# --------------------------------------------------------------------------------------
+
+A_MASTER_KEY = bytes(range(16))
+
+
+def test_a_structure_that_was_never_signed_says_so() -> None:
+    # Not "did not verify": there was nothing to verify. A reader told the signature
+    # failed goes looking for a parsing bug; a reader told the structure is unsigned
+    # knows there is nothing to look for.
+    unsigned = pcs.ShareProtection.from_der(
+        build_protection(entries=[], truncated_key_id=b"", signature_data=b""),
+    )
+
+    assert pcs.describe_protection_signature(unsigned, A_MASTER_KEY) == pcs.SIGNATURE_ABSENT
+
+
+def test_signature_data_that_will_not_parse_is_distinguished_from_one_that_fails() -> None:
+    # This module's reading of the signature *container*, which is a different question
+    # from the layout of the data it covers.
+    junk = pcs.ShareProtection.from_der(
+        build_protection(entries=[], truncated_key_id=b"", signature_data=None),
+    )
+
+    assert pcs.describe_protection_signature(junk, A_MASTER_KEY) == pcs.SIGNATURE_UNPARSEABLE
+
+
+def test_a_signature_naming_another_signer_is_not_reported_as_a_layout_problem() -> None:
+    # A key question, not a format one. Saying "misreading of the signed data's layout"
+    # here sends the next hour in exactly the wrong direction.
+    stranger = ec.generate_private_key(ec.SECP256R1())
+    protection = pcs.ShareProtection.from_der(
+        build_protection(
+            entries=[],
+            truncated_key_id=b"",
+            signature_data=object_signature_der(
+                key_id=pcs.compress_public_key(stranger.public_key()),
+            ),
+        ),
+    )
+
+    assert pcs.describe_protection_signature(protection, A_MASTER_KEY) == pcs.SIGNATURE_WRONG_SIGNER
+
+
+def test_a_good_signature_reports_nothing_at_all() -> None:
+    assert pcs.describe_protection_signature(signed_protection(A_MASTER_KEY), A_MASTER_KEY) is None
+    assert pcs.verify_protection_signature(signed_protection(A_MASTER_KEY), A_MASTER_KEY) is True

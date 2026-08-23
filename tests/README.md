@@ -1,6 +1,6 @@
 # Tests
 
-805 tests, no account, no network, no fixtures on disk except `golden/`.
+809 tests, no account, no network, no fixtures on disk except `golden/`.
 
 ```bash
 python -m pytest tests/ -q                       # everything
@@ -34,7 +34,7 @@ UPDATE_GOLDEN=1 python -m pytest tests/test_golden.py   # rewrite the transcript
 | File | Tests | Idea |
 | --- | --- | --- |
 | `test_keygen.py` | 100 | Key generation, 100 rounds. The oldest test here. |
-| `test_pcs.py` | 91 | PCS decryption (Stage 5) and the DER reader under it. Hand-built DER, so a wrong parse is visible. |
+| `test_pcs.py` | 95 | PCS decryption (Stage 5) and the DER reader under it. Hand-built DER, so a wrong parse is visible. |
 | `test_beacons.py` | 77 | Decrypted records → accessories (Stage 6). Includes records → accessory → real rolling keys. |
 | `test_items.py` | 59 | Keychain items (§6.8.1). Every failure here is silent: entry order, `wrappedkey` meaning two things, `encver` deciding how many entries exist. |
 | `test_shares.py` | 54 | Key shares (§6.7.0). SFIES archiving, the misspelled member name, the seven-part signature. |
