@@ -203,10 +203,29 @@ class RecoveredPeer:
     bottle: OpenedBottle
     """The opened bottle: the sponsoring peer's own private keys."""
 
+    cuttlefish_peer_id: str | None = None
+    """
+    How the trust-circle service addresses this peer, when it differs from the label.
+
+    Set by :meth:`AsyncKeychainSession.recover` from the sealed bottle. See :attr:`peer_id`.
+    """
+
     @property
     def peer_id(self) -> str:
-        """The peer this identity belongs to -- what a voucher would name as sponsor."""
-        return self.record.peer_id
+        """
+        The peer this identity belongs to -- what a voucher would name as sponsor.
+
+        **Not the escrow record's label.** `EscrowRecord.peer_id` is that label with
+        `com.apple.icdp.record.` stripped, and on some accounts it is not the peer hash
+        Cuttlefish knows: it carries no `SHA256:` prefix and is absent from the peer
+        directory. Asking `FetchRecoverableTlkShares` for that id returns every view's
+        key set and *no shares*, which surfaces as "carries no readable share record"
+        for Manatee and reads as an account problem rather than a wrong id.
+
+        So the sealed bottle's own id wins where the two disagree, and the label remains
+        the fallback for accounts where they already agree.
+        """
+        return self.cuttlefish_peer_id or self.record.peer_id
 
     def signing_key(self) -> ec.EllipticCurvePrivateKey:
         """Parse the signing key. This is what would sign a voucher."""
@@ -421,12 +440,25 @@ class AsyncKeychainSession(Closable):
             inner.escrowed_encryption_key,
         )
 
+        # Which id the share fetch must use. `sealed.peer_id` is what the viability
+        # listing reported for this bottle and what the peer directory is keyed by;
+        # the escrow label's suffix is not always the same string. See
+        # `RecoveredPeer.peer_id`.
+        cuttlefish_peer_id = sealed.peer_id or inner.peer_id or None
+        if cuttlefish_peer_id and cuttlefish_peer_id != record.peer_id:
+            logger.info(
+                "Addressing the recovered peer as %s; its escrow label says %s",
+                cuttlefish_peer_id,
+                record.peer_id,
+            )
+
         return RecoveredPeer(
             record=record,
             fields=fields,
             salt=salt,
             keys=keys,
             bottle=open_bottle(sealed, keys, sponsor=sponsor),
+            cuttlefish_peer_id=cuttlefish_peer_id,
         )
 
     def _sealed_bottle(self, record: EscrowRecord) -> cf.Bottle:
