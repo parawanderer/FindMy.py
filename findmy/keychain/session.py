@@ -178,6 +178,33 @@ def _require_partition(partition: str | None) -> str:
     return partition
 
 
+def addressable_peer_id(
+    directory: PeerDirectory,
+    *candidates: str,
+) -> str | None:
+    """
+    Choose which of a bottle's peer ids the trust circle actually answers to.
+
+    **The circle's own answer first.** A bottle carries a peer id on its envelope and
+    another inside it, the escrow record's label carries a third string, and on some
+    accounts they are not all the same -- so "which one is this peer" is a question only
+    the directory can settle. Asking Cuttlefish for shares under an id it does not know
+    returns every view's key set and *no shares*, with no error at all, which is why
+    guessing is expensive: see `parawanderer/OpenTagViewer#140`.
+
+    Falls back to the first non-empty candidate when the directory lists none of them.
+    There is nothing better to go on for a bottle whose peer the circle does not contain,
+    and refusing here would break recovering from a record whose device has since left.
+
+    :param candidates: In order of preference, most authoritative first.
+    """
+    known = next((candidate for candidate in candidates if candidate in directory), None)
+    if known is not None:
+        return known
+
+    return next((candidate for candidate in candidates if candidate), None)
+
+
 @dataclass(frozen=True)
 class RecoveredPeer:
     """
@@ -425,10 +452,14 @@ class AsyncKeychainSession(Closable):
         sealed = self._sealed_bottle(record)
         inner = cf.OTBottle.FromString(sealed.bottle)
 
-        # Who sealed this bottle. Looked up before it is opened, so that key material from
-        # a party the circle does not contain is refused rather than used.
+        # Who sealed this bottle, and under which of its two ids. Looked up before it is
+        # opened, so that key material from a party the circle does not contain is refused
+        # rather than used -- and **the id and the sponsor come out of one lookup**, so
+        # that the peer this addresses and the peer whose signature is checked cannot be
+        # two different peers. Issue #140 was that pair disagreeing.
         directory = await self.peer_directory()
-        sponsor = directory.get(sealed.peer_id) or directory.get(inner.peer_id)
+        addressable = addressable_peer_id(directory, sealed.peer_id, inner.peer_id)
+        sponsor = directory.get(addressable) if addressable else None
 
         # The salt is the account's `adsid`, and an account carries more than one
         # identifier of that shape. The check is free and offline, so the candidates are
@@ -440,11 +471,11 @@ class AsyncKeychainSession(Closable):
             inner.escrowed_encryption_key,
         )
 
-        # Which id the share fetch must use. `sealed.peer_id` is what the viability
-        # listing reported for this bottle and what the peer directory is keyed by;
-        # the escrow label's suffix is not always the same string. See
-        # `RecoveredPeer.peer_id`.
-        cuttlefish_peer_id = sealed.peer_id or inner.peer_id or None
+        # The same answer the sponsor was looked up with, carried onto the peer so that
+        # the id this addresses and the peer whose signature was checked cannot be two
+        # different peers. The escrow label's suffix is not always either of them; see
+        # `RecoveredPeer.peer_id` and `addressable_peer_id`.
+        cuttlefish_peer_id = addressable
         if cuttlefish_peer_id and cuttlefish_peer_id != record.peer_id:
             logger.info(
                 "Addressing the recovered peer as %s; its escrow label says %s",
@@ -785,7 +816,8 @@ class AsyncKeychainSession(Closable):
             listing and in their device list.
         :param os_version: This client's OS string, for the stable info.
         :raises KeychainSessionError: If the peer identifier derivation cannot be
-            confirmed against the circle, or the sponsor holds no usable key shares.
+            confirmed against the circle, if the sponsoring peer is not in the circle, or
+            if it holds no usable key shares.
         """
         directory = await self.peer_directory(refresh=True)
 
@@ -799,6 +831,21 @@ class AsyncKeychainSession(Closable):
                 f" {len(check.mismatched)} peer(s) already in this circle, so a voucher"
                 " built on it would name a beneficiary that does not exist. Refusing:"
                 " that failure would only surface after the join had been sent."
+            )
+            raise KeychainSessionError(msg)
+
+        # The sponsor has to be a peer the circle actually contains. A voucher naming one
+        # it does not is signed, sent, and permanent -- and what Cuttlefish does with it
+        # is not known here: it may refuse, or it may accept and leave a peer sponsored by
+        # nobody. Issue #140 made this reachable, because the id came from the escrow
+        # label rather than from the circle; the check is free and offline, so there is no
+        # reason to find out the expensive way.
+        if peer.peer_id not in directory:
+            msg = (
+                f"The sponsoring peer {peer.peer_id!r} is not in this trust circle, so the"
+                " voucher would name a sponsor Cuttlefish does not know. Refusing: a join"
+                " cannot be undone, and what it would leave behind is not known. The"
+                f" circle holds {len(directory)} peer(s)."
             )
             raise KeychainSessionError(msg)
 

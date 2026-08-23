@@ -170,16 +170,63 @@ async def test_closing_closes_everything_it_opened() -> None:
     assert session._cuttlefish.closed  # noqa: SLF001
 
 
-def test_a_recovered_peer_names_the_peer_a_voucher_would_sponsor() -> None:
-    peer = RecoveredPeer(
-        record=a_record(),
+def a_peer(record: EscrowRecord | None = None, cuttlefish_peer_id: str | None = None):  # noqa: ANN201
+    """Build a recovered peer without recovering: only its identifier is under test."""
+    return RecoveredPeer(
+        record=record or a_record(),
         fields={},
         salt="the-adsid",
         keys=None,  # pyright: ignore [reportArgumentType]
         bottle=None,  # pyright: ignore [reportArgumentType]
+        cuttlefish_peer_id=cuttlefish_peer_id,
     )
 
-    assert peer.peer_id == "SHA256:abc="
+
+def test_a_recovered_peer_names_the_peer_a_voucher_would_sponsor() -> None:
+    # The **agreeing** case, and the one every working account takes: this label's suffix
+    # already is the hash the circle knows. Kept exactly as it was, because a fix that
+    # only ever returned the bottle's id would break these accounts and pass every other
+    # test here. See the divergent case below.
+    assert a_peer().peer_id == "SHA256:abc="
+
+
+def test_a_peer_the_circle_names_differently_is_addressed_the_circle_s_way() -> None:
+    # Issue #140. The escrow label's suffix is not always the peer hash Cuttlefish knows,
+    # and asking for shares under the wrong one returns every view's key set and *no
+    # shares* -- no error, so it reads as an account problem rather than a wrong id.
+    peer = a_peer(
+        record=a_record(label="com.apple.icdp.record.CBEEDA4C-0000-4000-8000-000000000000"),
+        cuttlefish_peer_id="SHA256:realpeerhash=",
+    )
+
+    assert peer.peer_id == "SHA256:realpeerhash="
+    assert peer.record.peer_id == "CBEEDA4C-0000-4000-8000-000000000000"
+
+
+def test_the_label_is_still_the_fallback_when_the_bottle_offers_nothing() -> None:
+    # A bottle carrying no peer id at all leaves the label as the only thing to go on,
+    # which is what accounts did before this existed.
+    assert a_peer(cuttlefish_peer_id=None).peer_id == "SHA256:abc="
+    assert a_peer(cuttlefish_peer_id="").peer_id == "SHA256:abc="
+
+
+def test_every_place_a_peer_is_named_uses_the_one_property() -> None:
+    """Test that no call site reads the escrow label directly."""
+    # There are three, and the third is a **write**: `join` builds a voucher naming this
+    # peer as sponsor, permanently. Fixing only the fetch leaves shares retrieved and then
+    # rejected as addressed to someone else; fixing only those two leaves a voucher naming
+    # a sponsor Cuttlefish does not know.
+    import inspect  # noqa: PLC0415
+
+    from findmy.keychain import session  # noqa: PLC0415
+
+    source = inspect.getsource(session.AsyncKeychainSession)
+
+    assert "peer.record.peer_id" not in source
+    for site in ("fetch_recoverable_shares(self._cuttlefish, peer.peer_id)",
+                 "expected_receiver=peer.peer_id",
+                 "make_voucher(identity.peer_id, peer.peer_id"):
+        assert site in source, site
 
 
 @pytest.mark.asyncio
@@ -739,3 +786,85 @@ async def test_the_club_certificate_can_be_checked_without_joining(
 
     assert certificate.subject.rfc4514_string() == "CN=Escrow Club"
     assert calls == ["get_club_cert"]
+
+
+# --------------------------------------------------------------------------------------
+# Which of a bottle's ids the circle answers to (issue #140)
+# --------------------------------------------------------------------------------------
+
+
+def a_directory(*hashes: str):  # noqa: ANN201
+    """Build a peer directory containing peers by name and nothing else."""
+    from findmy.keychain.peers import Peer, PeerDirectory  # noqa: PLC0415
+
+    return PeerDirectory(
+        peers={
+            name: Peer(
+                hash=name,
+                signing_key=b"",
+                encryption_key=b"",
+                machine_id="",
+                model_id="",
+            )
+            for name in hashes
+        },
+    )
+
+
+def test_the_id_the_circle_lists_wins_over_the_one_it_does_not() -> None:
+    from findmy.keychain.session import addressable_peer_id  # noqa: PLC0415
+
+    directory = a_directory("SHA256:known=")
+
+    assert addressable_peer_id(directory, "SHA256:known=", "SHA256:other=") == "SHA256:known="
+
+
+def test_the_inner_id_is_taken_when_that_is_the_one_the_circle_lists() -> None:
+    # The case a fix that always prefers the envelope's id gets wrong. `recover` looks the
+    # sponsor up under whichever of the two the directory holds, so addressing the peer by
+    # the other one means the signature was checked against a different peer than the
+    # shares were requested for.
+    from findmy.keychain.session import addressable_peer_id  # noqa: PLC0415
+
+    directory = a_directory("SHA256:inner=")
+
+    assert addressable_peer_id(directory, "SHA256:envelope=", "SHA256:inner=") == "SHA256:inner="
+
+
+def test_a_peer_the_circle_does_not_hold_still_gets_its_first_id() -> None:
+    # Recovering from a record whose device has since left the circle is a thing people
+    # do, so an unknown peer is not a refusal -- there is simply nothing better to use.
+    from findmy.keychain.session import addressable_peer_id  # noqa: PLC0415
+
+    assert addressable_peer_id(a_directory(), "SHA256:a=", "SHA256:b=") == "SHA256:a="
+    assert addressable_peer_id(a_directory(), "", "SHA256:b=") == "SHA256:b="
+    assert addressable_peer_id(a_directory(), "", "") is None
+
+
+@pytest.mark.asyncio
+async def test_joining_refuses_a_sponsor_the_circle_does_not_contain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test the guard on the one call that writes."""
+    # A voucher naming an unknown sponsor is signed, sent and permanent, and what
+    # Cuttlefish does with it is not known from here -- it may refuse, or leave a peer
+    # sponsored by nobody. Issue #140 made this reachable, because the sponsor's id came
+    # from the escrow label rather than from the circle. Free to check, so it is checked.
+    session, _, calls, _ = _a_joinable_session(monkeypatch)
+
+    class Stranger:
+        peer_id = "SHA256:not-in-the-circle"
+
+        def signing_key(self):  # noqa: ANN202
+            raise AssertionError
+
+    with pytest.raises(KeychainSessionError, match="not in this trust circle"):
+        await session.join(
+            Stranger(),  # pyright: ignore [reportArgumentType]
+            passcode="123456",
+            device=_a_device(),
+            os_version="13.4.1",
+        )
+
+    # And nothing was enrolled or sent on the way to finding out.
+    assert calls == []

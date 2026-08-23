@@ -204,11 +204,20 @@ class EscrowRecord:
         """
         The peer this record belongs to, taken from its label.
 
-        The label is `com.apple.icdp.record.<peerId>`, and the peer id is a
-        `SHA256:`-prefixed base64 digest -- the same value a peer carries as its `hash`,
-        which is why peers are addressed by hash rather than by name. So a listing already
-        names the sponsoring peer a voucher would have to name, without asking anything
-        further.
+        The label is `com.apple.icdp.record.<peerId>`, and the suffix is *usually* a
+        `SHA256:`-prefixed base64 digest matching the `hash` the peer carries in the trust
+        circle.
+
+        .. warning::
+            **It is not always that, and this is not the id to address a peer by.** On
+            some accounts the suffix is a different string entirely -- no `SHA256:`
+            prefix, and absent from the peer directory. Asking Cuttlefish for shares under
+            it returns every view's key set and *no shares*, with no error, which reads as
+            an account problem and is not one. See `parawanderer/OpenTagViewer#140`.
+
+            Use :attr:`~findmy.keychain.session.RecoveredPeer.peer_id`, which prefers what
+            the circle itself says. This property is what the *record* is labelled with,
+            which is a different question and only sometimes the same answer.
 
         Returns the whole label if it does not carry the expected prefix, rather than
         guessing at a substring.
