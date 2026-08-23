@@ -1,6 +1,6 @@
 # Tests
 
-797 tests, no account, no network, no fixtures on disk except `golden/`.
+805 tests, no account, no network, no fixtures on disk except `golden/`.
 
 ```bash
 python -m pytest tests/ -q                       # everything
@@ -27,6 +27,7 @@ UPDATE_GOLDEN=1 python -m pytest tests/test_golden.py   # rewrite the transcript
 | **Opposite sections** — writer from one spec section, reader from another | two readings of one format that never meet | `build_inner_message` (§4.5.1) → `unwrap_inner_blob` (§6.5) |
 | **Frozen transcript** — output committed as text | writer and reader drifting *together*, silently | `golden/`, see below |
 | **Source inspection** — assert on the code, not its behaviour | a guarantee with no reachable call path | `ptkn` never sent; the GSA user agent staying transcribed |
+| **Whole-account** — one synthetic account through every layer | a change that works per-hop and breaks the chain; an account *shape* nobody tested | `fake_account.py`, driven by `test_end_to_end.py` |
 
 ## Files
 
@@ -52,8 +53,30 @@ UPDATE_GOLDEN=1 python -m pytest tests/test_golden.py   # rewrite the transcript
 | `test_icloud.py` | 14 | Wiring only, over sentinel fakes. Says so in its docstring. |
 | `test_location_reports.py` | 13 | The last hop: encrypted payload → latitude and longitude. Both payload shapes; signed coordinates. |
 | `test_golden.py` | 9 | Freezes the transcripts below. |
+| `test_end_to_end.py` | 8 | A whole synthetic account, peer to accessories, in both shapes an account comes in. Built by `fake_account.py`. |
 | `test_joined_peer.py` | 12 | Resuming as a peer that already joined: what is kept, and that the reading path asks for nothing more. |
 | `test_timeouts.py` | 9 | How long a request may take, and what it says when it does not. Drives a local server that never answers. |
+
+## `fake_account.py`
+
+A whole account, layered as a real one is: keychain key → zone protection → record
+protection → fields. Describe what it holds and run the real pipeline over it.
+
+```python
+account = a_whole_account([Accessory(name="Backpack")], label_suffix=DIVERGENT_LABEL_SUFFIX)
+account.use_the_view(monkeypatch)
+found = await account.accessories()      # recovered peer → shares → keys → accessories
+```
+
+- **Two account shapes, both real.** `AGREEING_LABEL_SUFFIX` is an account whose escrow
+  label suffix already is the peer hash the circle knows; `DIVERGENT_LABEL_SUFFIX` is one
+  where it is not (#140). That single difference decided whether any keys were recovered at
+  all, so both shapes run the same pipeline and must reach the same accessories.
+- **Add a shape rather than a test.** A new `Accessory(...)` field or a new variant is
+  usually all a newly-discovered account shape needs.
+- **Generated, not captured.** Every layer is encrypted under someone's keys, so a real
+  account's bytes are neither readable without their private keys nor ours to commit. This
+  proves the pipeline handles a shape; it cannot prove Apple produces one.
 
 ## `golden/`
 
