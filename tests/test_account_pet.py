@@ -316,3 +316,44 @@ def test_a_refusal_with_an_empty_body_reports_its_headers() -> None:
 
     assert "empty body" in described
     assert "X-Apple-HB" in described
+
+
+def test_a_401_on_a_session_with_no_password_is_an_auth_error() -> None:
+    """Test that both halves of this library report "sign in again" the same way."""
+    # A restored session need not carry a password -- that is what saving state is for --
+    # and re-login then raised `ValueError("No username or password specified")` from
+    # three frames down. The CloudKit half raises `UnauthorizedError` for the same
+    # situation, so a caller deciding "must the user sign in?" had to catch both shapes
+    # and read the text of one. The Android app makes exactly that decision.
+    import asyncio  # noqa: PLC0415
+
+    from findmy.reports.account import AsyncAppleAccount  # noqa: PLC0415
+    from findmy.reports.state import LoginState  # noqa: PLC0415
+    from tests.test_device_identity import a_provider  # noqa: PLC0415
+
+    class Refused:
+        status_code = 401
+        content = b""
+        headers: dict = {}
+
+        def text(self) -> str:
+            return ""
+
+    account = AsyncAppleAccount(a_provider())
+    account._set_login_state(  # noqa: SLF001
+        LoginState.LOGGED_IN,
+        {
+            "dsid": "1",
+            "mobileme_data": {"tokens": {"searchPartyToken": "t"}},
+            "adsid": "a",
+            "idms_hb": "h",
+        },
+    )
+
+    async def refuse(*_: object, **__: object) -> Refused:
+        return Refused()
+
+    account._http.post = refuse  # noqa: SLF001  # pyright: ignore [reportAttributeAccessIssue]
+
+    with pytest.raises(UnauthorizedError, match="has to sign in"):
+        asyncio.run(account.fetch_raw_reports([(["k"], [])]))

@@ -416,7 +416,7 @@ class LocationReportsFetcher:
 
         return reports
 
-    async def _fetch_accessory_reports(  # noqa: C901
+    async def _fetch_accessory_reports(
         self,
         accessory: RollingKeyPairSource,
         only_latest: bool = False,
@@ -448,13 +448,26 @@ class LocationReportsFetcher:
                 key = id_to_key[report.hashed_adv_key_bytes]
                 report.decrypt(key)
 
-                # update alignment data on every report
-                # iterate in reverse sorted order to prevent potentially
-                # excessive internal updates and logging in the accessory,
-                # because most accessories probably only really care about
-                # the latest index anyway.
-                for i in sorted(key_to_ind[key], reverse=True):
-                    accessory.update_alignment(report.timestamp, i)
+                # **The lowest index this key could correspond to, not the highest.**
+                #
+                # A primary key belongs to exactly one index, so for one this is the
+                # index, and nothing changes. A *secondary* key covers up to 192 primary
+                # indices -- `_secondary_keys_at` offers two per index, each spanning 96
+                # -- so the set below is a window, not a point, and the only thing a
+                # match establishes is that the accessory is somewhere inside it.
+                #
+                # Taking the top of that window, which reverse-sorting did, moves
+                # alignment **ahead of the truth by up to 48 hours**, and
+                # `update_alignment` refuses to move back -- so the error is permanent and
+                # accumulates. The accessory then falls below the range its own next fetch
+                # searches, and stops being found at all, with nothing logged anywhere.
+                # `_secondary_keys_at` says the same thing about its own guess: "for
+                # alignment, it's better to underestimate progression of the index than to
+                # overestimate it."
+                #
+                # One call rather than a descending sweep, which also spares the accessory
+                # the repeated no-op updates the old loop made.
+                accessory.update_alignment(report.timestamp, min(key_to_ind[key]))
 
             cur_keys_primary.clear()
             cur_keys_secondary.clear()

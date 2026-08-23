@@ -36,6 +36,9 @@ TAG_KEY = KeyPair(bytes(range(1, 29)))
 EPHEMERAL_SCALAR = 0x0FEDCBA987654321FEDCBA987654321FEDCBA98765432100
 WHEN = datetime(2026, 1, 1, 12, 30, 45, tzinfo=timezone.utc)
 
+NOW = datetime.now(timezone.utc)
+"""For the alignment tests, which run against the fetcher's own clock rather than `WHEN`."""
+
 
 def encrypt_report(  # noqa: PLR0913 -- a report's every field, and there are seven
     key: KeyPair,
@@ -270,3 +273,101 @@ def test_a_report_sealed_the_old_way_still_decodes_to_the_same_place() -> None:
             ],
         ),
     )
+
+
+# --------------------------------------------------------------------------------------
+# What a report teaches the accessory about where its key index is
+# --------------------------------------------------------------------------------------
+
+
+class OneReportAccount:
+    """An account that answers with one report, and only for keys it was asked about."""
+
+    def __init__(self, key: KeyPair, report: LocationReport) -> None:
+        self._key = key
+        self._report = report
+        self.asked: list[int] = []
+
+    async def fetch_raw_reports(self, ids: list) -> list[LocationReport]:  # noqa: ANN401
+        asked = {
+            key for group in ids for half in group for key in ([half] if isinstance(half, str) else half)
+        }
+        self.asked.append(len(asked))
+        return [self._report] if self._key.hashed_adv_key_b64 in asked else []
+
+
+def an_accessory(paired_days_ago: int = 7):  # noqa: ANN201
+    """Build a rolling-key accessory whose alignment starts at its pairing date."""
+    import secrets  # noqa: PLC0415
+
+    from findmy import FindMyAccessory  # noqa: PLC0415
+
+    # Relative to the real clock, not this module's fixed `WHEN`: the fetcher searches
+    # from `datetime.now()`, so an accessory dated from the constant would be searched
+    # across every index between the two -- months of them.
+    paired = NOW - timedelta(days=paired_days_ago)
+    accessory = FindMyAccessory(
+        master_key=secrets.token_bytes(28),
+        skn=secrets.token_bytes(32),
+        sks=secrets.token_bytes(32),
+        paired_at=paired,
+    )
+    accessory.update_alignment(paired, 0)
+    return accessory
+
+
+def align_from_a_report(accessory, key_type, true_index: int) -> int:  # noqa: ANN001
+    """Fetch history for an accessory whose report decrypts under `key_type`, return its drift."""
+    import asyncio  # noqa: PLC0415
+
+    from findmy.reports.reports import LocationReportsFetcher  # noqa: PLC0415
+
+    key = next(k for k in accessory.keys_at(true_index) if k.key_type == key_type)
+    report = LocationReport(encrypt_report(key, when=NOW), key.hashed_adv_key_bytes)
+
+    asyncio.run(LocationReportsFetcher(OneReportAccount(key, report)).fetch_location_history(accessory))
+
+    return accessory._alignment_index - true_index  # noqa: SLF001
+
+
+@pytest.mark.parametrize("true_index", [300, 600, 671])
+def test_a_primary_key_match_aligns_exactly(true_index: int) -> None:
+    """Test that a primary match is worth an exact index, since it belongs to one."""
+    from findmy.keys import KeyPairType  # noqa: PLC0415
+
+    assert align_from_a_report(an_accessory(), KeyPairType.PRIMARY, true_index) == 0
+
+
+@pytest.mark.parametrize("true_index", [480, 500, 576, 600, 671])
+def test_a_secondary_key_match_never_moves_alignment_past_the_truth(true_index: int) -> None:
+    """Test the one direction that cannot be undone."""
+    # A secondary key covers up to 192 primary indices, so a match places the accessory
+    # somewhere in a window rather than at a point. Taking the top of that window puts
+    # alignment **ahead** of the accessory by as much as 48 hours -- and
+    # `update_alignment` refuses to move back, so the error is permanent, accumulates,
+    # and eventually drops the accessory below the range its own next fetch searches. It
+    # then stops being found, with nothing logged. Measured on real hardware at 114
+    # indices before this was understood; see OpenTagViewer#139.
+    #
+    # Behind is safe: it only widens the next search, which is honest about the
+    # uncertainty, and the next primary match corrects it upward.
+    from findmy.keys import KeyPairType  # noqa: PLC0415
+
+    drift = align_from_a_report(an_accessory(), KeyPairType.SECONDARY, true_index)
+
+    assert drift <= 0, f"alignment ran {drift} indices ahead of the accessory"
+
+
+def test_a_report_still_teaches_the_accessory_something() -> None:
+    """Test that the conservative choice is not the same as learning nothing."""
+    # The cheap way to satisfy the test above would be to stop updating alignment from
+    # secondary matches at all. That loses real information: the window's lower bound is
+    # still far above where an unaligned accessory starts.
+    from findmy.keys import KeyPairType  # noqa: PLC0415
+
+    accessory = an_accessory()
+    before = accessory._alignment_index  # noqa: SLF001
+
+    align_from_a_report(accessory, KeyPairType.SECONDARY, 600)
+
+    assert accessory._alignment_index > before  # noqa: SLF001

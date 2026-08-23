@@ -1283,6 +1283,22 @@ class AsyncAppleAccount(BaseAppleAccount):
         if r.status_code == 401:
             logger.info("Got 401 while fetching reports, redoing login")
 
+            # **Asked before trying, so that "needs a password" is an auth failure and
+            # not a `ValueError`.** A session restored from saved state need not carry
+            # one -- that is the point of saving state -- and `_gsa_authenticate` then
+            # raises a bare `ValueError("No username or password specified")` from three
+            # frames down, which says nothing about authentication and is not what the
+            # CloudKit half of this library raises for the same situation. Anything
+            # trying to tell "the user must sign in again" from "transient" had to catch
+            # both shapes and read the message of one.
+            if not self._username or not self._password:
+                msg = (
+                    "Apple rejected the report fetch and this session holds no password"
+                    " to authenticate again with, so it cannot recover on its own. The"
+                    " user has to sign in."
+                )
+                raise UnauthorizedError(msg)
+
             new_state = await self._gsa_authenticate()
             if new_state != LoginState.AUTHENTICATED:
                 msg = f"Unexpected login state after reauth: {new_state}. Please log in again."

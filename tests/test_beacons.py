@@ -1194,3 +1194,37 @@ async def test_two_naming_records_for_one_accessory_are_refused() -> None:
 
     with pytest.raises(BeaconExportError, match="named by 2 records"):
         await store.find_naming_record("BEACON-1", [private_key])
+
+
+def test_a_short_result_says_how_short_and_why() -> None:
+    # A caller handed a bare list cannot tell that it is missing anything: skipping is
+    # normal, since a zone holds records for other parties too. Without the tally,
+    # "fewer tags than expected" and "some of those were never tags" are the same
+    # observation -- which is what somebody had to unpick by counting raw records by hand.
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    theirs = ec.generate_private_key(ec.SECP256R1())
+
+    mine, _ = make_encrypted_record(private_key, bytes(range(16)), {})
+    not_a_tag, _ = make_encrypted_record(
+        private_key, bytes(range(16)), {}, record_type="SomethingElse", name="OTHER",
+    )
+    someone_elses, _ = make_encrypted_record(theirs, bytes(range(16)), {}, name="THEIRS")
+
+    result = decrypt_records([mine, not_a_tag, someone_elses], [private_key])
+
+    assert len(result) == 1
+    assert result.skipped == {"SomethingElse": 1, "no key held": 1}
+    assert result.skipped_total == 2
+    # The one message that tells "genuinely someone else's" from "compared in the wrong
+    # encoding" apart, which the count alone cannot.
+    assert result.first_miss is not None
+
+
+def test_the_result_is_still_a_list_for_everything_that_treats_it_as_one() -> None:
+    # It is returned by an exported function, so the tally rides along rather than
+    # replacing what callers already index, iterate and compare.
+    private_key = ec.generate_private_key(ec.SECP256R1())
+
+    assert decrypt_records([], [private_key]) == []
+    assert list(decrypt_records([], [private_key])) == []
+    assert decrypt_records([], [private_key]).skipped == {}

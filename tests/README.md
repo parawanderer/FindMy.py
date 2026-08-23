@@ -1,6 +1,6 @@
 # Tests
 
-809 tests, no account, no network, no fixtures on disk except `golden/`.
+821 tests, no account, no network, no fixtures on disk except `golden/`.
 
 ```bash
 python -m pytest tests/ -q                       # everything
@@ -35,7 +35,7 @@ UPDATE_GOLDEN=1 python -m pytest tests/test_golden.py   # rewrite the transcript
 | --- | --- | --- |
 | `test_keygen.py` | 100 | Key generation, 100 rounds. The oldest test here. |
 | `test_pcs.py` | 95 | PCS decryption (Stage 5) and the DER reader under it. Hand-built DER, so a wrong parse is visible. |
-| `test_beacons.py` | 77 | Decrypted records → accessories (Stage 6). Includes records → accessory → real rolling keys. |
+| `test_beacons.py` | 79 | Decrypted records → accessories (Stage 6). Includes records → accessory → real rolling keys. |
 | `test_items.py` | 59 | Keychain items (§6.8.1). Every failure here is silent: entry order, `wrappedkey` meaning two things, `encver` deciding how many entries exist. |
 | `test_shares.py` | 54 | Key shares (§6.7.0). SFIES archiving, the misspelled member name, the seven-part signature. |
 | `test_escrow.py` | 47 | The escrow listing and KeyVault framing. Padded sections declare their true length and occupy more. |
@@ -49,9 +49,9 @@ UPDATE_GOLDEN=1 python -m pytest tests/test_golden.py   # rewrite the transcript
 | `test_terms.py` | 22 | The terms-of-service flow (Stage 2 §5.2). |
 | `test_device_identity.py` | 18 | One device across every header, the ids a client supplies, and the one user agent that deliberately disagrees. |
 | `test_tls.py` | 15 | Verification on unless explicitly turned off, and the lazy scanner import. |
-| `test_account_pet.py` | 15 | Issuing a fresh PET, and what a refused announce reports. |
+| `test_account_pet.py` | 16 | Issuing a fresh PET, and what a refused announce reports. |
 | `test_icloud.py` | 14 | Wiring only, over sentinel fakes. Says so in its docstring. |
-| `test_location_reports.py` | 13 | The last hop: encrypted payload → latitude and longitude. Both payload shapes; signed coordinates. |
+| `test_location_reports.py` | 22 | The last hop: encrypted payload → latitude and longitude. Both payload shapes; signed coordinates. |
 | `test_golden.py` | 9 | Freezes the transcripts below. |
 | `test_end_to_end.py` | 8 | A whole synthetic account, peer to accessories, in both shapes an account comes in. Built by `fake_account.py`. |
 | `test_joined_peer.py` | 12 | Resuming as a peer that already joined: what is kept, and that the reading path asks for nothing more. |

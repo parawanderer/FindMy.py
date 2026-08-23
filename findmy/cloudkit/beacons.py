@@ -43,7 +43,7 @@ from .proto import cloudkit_pb2 as ck
 from .records import CloudKitRecord, records_from_changes
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -1104,12 +1104,56 @@ class AsyncBeaconStore:
         return ""
 
 
+class DecryptedRecords(list):
+    """
+    The records that decrypted, carrying what did not alongside them.
+
+    **A list, so that nothing that already treats it as one has to change** -- it is
+    returned by an exported function and every existing caller indexes, iterates or
+    compares it. The counts ride along as attributes for the callers that need them.
+
+    They are needed. A caller handed a bare list has no signal that it is *short*: a zone
+    legitimately holds records for other parties, so skipping is normal and silent, and
+    "fewer tags than expected" is indistinguishable from "some of those were never tags"
+    without this. The counts were always computed -- they were logged and then dropped on
+    the floor, which meant the only way to notice was to count raw records by hand
+    afterwards, which is what somebody had to do.
+    """
+
+    def __init__(
+        self,
+        records: Iterable[DecryptedRecord] = (),
+        *,
+        skipped: Mapping[str, int] | None = None,
+        first_miss: str | None = None,
+    ) -> None:
+        """Initialize with the decrypted records and the tally of what was not."""
+        super().__init__(records)
+
+        self.skipped: dict[str, int] = dict(skipped or {})
+        """How many records were skipped, by reason. Empty when nothing was."""
+
+        self.first_miss: str | None = first_miss
+        """
+        The first "no key held" in full, which the tally alone cannot tell apart.
+
+        That count is the same whether the records genuinely belong to somebody else or
+        this client is comparing keys in the wrong encoding, and those lead in opposite
+        directions.
+        """
+
+    @property
+    def skipped_total(self) -> int:
+        """How many records did not decrypt, for any reason."""
+        return sum(self.skipped.values())
+
+
 def decrypt_records(
     records: Iterable[CloudKitRecord],
     private_keys: Sequence[ec.EllipticCurvePrivateKey],
     *,
     default_master_keys: Sequence[bytes] = (),
-) -> list[DecryptedRecord]:
+) -> DecryptedRecords:
     """
     Decrypt the records worth decrypting, and report rather than hide what was skipped.
 
@@ -1143,6 +1187,10 @@ def decrypt_records(
             skipped["no key held"] = skipped.get("no key held", 0) + 1
             first_miss = first_miss or str(e)
         except PCSError:
+            # Counted as well as logged. A record that fails for a reason other than a
+            # missing key is just as absent from the result, and a caller reconciling
+            # counts should not have to read the log to find out.
+            skipped["would not decrypt"] = skipped.get("would not decrypt", 0) + 1
             logger.exception("Could not decrypt %s (%s)", record.name, record.record_type)
 
     if skipped:
@@ -1151,4 +1199,4 @@ def decrypt_records(
     if first_miss is not None:
         logger.info("Why no key was held: %s", first_miss)
 
-    return decrypted
+    return DecryptedRecords(decrypted, skipped=skipped, first_miss=first_miss)
