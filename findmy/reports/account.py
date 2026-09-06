@@ -29,12 +29,14 @@ from typing_extensions import NotRequired, ParamSpec, override
 
 from findmy import util
 from findmy.errors import (
+    AppleServiceUnavailableError,
     EmptyResponseError,
     InvalidCredentialsError,
     InvalidStateError,
     MobileMeDelegateError,
     UnauthorizedError,
     UnhandledProtocolError,
+    is_service_unavailable,
 )
 
 from .anisette import AnisetteMapping, get_provider_from_mapping
@@ -1605,6 +1607,8 @@ class AsyncAppleAccount(BaseAppleAccount):
             json=data,
             headers=headers,
         )
+        if is_service_unavailable(r.status_code):
+            raise AppleServiceUnavailableError(r.status_code, "The two-factor request")
         if not r.ok:
             msg = f"SMS 2FA request failed: {r.status_code}"
             raise UnhandledProtocolError(msg)
@@ -1646,6 +1650,13 @@ class AsyncAppleAccount(BaseAppleAccount):
             headers=headers,
             data=plistlib.dumps(body),
         )
+        # **A 5xx here is Apple declining, not a shape this library cannot read**, and the
+        # two want opposite things from a caller: one is worth waiting out, the other is
+        # worth reporting. Collapsing them into UnhandledProtocolError sent people to the
+        # issue tracker for a bad minute at gsa.apple.com - OpenTagViewer#168 and #176,
+        # where the same account met it three times in three minutes at three call sites.
+        if is_service_unavailable(resp.status_code):
+            raise AppleServiceUnavailableError(resp.status_code, "The Grand Slam request")
         if not resp.ok:
             msg = f"Error response for GSA request: {resp.status_code}"
             raise UnhandledProtocolError(msg)

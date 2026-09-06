@@ -10,6 +10,7 @@ from .accessory import (
     RollingKeyPairSource,
 )
 from .errors import (
+    AppleServiceUnavailableError,
     InvalidCredentialsError,
     InvalidStateError,
     MobileMeDelegateError,
@@ -50,6 +51,7 @@ __all__ = (
     "AccountStateMapping",
     "AnisetteMapping",
     "AppleAccount",
+    "AppleServiceUnavailableError",
     "AsyncAppleAccount",
     "AsyncSmsSecondFactor",
     "AsyncTrustedDeviceSecondFactor",
