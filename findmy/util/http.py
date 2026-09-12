@@ -25,7 +25,12 @@ logger = logging.getLogger(__name__)
 try:
     # Only resolves under Chaquopy. Its presence is the platform switch: everywhere else
     # imports this module and gets the aiohttp path below, unchanged.
-    from java import cast, jclass
+    #
+    # Renamed on import: `java.cast` and `typing.cast` do two unrelated things with the
+    # same name, and the aiohttp path (reachable on Android too, via `force_aiohttp`)
+    # needs the typing one. Shadowing it silently sent a type-hint string into `java.cast`,
+    # which reads it as a JNI class signature and raises "Invalid JNI signature" on it.
+    from java import cast as jcast, jclass
 
     _ON_ANDROID = True
 except ImportError:
@@ -181,7 +186,7 @@ class _AndroidTlsRequest:
         platform_tmf = cls._TrustManagerFactory.getInstance(
             cls._TrustManagerFactory.getDefaultAlgorithm(),
         )
-        platform_tmf.init(cast(cls._KeyStore, None))
+        platform_tmf.init(jcast(cls._KeyStore, None))
 
         combined_store = cls._KeyStore.getInstance(cls._KeyStore.getDefaultType())
         combined_store.load(None, None)
@@ -284,7 +289,13 @@ class _AndroidTlsRequest:
 class HttpSession(Closable):
     """Asynchronous HTTP session manager. For internal use only."""
 
-    def __init__(self, *, verify_tls: bool = True, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        *,
+        verify_tls: bool = True,
+        timeout: float = DEFAULT_TIMEOUT,
+        force_aiohttp: bool = False,
+    ) -> None:
         """
         Initialize the session.
 
@@ -296,8 +307,15 @@ class HttpSession(Closable):
             included. The one case it exists for is a self-hosted Anisette server with a
             self-signed certificate, which is why the switch a caller actually sees is on
             that provider rather than here.
+        :param force_aiohttp: Use aiohttp even under Chaquopy, skipping
+            :class:`_AndroidTlsRequest` entirely. CloudKit's edge (unlike GSA's) silently
+            answers Conscrypt's TLS handshake with an empty success rather than the real
+            body -- no error, just a 200 with nothing usable in it -- while the same
+            request through aiohttp's OpenSSL-backed TLS gets the real response. Callers
+            whose traffic goes to CloudKit rather than GSA should set this.
         """
         super().__init__()
+        self._force_aiohttp = force_aiohttp
 
         self._session: ClientSession | None = None
         self._closed: bool = False
@@ -351,7 +369,7 @@ class HttpSession(Closable):
         except on Android -- see :class:`_AndroidTlsRequest`, which takes the same
         arguments but does not go through aiohttp at all.
         """
-        if _ON_ANDROID:
+        if _ON_ANDROID and not self._force_aiohttp:
             return await self._android_request(method, url, **kwargs)
 
         session = await self._get_session()
