@@ -1638,7 +1638,10 @@ class AsyncAppleAccount(BaseAppleAccount):
             # locks people out. A caller that sets its own identity should know this
             # header does not follow it. See `_GSA_USER_AGENT`.
             "User-Agent": _GSA_USER_AGENT,
-            "X-MMe-Client-Info": self._anisette.client,
+            # `_GSA_USER_AGENT` speaks as akd; matching client info to it rather than to
+            # Xcode is what keeps this endpoint from refusing the request outright with a
+            # 503 -- see `BaseAnisetteProvider.client_akd`.
+            "X-MMe-Client-Info": self._anisette.client_akd,
         }
 
         resp = await self._http.post(
