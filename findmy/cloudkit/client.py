@@ -302,7 +302,10 @@ class AsyncCloudKitClient(Closable):
 
         self._identity = _ClientIdentity.parse(account.client_info)
         self._info: CloudKitContainerInfo | None = None
-        self._http: HttpSession = HttpSession()
+        # force_aiohttp: CloudKit's edge answers Conscrypt's TLS handshake with a silent
+        # empty success (200, no error, unusable body) rather than the real response --
+        # see HttpSession's docstring. aiohttp's OpenSSL-backed TLS gets the real one.
+        self._http: HttpSession = HttpSession(force_aiohttp=True)
 
     @property
     def container_info(self) -> CloudKitContainerInfo | None:
@@ -363,12 +366,19 @@ class AsyncCloudKitClient(Closable):
         logger.info("Opening CloudKit container %s", self._container)
 
         url = f"{CK_APP_INIT_URL}?container={quote(self._container)}"
+        # Basic Auth carries the general iCloud delegate (`mmeAuthToken`), same as every
+        # other setup-service call. `cloudKitToken` is required too, but as a separate
+        # `X-CloudKit-AuthToken` header, not as a swap-in for Basic Auth -- omitting it
+        # gets a 200 with an empty body rather than an error, silently rather than loudly.
         auth = (self._account.dsid, self._account.service_tokens["mmeAuthToken"])
+
+        headers = await self._cloudkit_headers()
+        headers["x-cloudkit-authtoken"] = self._account.service_tokens["cloudKitToken"]
 
         resp = await self._http.post(
             url,
             auth=auth,
-            headers=await self._cloudkit_headers(),
+            headers=headers,
         )
         if resp.status_code == 401:
             msg = (
