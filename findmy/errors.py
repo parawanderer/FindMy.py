@@ -1,5 +1,15 @@
 """Exception classes."""
 
+from __future__ import annotations
+
+import math
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 
 class InvalidCredentialsError(Exception):
     """Raised when credentials are incorrect."""
@@ -28,10 +38,11 @@ class AppleServiceUnavailableError(UnhandledProtocolError):
     identically sends people to file issues about Apple having a bad minute, and gives an
     application no way to tell a retry-worthy failure from a real one.
 
-    Observed as a 503 from ``gsa.apple.com`` affecting every call for a stretch of minutes,
-    then clearing on its own -- see OpenTagViewer#168 and #176, where one account met it at
-    ``td_2fa_submit``, again at ``request_pet`` a second later, and again at ``login`` a
-    minute after that.
+    Observed as a 503 from ``gsa.apple.com`` affecting every call for a stretch of minutes --
+    see OpenTagViewer#168 and #176, where one account met it at ``td_2fa_submit``, again at
+    ``request_pet`` a second later, and again at ``login`` a minute after that. **It does not
+    always clear on its own:** from September 2026 the same 503 was Apple's edge refusing the
+    Xcode client identifier, permanently, until the client changed.
 
     A subclass of ``UnhandledProtocolError`` on purpose, so existing ``except`` clauses keep
     catching it and nothing downstream breaks by upgrading. Catch this one first where the
@@ -39,18 +50,92 @@ class AppleServiceUnavailableError(UnhandledProtocolError):
 
     :param status_code: what the endpoint answered with.
     :param what: which request it was, for the message.
+    :param retry_after: seconds Apple asked the client to wait, from ``Retry-After``, or None
+        when it did not say. See :func:`parse_retry_after`.
     """
 
-    def __init__(self, status_code: int, what: str) -> None:
-        """Record what was refused and with what, then compose the message."""
+    def __init__(self, status_code: int, what: str, retry_after: float | None = None) -> None:
+        """Record what was refused, with what, and for how long, then compose the message."""
         self.status_code = status_code
         self.what = what
+        self.retry_after = retry_after
+        """
+        Seconds Apple asked for before a retry, or None when the response did not say.
 
+        **None is the common case, not a failure to parse.** No GSA refusal observed so far has
+        carried the header, so a caller must treat None as "unknown" rather than "retry now" --
+        and must not invent a number to fill it. When it is present it is Apple's own answer
+        and worth showing a person, which is the whole reason to read it.
+        """
+
+        # **No promise that it clears on its own.** This used to say it usually does. For the
+        # 503s of September 2026 it did not: they were Apple refusing the Xcode client
+        # identifier, and every retry met the same answer until the client changed.
+        wait = (
+            f" Apple asked for {_describe_seconds(retry_after)} before trying again."
+            if retry_after is not None
+            else " Waiting and trying again may help."
+        )
         super().__init__(
             f"{what} was refused with HTTP {status_code}. This is Apple declining to serve"
-            " the request rather than a response this library cannot read, and it usually"
-            " clears on its own -- wait and try again.",
+            f" the request rather than a response this library cannot read.{wait}",
         )
+
+
+def _describe_seconds(seconds: float) -> str:
+    """Describe a wait as a person would say it, rounded up so nobody retries too early."""
+    whole = max(0, math.ceil(seconds))
+    if whole < 60:
+        return f"{whole} second{'s' if whole != 1 else ''}"
+    minutes = math.ceil(whole / 60)
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
+
+
+def parse_retry_after(
+    headers: Mapping[str, str] | None,
+    now: datetime | None = None,
+) -> float | None:
+    """
+    Seconds to wait from a response's ``Retry-After`` header, or None if it gives none.
+
+    RFC 9110 section 10.2.3 allows two forms, and both are handled: a non-negative integer of
+    seconds, or an HTTP date. A date already in the past is 0 -- it is a valid answer meaning
+    "now" -- rather than a negative wait.
+
+    **Looked up without regard to case**, and that is not pedantry. Responses reach this as a
+    plain ``dict``, which is case-sensitive, and HTTP/2 transmits header names in lowercase, so
+    a lookup of ``"Retry-After"`` alone would miss the header on exactly the connections Apple
+    is most likely to use.
+
+    Anything unreadable is None rather than a guess. A wrong wait is worse than none: too short
+    and the retry is refused again, too long and a person stares at a countdown for nothing.
+
+    :param now: the time a date is measured from. For tests; defaults to the current time.
+    """
+    if not headers:
+        return None
+
+    raw = next(
+        (value for name, value in headers.items() if name.lower() == "retry-after"),
+        None,
+    )
+    if raw is None:
+        return None
+
+    value = raw.strip()
+    if value.isdigit():
+        return float(int(value))
+
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        # RFC 9110 dates are GMT by definition; one without a zone is read as such.
+        when = when.replace(tzinfo=timezone.utc)
+
+    reference = now if now is not None else datetime.now(timezone.utc)
+    return max(0.0, (when - reference).total_seconds())
 
 
 def is_service_unavailable(status_code: int) -> bool:

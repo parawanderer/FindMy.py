@@ -37,6 +37,7 @@ from findmy.errors import (
     UnauthorizedError,
     UnhandledProtocolError,
     is_service_unavailable,
+    parse_retry_after,
 )
 
 from .anisette import AnisetteMapping, get_provider_from_mapping
@@ -74,6 +75,51 @@ if TYPE_CHECKING:
     from .anisette import BaseAnisetteProvider, DeviceIdentity
 
 logger = logging.getLogger(__name__)
+
+# Request headers that are secrets, or close enough, and must never reach a log. Everything else
+# on these requests - the client info, the user agent, the serial, the locale - is what somebody
+# debugging a refusal needs to compare against a client that works.
+_NEVER_LOGGED = frozenset(
+    {
+        "x-apple-i-md",  # the one-time password
+        "x-apple-i-md-m",  # the machine id
+        "x-apple-identity-token",  # adsid:idms_token, a credential
+        "x-apple-gs-token",
+        "authorization",
+    }
+)
+
+
+def _refused(
+    response: util.http.HttpResponse,
+    sent: Mapping[str, str],
+    what: str,
+) -> AppleServiceUnavailableError:
+    """
+    Build the error for a refusal, logging what was sent and what came back.
+
+    **The logging is the reason this exists as a function.** A refusal from Apple's edge says
+    nothing about why, and every diagnosis in September 2026 turned on a header: the client
+    info naming Xcode, and then a 429 that one client met and another did not. Both were found
+    by comparing requests, and each comparison started with guessing what had been sent. So
+    a refusal now records it - the request headers minus the secrets, and the response
+    headers in full, which is also how anyone will find out whether Apple ever sends
+    ``Retry-After`` on these.
+    """
+    shown = {name: value for name, value in sent.items() if name.lower() not in _NEVER_LOGGED}
+    logger.warning(
+        "%s was refused with HTTP %d.\n  sent:     %s\n  received: %s",
+        what,
+        response.status_code,
+        shown,
+        dict(response.headers),
+    )
+    return AppleServiceUnavailableError(
+        response.status_code,
+        what,
+        retry_after=parse_retry_after(response.headers),
+    )
+
 
 srp.rfc5054_enable()
 srp.no_username_in_x()
@@ -1608,7 +1654,7 @@ class AsyncAppleAccount(BaseAppleAccount):
             headers=headers,
         )
         if is_service_unavailable(r.status_code):
-            raise AppleServiceUnavailableError(r.status_code, "The two-factor request")
+            raise _refused(r, headers, "The two-factor request")
         if not r.ok:
             msg = f"SMS 2FA request failed: {r.status_code}"
             raise UnhandledProtocolError(msg)
@@ -1675,7 +1721,7 @@ class AsyncAppleAccount(BaseAppleAccount):
         # issue tracker for a bad minute at gsa.apple.com - OpenTagViewer#168 and #176,
         # where the same account met it three times in three minutes at three call sites.
         if is_service_unavailable(resp.status_code):
-            raise AppleServiceUnavailableError(resp.status_code, "The Grand Slam request")
+            raise _refused(resp, headers, "The Grand Slam request")
         if not resp.ok:
             msg = f"Error response for GSA request: {resp.status_code}"
             raise UnhandledProtocolError(msg)
