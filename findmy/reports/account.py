@@ -1642,7 +1642,26 @@ class AsyncAppleAccount(BaseAppleAccount):
             # locks people out. A caller that sets its own identity should know this
             # header does not follow it. See `_GSA_USER_AGENT`.
             "User-Agent": _GSA_USER_AGENT,
-            "X-MMe-Client-Info": self._anisette.client,
+            # **akd, not Xcode, and this is not cosmetic.** Since early September 2026
+            # Apple's edge drops any request to this endpoint whose client info contains
+            # `com.apple.dt.Xcode`, before a credential is looked at: a 190-byte HTML
+            # page from `Server: Apple` in ~0.2s rather than a GSA plist, which surfaces
+            # as HTTP 503 and reads as an outage. The same request naming `com.apple.akd`
+            # reaches the service and is answered properly.
+            #
+            # Reproducible without an account, and worth re-running before believing any
+            # theory about this:
+            #
+            #     curl -so /dev/null -w '%{http_code}\n' -X POST --data-binary t \
+            #       -H 'X-MMe-Client-Info: <Mac14,2> <macOS;15.7.5;24G624> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>' \
+            #       https://gsa.apple.com/grandslam/GsService2      # 503
+            #
+            #     ... (com.apple.akd/1.0)> ...                      # 401, i.e. it arrived
+            #
+            # Diagnosed by AltStore (altstoreio/AltStore#1790, shipped in AltServer
+            # 1.7.6); the same block took out SideStore, Macless Haystack, OpenBubbles
+            # and this library. See OpenTagViewer#168, #176, #181.
+            "X-MMe-Client-Info": self._anisette.client_akd,
         }
 
         resp = await self._http.post(
