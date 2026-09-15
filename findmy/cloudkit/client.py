@@ -363,12 +363,24 @@ class AsyncCloudKitClient(Closable):
         logger.info("Opening CloudKit container %s", self._container)
 
         url = f"{CK_APP_INIT_URL}?container={quote(self._container)}"
+
+        # **Two tokens, and this endpoint wants both.** Basic Auth carries the general iCloud
+        # delegate, `mmeAuthToken`, as every other setup-service call does. `cloudKitToken` is
+        # required as well, in its own header -- it is not an alternative to Basic Auth, which is
+        # how it came to be left out here while every operation below sends it.
+        #
+        # **Nothing says so when it is missing.** The endpoint answers 200 with an empty body
+        # rather than 401, so the only symptom is the "did not return a user id" below, several
+        # lines from the cause. Found by @LiamJ74 in parawanderer/FindMy.py#4, by replaying the
+        # same request with curl and getting a real `cloudKitUserId` back.
         auth = (self._account.dsid, self._account.service_tokens["mmeAuthToken"])
+        headers = await self._cloudkit_headers()
+        headers["x-cloudkit-authtoken"] = self._account.service_tokens["cloudKitToken"]
 
         resp = await self._http.post(
             url,
             auth=auth,
-            headers=await self._cloudkit_headers(),
+            headers=headers,
         )
         if resp.status_code == 401:
             msg = (
