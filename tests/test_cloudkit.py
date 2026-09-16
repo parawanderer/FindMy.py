@@ -84,6 +84,10 @@ class FakeAccount:
         # The CloudKit client takes its serial from the account rather than keeping a
         # second copy, so this fake has to carry one too.
         self.serial = "0FINDMYPY001"
+        # Same reason as the serial above: the client reads the account's timeout rather than
+        # keeping the library default, so this fake has to carry one. Deliberately not the
+        # default, so a test can tell "inherited" from "happened to match".
+        self.timeout = 17.0
         self.device_uuid = DEVICE_UUID
         self.dsid = "1234567890"
         self.service_tokens = {
@@ -686,3 +690,16 @@ def test_the_modelled_response_fields_leave_nothing_unknown() -> None:
     roundtripped = ck.RetrieveChangesResponse.FromString(payload.SerializeToString())
 
     assert describe_unknown_fields(roundtripped) == []
+
+
+def test_the_client_waits_as_long_as_the_account_was_told_to() -> None:
+    """
+    The CloudKit client had the same gap as the escrow proxy: its own session, built with the
+    library default, on an account that may have been configured for much longer. Same network,
+    same link, so the same patience.
+    """
+    client = AsyncCloudKitClient(FakeAccount())  # pyright: ignore [reportArgumentType]
+
+    assert client._http.timeout == 17.0, (  # noqa: SLF001
+        "the CloudKit client is not inheriting the account's timeout"
+    )

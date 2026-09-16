@@ -302,7 +302,11 @@ class AsyncCloudKitClient(Closable):
 
         self._identity = _ClientIdentity.parse(account.client_info)
         self._info: CloudKitContainerInfo | None = None
-        self._http: HttpSession = HttpSession()
+
+        # The account's timeout rather than the default, for the reason spelled out in
+        # `keychain.escrow`: a caller that asks for longer is describing its network, and the
+        # same network carries this.
+        self._http: HttpSession = HttpSession(timeout=account.timeout)
 
     @property
     def container_info(self) -> CloudKitContainerInfo | None:

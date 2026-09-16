@@ -589,7 +589,14 @@ class AsyncEscrowProxy(Closable):
         self._account = account
         self._host = host.rstrip("/")
         self._pet = pet
-        self._http = HttpSession()
+
+        # **The account's timeout, not the default.** This built its own session with the five
+        # second default however long the account had been told to wait, so a caller on a slow
+        # link signed in happily and then timed out here - reported against OpenTagViewer on a
+        # phone, as `srp_init did not answer within 5s`, with the account configured for thirty.
+        # The escrow proxy is a poor candidate for a short timeout anyway: it does SRP on its
+        # side of each exchange.
+        self._http = HttpSession(timeout=account.timeout)
 
     def replace_pet(self, pet: str) -> None:
         """
