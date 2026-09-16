@@ -160,9 +160,15 @@ class MobileMeDelegateError(UnhandledProtocolError):
 
     So this reports both, verbatim. Which `localizedError` value means "terms pending" is
     not established -- `UNAUTHORIZED` is a known but different value on the same channel
-    -- so nothing here branches on a guess. If an account is stuck at this error, the
-    terms flow is the remedy to try: see
+    -- so nothing here branches on a guess. If an account is stuck at this error *and a
+    localizedError came back*, the terms flow is the remedy to try: see
     :meth:`~findmy.reports.account.AsyncAppleAccount.fetch_terms`.
+
+    **And when no localizedError came back, it is not a terms problem at all.** The
+    delegate's own `status` fails independently of that channel, and a caller that cannot
+    tell the two apart will offer an empty document list to somebody whose terms are fine.
+    :attr:`names_a_localized_error` is the discriminator; branch on it rather than on the
+    exception type.
     """
 
     def __init__(
@@ -186,6 +192,20 @@ class MobileMeDelegateError(UnhandledProtocolError):
         """Whether the credential was rejected, which usually means the PET expired."""
         return self.localized_error == "UNAUTHORIZED"
 
+    @property
+    def names_a_localized_error(self) -> bool:
+        """
+        Whether the response used the channel unaccepted terms arrive on.
+
+        **False means the terms flow is not the remedy, and is worth branching on.** The two
+        channels fail independently: `localizedError` is where a response explains itself in
+        words, and the delegate's own `status` is where it reports that it would not serve the
+        account at all. A caller that treats every delegate failure as "terms pending" sends
+        somebody to a document list that is empty, tells them the problem is terms, and leaves
+        the actual refusal unmentioned.
+        """
+        return self.localized_error is not None
+
     def _describe(self) -> str:
         """Say what the response said, and what can be done about it."""
         said = [
@@ -205,11 +225,33 @@ class MobileMeDelegateError(UnhandledProtocolError):
                 "The credential was rejected, which is usually an expired PET rather than"
                 " a bad password. Log in again."
             )
-        else:
+        elif self.names_a_localized_error:
             remedy = (
                 "If this account has unaccepted iCloud terms, fetch_terms() and"
                 " accept_terms() are the remedy, and the localizedError above is worth"
                 " reporting -- which value means that is not yet known."
+            )
+        else:
+            # **Advising about localizedError here was a bug, and a user-visible one.** The
+            # remedy above used to be the only alternative to UNAUTHORIZED, so a response
+            # whose delegate simply refused the account was answered with a sentence about
+            # terms of service and an instruction to report a field that is not in it.
+            # OpenTagViewer#221 shows it on a phone: an account with nothing wrong with its
+            # terms, told to go and accept some.
+            #
+            # What it is instead is not established from here, so this reports rather than
+            # concludes. Every client sharing this sign-in path meets it on Apple IDs that
+            # have never been used with an Apple device, and the advice that circulates is
+            # to fill the account out at appleid.apple.com -- see macless-haystack#84, #86
+            # and #87, where the same status arrives with "Account limit reached" and with
+            # this same "server problem" wording.
+            remedy = (
+                "No localizedError came back, so this is not the terms channel and"
+                " accepting terms will not change it -- the delegate refused the account"
+                " itself. Clients sharing this sign-in path report this on Apple IDs that"
+                " have never been used with an Apple device, and that completing the"
+                " account at appleid.apple.com clears it; retrying alone generally does"
+                " not. Despite the wording, it is not known to be temporary."
             )
 
         return f"The com.apple.mobileme delegate request failed, reporting {reported}. {remedy}"
