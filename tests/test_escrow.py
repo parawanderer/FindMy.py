@@ -60,6 +60,8 @@ class FakeAccount:
         self.client_info = identity.client_info("com.apple.AOSKit/282 (com.apple.dt.Xcode/1)")
         self.identity = identity
         self.account_name = "someone@example.com"
+        # Not the default, so a test can tell "inherited" from "happened to match".
+        self.timeout = 17.0
 
     async def get_anisette_headers(self) -> dict[str, str]:
         return {"X-Apple-I-MD": "otp"}
@@ -772,3 +774,22 @@ def test_a_rejection_that_is_not_a_plist_still_reports_what_arrived() -> None:
     assert "upstream is unwell" in str(error)
     # Nothing described this, so it must not take the delete-and-re-enrol path.
     assert not error.reported
+
+
+def test_the_proxy_waits_as_long_as_the_account_was_told_to() -> None:
+    """
+    **The escrow proxy built its own session with the five second default**, whatever the
+    account had been configured for, so a caller on a slow link signed in happily and then
+    timed out here. Reported against OpenTagViewer on a phone: `srp_init did not answer within
+    5s`, on an account configured for thirty.
+
+    A session of its own is still right - this talks to a different host with a different
+    lifetime - but the patience is a property of the network, and that is the same network.
+    """
+    from findmy.keychain.escrow import AsyncEscrowProxy  # noqa: PLC0415
+
+    proxy = AsyncEscrowProxy(FakeAccount(), escrow_host("24"), "the-pet")  # pyright: ignore [reportArgumentType]
+
+    assert proxy._http.timeout == 17.0, (  # noqa: SLF001
+        "the escrow proxy is not inheriting the account's timeout"
+    )

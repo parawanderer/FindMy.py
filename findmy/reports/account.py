@@ -757,6 +757,20 @@ class AsyncAppleAccount(BaseAppleAccount):
         self._reports: LocationReportsFetcher = LocationReportsFetcher(self)
         self._closed: bool = False
 
+    @property
+    def timeout(self) -> float:
+        """
+        Seconds this account allows one request, as it was configured.
+
+        **Exposed so the services built on an account can agree with it.** A caller that asks
+        for a longer timeout is describing its network, not this class: the same slow link
+        carries the escrow proxy and CloudKit, and those built their own
+        :class:`~findmy.util.http.HttpSession` with the five second default no matter what the
+        account was told. Signing in succeeded on a connection that then timed out fetching, and
+        nothing in the caller could reach the value to change it.
+        """
+        return self._http.timeout
+
     def _set_login_state(
         self,
         state: LoginState,
