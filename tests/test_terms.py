@@ -272,3 +272,45 @@ def test_a_failure_that_says_nothing_still_says_that() -> None:
     error = MobileMeDelegateError()
 
     assert "nothing about why" in str(error)
+
+
+def test_a_delegate_status_failure_is_not_sent_to_the_terms_flow() -> None:
+    # The shape OpenTagViewer#221 arrived in: the delegate refused the account and said so
+    # on its own status, with nothing on the localizedError channel at all. Offering terms
+    # here tells somebody whose terms are fine to go and accept some.
+    error = MobileMeDelegateError(
+        status=1,
+        status_message="A server problem is blocking Apple ID sign in. Try signing in later.",
+    )
+
+    assert not error.names_a_localized_error
+    assert "fetch_terms()" not in str(error)
+    assert "accepting terms will not change it" in str(error)
+
+
+def test_a_delegate_status_failure_still_quotes_what_apple_said() -> None:
+    # Whatever the cause turns out to be, the string Apple sent is the only evidence a
+    # report can carry, so it has to survive into the message.
+    error = MobileMeDelegateError(
+        status=1,
+        status_message="A server problem is blocking Apple ID sign in. Try signing in later.",
+    )
+
+    assert "status=1" in str(error)
+    assert "A server problem is blocking Apple ID sign in." in str(error)
+
+
+def test_the_delegate_status_remedy_does_not_promise_that_waiting_works() -> None:
+    # Apple's own wording says "try signing in later", and across the clients sharing this
+    # path it does not clear on its own. Repeating Apple's advice would send somebody to
+    # retry a thing that stays broken.
+    error = MobileMeDelegateError(status=1, status_message="Try signing in later.")
+
+    assert "appleid.apple.com" in str(error)
+    assert "not known to be temporary" in str(error)
+
+
+def test_a_localized_error_is_still_recognised_as_the_terms_channel() -> None:
+    # The discriminator both ways round, so the new branch cannot quietly swallow the old.
+    assert MobileMeDelegateError(localized_error="SOME_VALUE").names_a_localized_error
+    assert not MobileMeDelegateError(status=1).names_a_localized_error
