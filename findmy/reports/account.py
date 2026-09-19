@@ -1660,6 +1660,11 @@ class AsyncAppleAccount(BaseAppleAccount):
             },
         )
         headers.update(await self.get_anisette_headers(with_client_info=True))
+        # #236 experiment: present the 2FA calls as akd, like the sign-in around them.
+        headers["X-Mme-Client-Info"] = self._anisette.client_akd
+        headers["User-Agent"] = self._anisette.akd_user_agent
+        headers.pop("X-Apple-App-Info", None)
+        headers.pop("X-Xcode-Version", None)
 
         r = await self._http.request(
             method,
